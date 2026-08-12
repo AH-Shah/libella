@@ -1,5 +1,0 @@
-filepath,dataset_id,patient_id,discovery,projection
-/Users/Hemato/project_3/data/processed/p5/labeled_h5ad/GSE1_cosmx_wt_221.h5ad,GSE1,cosmx_wt_221,1,1
-/Users/Hemato/project_3/data/processed/p5/labeled_h5ad/GSE1_cosmx_wt_110.h5ad,GSE1,cosmx_wt_110,1,1
-/Users/Hemato/project_3/data/processed/p5/labeled_h5ad/GSE1_cosmx_wt_120.h5ad,GSE1,cosmx_wt_120,1,1
-/Users/Hemato/project_3/data/processed/p5/labeled_h5ad/GSE1_cosmx_wt_210.h5ad,GSE1,cosmx_wt_210,1,1

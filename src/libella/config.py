@@ -83,6 +83,7 @@ class RunConfig:
     grad_clip: float = 100.0
 
     # Inference & Topology
+    entropy_pruning: bool = True
     inference_scale: float = 15.0
     inference_alpha: float = 1.5
     inference_temp: float = 1.5

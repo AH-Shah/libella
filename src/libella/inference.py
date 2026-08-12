@@ -620,7 +620,12 @@ def refine_outputs(
         null_entropies.append(-np.sum(sh_p * np.log(sh_p + 1e-9), axis=1))
     
     null_threshold = np.percentile(np.vstack(null_entropies), 1)
-    valid_entropy = true_entropy > null_threshold
+    
+    if cfg.entropy_pruning:
+        valid_entropy = true_entropy > null_threshold
+    else:
+        valid_entropy = np.ones(K, dtype=bool)
+        print("  ↳ [!] Entropy pruning disabled. Preserving patient-specific ecotypes.")
     
     # 2. Extract Valid Indices directly 
     final_idx = [i for i in range(K) if valid_entropy[i]]
@@ -642,8 +647,10 @@ def refine_outputs(
     for i in range(K):
         md_lines.append(f"- **Program {i}**: {get_top_genes_str(i)}")
         
+    status_str = "ACTIVE" if cfg.entropy_pruning else "DISABLED (Patient-specific states preserved)"
     md_lines.extend([
         "\n## 2. Artifact Pruning (Shannon Entropy)",
+        f"- **Status:** `{status_str}`",
         f"- **Calculated Null Threshold (1st Percentile):** `{null_threshold:.3f}`",
         "\n**Deleted Programs:**"
     ])
