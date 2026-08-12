@@ -38,8 +38,8 @@ dependencies = [
 [project.scripts]
 libella = "libella.cli:main"
 
-[tool.setuptools.package-data]
-"libella" = ["signatures.csv"]
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/libella"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/libella"]
