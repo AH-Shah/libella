@@ -134,7 +134,8 @@ def _load_inf_data(
 
     adata_backed = sc.read_h5ad(h5ad_path, backed="r")
     
-    gene_to_idx = {g: i for i, g in enumerate(adata_backed.var_names)}
+    upper_var_names = [str(g).upper() for g in adata_backed.var_names]
+    gene_to_idx = {g: i for i, g in enumerate(upper_var_names)}
     present_genes = [g for g in common_genes if g in gene_to_idx]
     col_indices = [gene_to_idx[g] for g in present_genes]
     

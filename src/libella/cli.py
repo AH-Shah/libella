@@ -132,6 +132,19 @@ def run_pipeline(manifest_path: Path) -> None:
             
             clean_whitelist = set() if cfg.unsupervised else get_whitelist(paths.sig_csv)
             
+            # 🚨 ADDED: Pre-flight Gene Name Check
+            if not cfg.unsupervised and len(discovery_files) > 0:
+                import scanpy as sc
+                _tmp_adata = sc.read_h5ad(discovery_files[0], backed='r')
+                _upper_genes = set(str(g).upper() for g in _tmp_adata.var_names)
+                _overlap = len(_upper_genes.intersection(clean_whitelist))
+                if _overlap < 50:
+                    raise ValueError(
+                        f"\n[!] CRITICAL DATA ERROR: Only {_overlap} genes in {discovery_files[0].name} matched the signature dictionary.\n"
+                        f"    Libella requires standard Human HGNC gene symbols (e.g., 'CD8A', 'SOX2') in adata.var_names.\n"
+                        f"    If your data uses Ensembl IDs (ENSG...) or alternative aliases, please map them to HGNC symbols before running Libella."
+                    )
+            
             if consensus_cache.exists() and not cfg.force_retrain:
                 with open(consensus_cache, "r") as f:
                     common_genes = json.load(f)

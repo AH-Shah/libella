@@ -482,9 +482,10 @@ def _load_h5ad(
     else:
         adata_mem = adata_backed.to_memory()
         
-    # 🚨 INSTANTLY subset the matrix strictly to the provided clean_whitelist
-    valid_genes_mask = np.array([g in clean_whitelist for g in adata_mem.var_names])
-    valid_genes = np.array(adata_mem.var_names)[valid_genes_mask]
+    
+    upper_var_names = np.array([str(g).upper() for g in adata_mem.var_names])
+    valid_genes_mask = np.array([g in clean_whitelist for g in upper_var_names])
+    valid_genes = upper_var_names[valid_genes_mask]
     
     X_csc = adata_mem.X.tocsc()
     X_sparse = X_csc[:, valid_genes_mask].tocsr()
@@ -639,9 +640,10 @@ def _remap_and_norm(
 ) -> tuple[sp.csr_matrix, sp.csr_matrix, np.ndarray]:
     """Consolidate loading, sketching, and mapping into a single GC-safe scope."""
 
-    # 1. Load and Sketch
+    # 1. Load and Sketch (Auto-Uppercase)
     adata_backed = sc.read_h5ad(f, backed='r')
-    gene_to_idx = {g: i for i, g in enumerate(adata_backed.var_names)}
+    upper_var_names = [str(g).upper() for g in adata_backed.var_names]
+    gene_to_idx = {g: i for i, g in enumerate(upper_var_names)}
     present_genes = [g for g in common_genes if g in gene_to_idx]
     col_indices = [gene_to_idx[g] for g in present_genes]
     
