@@ -731,7 +731,7 @@ def make_domains(
         
         adata = sc.AnnData(X=np.clip(corr_mat, -1.0, 1.0))
         sc.pp.neighbors(adata, n_neighbors=5, metric="correlation")
-        sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=42)
+        sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=42, use_rep='X')
         leiden_mapping = adata.obs["leiden"].astype(int).values
         
         n_domains = len(np.unique(leiden_mapping))
