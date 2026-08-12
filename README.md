@@ -23,6 +23,27 @@ libella manifest.csv --out-dir ./results --mode DISCOVERY
 libella manifest.csv --out-dir ./results_dev --mode DEV
 ```
 
+### Data Requirements
+Libella expects standard **Human HGNC gene symbols** (e.g., `CD8A`, `EPCAM`) in your `.h5ad` file's `adata.var_names`. 
+* **Mouse/Rat Data:** Libella automatically uppercases all gene names (e.g., `Sox2` → `SOX2`), so mouse data works natively out-of-the-box!
+* **Ensembl IDs:** If your `.var_names` are Ensembl IDs (`ENSG0000...`), you **must** map them to HGNC symbols before running the pipeline.
+
+*(Example conversion snippet in Python using Scanpy)*
+```python
+import scanpy as sc
+import mygene
+
+adata = sc.read_h5ad("my_data.h5ad")
+
+# Query MyGene.info to map Ensembl to HGNC
+mg = mygene.MyGeneInfo()
+results = mg.querymany(adata.var_names, scopes='ensembl.gene', fields='symbol', species='human')
+
+# Replace names (dropping genes that didn't map)
+symbol_map = {res['query']: res.get('symbol', res['query']) for res in results}
+adata.var_names = [symbol_map[g] for g in adata.var_names]
+adata.write_h5ad("my_data_mapped.h5ad")
+
 ### The Manifest File
 Your `manifest.csv` must contain a `filepath` and a `split` column. You can optionally include `patient_id` and `dataset_id`.
 
