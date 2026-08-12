@@ -36,7 +36,7 @@ from .data import (
 )
 from .model import LibellaGNN
 from .topology_3d import generate_3d_topology_network
-from .utils import get_ds_id, get_pt_id, get_device
+from .utils import get_device
 
 def plot_curves(history: dict[str, list]) -> None:
     """Plot GNN convergence history."""
@@ -309,14 +309,16 @@ class SpatialAnalyzer:
         h5ad_path: Path, 
         common_genes: list[str], 
         meta_names: list[str], 
-        used_indices: np.ndarray
+        used_indices: np.ndarray,
+        pt_id: str,
+        ds_id: str
     ) -> None:
         self.h5ad_path = h5ad_path
         self.common_genes = common_genes
         self.meta_names = meta_names
         self.used_indices_global = used_indices
-        self.sid = Path(h5ad_path).stem.replace("GSE280314_", "").replace("GSE303070_", "")
-        self.did = get_ds_id(h5ad_path)
+        self.sid = pt_id
+        self.did = ds_id
         self.results: dict[str, pd.DataFrame] = {}
 
     def run(self) -> None:
@@ -352,14 +354,15 @@ class SpatialAnalyzer:
                 v.to_csv(out_path / f"{k}.csv", index=False)
 
 def process_pt(
-    f: Path, common_genes: list[str], meta_names: list[str], used_indices: np.ndarray
+    f: Path, common_genes: list[str], meta_names: list[str], used_indices: np.ndarray,
+    pt_id: str, ds_id: str
 ) -> dict[str, pd.DataFrame] | None:
     """Process single patient topology."""
     out_dirs = paths.make_dirs(cfg.suffix)
     indiv_out = out_dirs["indiv"]
     out_dir = out_dirs["out"]
     
-    s_dir = indiv_out / f.stem.replace("GSE280314_", "").replace("GSE303070_", "")
+    s_dir = indiv_out / pt_id
     
     if (s_dir / "Topology.csv").exists(): 
         return {
@@ -367,7 +370,7 @@ def process_pt(
         }
         
     try:
-        analyzer = SpatialAnalyzer(f, common_genes, meta_names, used_indices)
+        analyzer = SpatialAnalyzer(f, common_genes, meta_names, used_indices, pt_id, ds_id)
         analyzer.run()
         return analyzer.results
     except Exception as e:
@@ -410,7 +413,7 @@ def run_meta(all_results: list[dict[str, pd.DataFrame] | None]) -> None:
     topo_list = [r["Topology"] for r in all_results if r is not None and "Topology" in r and not r["Topology"].empty]
     if topo_list:
         df = pd.concat(topo_list).assign(
-            Patient_ID=lambda x: x["Sample"].apply(get_pt_id)
+            Patient_ID=lambda x: x["Sample"]
         ).groupby(["Patient_ID", "Interface"]).mean(numeric_only=True).reset_index()
         
         res = []
@@ -747,9 +750,9 @@ def make_domains(
             d = data.edge_index[1].numpy()
             A_native = sp.csr_matrix((np.ones_like(s, dtype=np.float32), (s, d)), shape=(N, N))
             
-            delattr(data, "x_in")
-            delattr(data, "edge_index")
-            delattr(data, "edge_attr")
+            if hasattr(data, "x_in"): delattr(data, "x_in")
+            if hasattr(data, "edge_index"): delattr(data, "edge_index")
+            if hasattr(data, "edge_attr"): delattr(data, "edge_attr")
             del data; gc.collect()
             
             W_pt = W_global[offset:offset+N]

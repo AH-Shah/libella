@@ -61,26 +61,3 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
     sum_val = torch.zeros(num_nodes, dtype=src.dtype, device=src.device).scatter_add(0, index, exp_val)
     return exp_val / (sum_val[index] + 1e-9)
 
-
-def get_pt_id(sample_name: str | Path) -> str:
-    """Extract patient ID from filename."""
-    name = str(sample_name).replace(".pt", "").replace(".h5ad", "")
-    name = re.sub(r"_graph$", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"(_chunk_\d+|_fov\d+|_core\d+|_roi\d+)$", "", name, flags=re.IGNORECASE)
-    name = name.replace("GSE280314_", "").replace("GSE303070_", "")
-    
-    patterns = [r"^(\d+[TN])_", r"^(GSM\d+)_slide", r"^(GSM\d+)_Tumor", r"^(pt\d+)"]
-    for pat in patterns:
-        if match := re.match(pat, name):
-            return match.group(1)
-            
-    return name
-
-def get_ds_id(file_path: str | Path) -> str:
-    """Extract cohort ID from filename."""
-    name = Path(file_path).stem
-    if match := re.match(r"^(GSE\d+)", name):
-        return match.group(1)
-    if "Ajou" in name:
-        return "GSE226997"
-    return "Unknown_Cohort"

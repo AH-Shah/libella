@@ -483,11 +483,19 @@ def train_gnn(
         return model, history, optimal_k
 
     init_components, optimal_k, checkpoint = get_priors(graph_paths)
-    n_extra_slots = cfg.extra_topics
-    extra_slots = np.zeros((n_extra_slots, init_components.shape[1]))
     
-    init_components = np.vstack([init_components, extra_slots])
-    optimal_k += n_extra_slots
+    if cfg.phase == "EXTRACT_PRIORS":
+        print("\n[✓] Phase 'EXTRACT_PRIORS' complete. Exiting before training.")
+        import sys; sys.exit(0)
+
+    n_extra_slots = cfg.extra_topics
+    if n_extra_slots > 0:
+        print(f"  ↳ Appending {n_extra_slots} extra randomized slots to the prior.")
+        if init_components is not None:
+            extra_slots = np.zeros((n_extra_slots, init_components.shape[1]))
+            init_components = np.vstack([init_components, extra_slots])
+            
+        optimal_k += n_extra_slots
     gc.collect()
 
     model, optimizer, scheduler, best_val_loss, history, start_epoch = _init_model(

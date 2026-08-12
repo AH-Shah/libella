@@ -23,6 +23,15 @@ class RunConfig:
     mode: str = "PUBLISH"
     force_retrain: bool = False
     
+    # Execution Phases & Setup
+    phase: str = "ALL"
+    unsupervised: bool = False
+    
+    # Native K Controllers
+    n_prior_lineages: int = 30   
+    n_dict_components: int = 100
+    k_override: int | None = None
+    
     hidden_dim: int = 128
     k_hops: int = 2
     extra_topics: int = 0
@@ -120,7 +129,9 @@ class RunConfig:
 class Paths:
     """Project path manager."""
     out_base: Path = Path("./libella_output")
-    sig_csv: Path = Path("./signatures.csv")
+    
+
+    sig_csv: Path = Path(__file__).parent / "signatures.csv"
     
     def make_dirs(self, suffix: str = "") -> dict:
         out_dir = self.out_base / f"run{suffix}"
@@ -140,7 +151,7 @@ class Paths:
         dirs["checkpoint"] = out_dir / "gnn_checkpoint.pt"
         return dirs
 
-NOISE_PATTERNS = (
+NOISE_PATTERNS = [
     r"^M?RP[LSP]+[A-Z0-9]*\d+",   # Ribosomal proteins
     r"^(?:EEF|EIF)\d[A-Z0-9]*",   # Elongation/Initiation factors
     r"^PABP[CN]\d+.*",            # Poly-A binding

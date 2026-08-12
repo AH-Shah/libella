@@ -174,7 +174,7 @@ def _get_raw_adjs(graph_paths: list[Path]) -> np.ndarray:
     gc.collect()
 
     dict_learner = MiniBatchDictionaryLearning(
-        n_components=100, alpha=2.0, random_state=42, max_iter=100
+        n_components=cfg.n_dict_components, alpha=2.0, random_state=42, max_iter=100
     )
     dict_learner.fit(X_dense)
 
@@ -306,7 +306,7 @@ def get_priors(
     optimal_k = None
     init_components = None
     
-    out_dirs = paths.setup_output_dirs(cfg.suffix)
+    out_dirs = paths.make_dirs(cfg.suffix)
     checkpoint_path = out_dirs["checkpoint"]
     cnmf_priors_path = out_dirs["cnmf_priors"]
     genes_path = out_dirs["genes"]
@@ -330,18 +330,46 @@ def get_priors(
     if init_components is None:
         print("  ↳ Extracting Biological Priors...")
 
-        atlas_matrix, target_genes, lineage_names = _parse_nouns(
-            genes_path, paths.sig_csv
-        )
-        nouns, noun_reports = _compress_nouns(
-            atlas_matrix, lineage_names, target_genes, n_clusters=30
-        )
-
         raw_spatial_topics = _get_raw_adjs(graph_paths)
 
-        orthogonal_adjectives, sieve_stats, adjective_reports = _apply_sieve(
-            raw_spatial_topics, nouns, target_genes
-        )
+        if cfg.unsupervised:
+            print("  ↳ [!] UNSUPERVISED MODE: Bypassing signatures.csv.")
+            # Rely entirely on the spatial dictionary components as the base K
+            init_components = raw_spatial_topics
+            optimal_k = init_components.shape[0]
+            print(f"  ↳ Extracted {optimal_k} unsupervised spatial dictionary components.")
+        else:
+            atlas_matrix, target_genes, lineage_names = _parse_nouns(
+                genes_path, paths.sig_csv
+            )
+            # Plug in the configurable lineage limit
+            nouns, noun_reports = _compress_nouns(
+                atlas_matrix, lineage_names, target_genes, n_clusters=cfg.n_prior_lineages
+            )
+
+            orthogonal_adjectives, sieve_stats, adjective_reports = _apply_sieve(
+                raw_spatial_topics, nouns, target_genes
+            )
+
+            if len(orthogonal_adjectives) > 0:
+                init_components = np.vstack([nouns, orthogonal_adjectives])
+            else:
+                init_components = nouns
+
+            optimal_k = init_components.shape[0]
+
+            x_pelka = nouns.shape[0]
+            y_dict = orthogonal_adjectives.shape[0]
+            print(f"  ↳ {x_pelka} compressed lineages + {y_dict} dict addition prior is sealed (Base K={optimal_k}).")
+
+            report_path = out_dir / "prior.txt"
+            _write_report(noun_reports, sieve_stats, adjective_reports, report_path)
+
+        try:
+            if init_components is not None:
+                joblib.dump(init_components, cnmf_priors_path)
+        except Exception:
+            pass
 
         if len(orthogonal_adjectives) > 0:
             init_components = np.vstack([nouns, orthogonal_adjectives])
