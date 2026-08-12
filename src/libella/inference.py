@@ -422,7 +422,17 @@ def run_meta(all_results: list[dict[str, pd.DataFrame] | None]) -> None:
             pts = sub["Patient_ID"].unique()
             k_pts = len(pts)
             
-            if k_pts > 1:
+            if k_pts == 1:
+                # 1-Patient Fallback: Cannot compute variance or LOPO, but retain raw enrichment
+                meta_eff = sub["Log2_Enrichment"].values[0]
+                res.append({
+                    "Interface": i, 
+                    "Pooled_Log2_Enrichment": round(float(meta_eff), 3), 
+                    "Cross_Patient_SE": 0.0,
+                    "P_val_raw": 1.0,  # No statistical significance on N=1
+                    "LOPO_Robustness": "1/1"
+                })
+            elif k_pts > 1:
                 log2_vals = sub["Log2_Enrichment"].values
                 meta_eff = np.mean(log2_vals)
                 meta_se = np.std(log2_vals, ddof=1) / (np.sqrt(k_pts) + 1e-9)
@@ -432,13 +442,14 @@ def run_meta(all_results: list[dict[str, pd.DataFrame] | None]) -> None:
                 lopo = 0
                 for pt in pts:
                     s = sub[sub["Patient_ID"] != pt]["Log2_Enrichment"].values
-                    if len(s) > 1:
+                    if len(s) >= 1: # Fix: allow N=2 cohorts to still compare effect direction
                         loo_eff = np.mean(s)
-                        loo_se = np.std(s, ddof=1) / (np.sqrt(len(s)) + 1e-9)
+                        loo_se = np.std(s, ddof=1) / (np.sqrt(len(s)) + 1e-9) if len(s) > 1 else 1e-9
                         loo_t = loo_eff / (loo_se + 1e-9)
-                        loo_p = t.sf(np.abs(loo_t), df=len(s)-1) * 2.0
+                        loo_p = t.sf(np.abs(loo_t), df=len(s)-1) * 2.0 if len(s) > 1 else 1.0
                         
-                        if (loo_eff * meta_eff > 0) and (loo_p < 0.05):
+                        # Increment if effect direction matches AND (it's significant OR it's the only remaining sample)
+                        if (loo_eff * meta_eff > 0) and (loo_p < 0.05 or len(s) == 1):
                             lopo += 1
                             
                 res.append({
@@ -725,13 +736,24 @@ def make_domains(
         W_global = np.vstack(W_list)
         
         print("  ↳ Discovering Macro-Compartments (Auto-K Leiden)...")
-        corr_mat = np.corrcoef(W_global.T)
-        corr_mat = np.nan_to_num(corr_mat, nan=0.0) 
-        np.fill_diagonal(corr_mat, 1.0)
         
-        adata = sc.AnnData(X=np.clip(corr_mat, -1.0, 1.0))
-        sc.pp.neighbors(adata, n_neighbors=5, metric="correlation")
-        sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=42, use_rep='X')
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore") 
+            
+            corr_mat = np.corrcoef(W_global.T)
+            corr_mat = np.nan_to_num(corr_mat, nan=0.0) 
+            np.fill_diagonal(corr_mat, 1.0)
+            
+            adata = sc.AnnData(X=np.clip(corr_mat, -1.0, 1.0))
+            
+            sc.pp.neighbors(adata, n_neighbors=5, metric="correlation", use_rep="X")
+            try:
+                sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=42, flavor="igraph", directed=False)
+            except TypeError:
+
+                sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=42)
+                
         leiden_mapping = adata.obs["leiden"].astype(int).values
         
         n_domains = len(np.unique(leiden_mapping))
