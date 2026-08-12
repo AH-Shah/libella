@@ -70,6 +70,7 @@ class RunConfig:
     hub_threshold: float = 0.15
     anchor_peak_threshold: float = 0.80
     ortho_overlap_threshold: float = 0.25
+    ortho_weight: float = 10.0
     tsallis_alpha: float = 1.75
     delta_clamp: float = 30.0
     zero_mask_rate: float = 0.05
