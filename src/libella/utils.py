@@ -55,9 +55,9 @@ def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
 def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
     """Fast scatter softmax without CPU sync."""
-    with torch.no_grad():
-        max_val = torch.zeros(num_nodes, dtype=src.dtype, device=src.device).scatter_reduce(0, index, src, reduce="amax")
-    exp_val = torch.exp(src - max_val[index])
+    src_safe = torch.clamp(src, min=-60.0, max=60.0)
+
+    exp_val = torch.exp(src_safe)
     sum_val = torch.zeros(num_nodes, dtype=src.dtype, device=src.device).scatter_add(0, index, exp_val)
     return exp_val / (sum_val[index] + 1e-9)
 

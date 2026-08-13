@@ -147,7 +147,7 @@ class LibellaGNN(nn.Module):
             if len(src) > 0:
                 h_pair = torch.cat([h_ctx[src], h_ctx[dst], W_bil.unsqueeze(1)], dim=-1)
                 e_raw = self.gat_a(F.leaky_relu(self.gat_w(h_pair))).squeeze(-1)
-                tau = torch.clamp(F.softplus(self.att_temp), min=0.01)
+                tau = torch.clamp(F.softplus(self.att_temp), min=0.05)
                 e_scaled = e_raw / tau
                 alpha_att = scatter_softmax(e_scaled, dst, N) 
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
