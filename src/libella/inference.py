@@ -202,30 +202,11 @@ def _run_inf(
     W_global = np.zeros((N_cells, saved_k), dtype=np.float32)
     with torch.no_grad():
         for batch in batcher:
-            # 1. Fast GPU Decompression: Send tiny sparse arrays to device FIRST, then decompress
-            x_coo = batch["x"].tocoo()
-            x_ind = torch.stack([
-                torch.from_numpy(x_coo.row).to(torch.int64),
-                torch.from_numpy(x_coo.col).to(torch.int64)
-            ]).to(device, non_blocking=True)
-            x_val = torch.from_numpy(x_coo.data).to(torch.float32).to(device, non_blocking=True)
-
-            x_coo = batch["x"].tocoo()
-            x_ind = torch.stack([
-                torch.from_numpy(x_coo.row).to(torch.int64),
-                torch.from_numpy(x_coo.col).to(torch.int64)
-            ]).to(device, non_blocking=True)
-            x_val = torch.from_numpy(x_coo.data).to(torch.float32).to(device, non_blocking=True)
-
-            x_dense = torch.sparse_coo_tensor(
-                x_ind, x_val, size=x_coo.shape, device=device
-            ).to_dense()
-
-            # 2. Transfer int32 edge arrays asynchronously
+            x_dense = torch.from_numpy(batch["x"].toarray()).float().to(device)
             adj_coo = batch["adj"].tocoo()
-            src = torch.from_numpy(adj_coo.row).to(torch.int32).to(device, non_blocking=True)
-            dst = torch.from_numpy(adj_coo.col).to(torch.int32).to(device, non_blocking=True)
-            weights = torch.from_numpy(adj_coo.data).to(torch.float32).to(device, non_blocking=True)
+            src = torch.from_numpy(adj_coo.row).long().to(device)
+            dst = torch.from_numpy(adj_coo.col).long().to(device)
+            weights = torch.from_numpy(adj_coo.data).float().to(device)
             x_dense, src, dst, weights = pad_mps_shapes(x_dense, src, dst, weights)
             fracs, _ = model(x_dense, src, dst, weights)
             fracs_cpu = fracs.cpu().numpy()
@@ -553,23 +534,11 @@ def get_ecotypes(
             patient_frac_matrix = np.zeros((N_cells, K_topics), dtype=np.float32)
             
             for batch in batcher:
-                # 1. Fast GPU Decompression: Send tiny sparse arrays to device FIRST, then decompress
-                x_coo = batch["x"].tocoo()
-                x_ind = torch.stack([
-                    torch.from_numpy(x_coo.row).to(torch.int64),
-                    torch.from_numpy(x_coo.col).to(torch.int64)
-                ]).to(device, non_blocking=True)
-                x_val = torch.from_numpy(x_coo.data).to(torch.float32).to(device, non_blocking=True)
-
-                x_dense = torch.sparse_coo_tensor(
-                    x_ind, x_val, size=x_coo.shape, device=device
-                ).to_dense()
-
-                # 2. Transfer int32 edge arrays asynchronously
+                x_dense = torch.from_numpy(batch["x"].toarray()).float().to(device)
                 adj_coo = batch["adj"].tocoo()
-                src = torch.from_numpy(adj_coo.row).to(torch.int32).to(device, non_blocking=True)
-                dst = torch.from_numpy(adj_coo.col).to(torch.int32).to(device, non_blocking=True)
-                weights = torch.from_numpy(adj_coo.data).to(torch.float32).to(device, non_blocking=True)
+                src = torch.from_numpy(adj_coo.row).long().to(device)
+                dst = torch.from_numpy(adj_coo.col).long().to(device)
+                weights = torch.from_numpy(adj_coo.data).float().to(device)
                 x_dense, src, dst, weights = pad_mps_shapes(x_dense, src, dst, weights)
                 
                 fracs, _ = model(x_dense, src, dst, weights)
