@@ -238,6 +238,9 @@ def _train_loop(
                 
                 local_core = batch["local_core_idx"]
                 core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
+
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    fracs, pure_anchors = model(x, src, dst, weights)
                 
                 t_mask_np = batch["train_mask"][local_core]
                 if t_mask_np.sum() > 0:
