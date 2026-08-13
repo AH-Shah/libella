@@ -279,8 +279,9 @@ class LibellaGNN(nn.Module):
         scaled_delta = recon_c.sub_(x_c)
         
         penalty_mask = is_non_zero & (scaled_delta < 0)
-        multiplier = 1.0 + (penalty_mask.to(scaled_delta.dtype) * 2.0)
-        scaled_delta.mul_(multiplier) # In-place multiply by 3.0 or 1.0
+        weight_multiplier = penalty_mask.to(scaled_delta.dtype).mul_(2.0).add_(1.0)
+        
+        scaled_delta.mul_(weight_multiplier)
 
         
         scaled_delta.clamp_(min=-30.0, max=30.0)
