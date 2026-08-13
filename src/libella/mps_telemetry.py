@@ -6,9 +6,9 @@ from pathlib import Path
 
 # --- Import your actual project modules here ---
 # Adjust these imports based on your file structure.
-from .config import cfg
-from .model import LibellaGNN
-from .utils import pad_mps_shapes
+from libella.config import cfg, paths
+from libella.model import LibellaGNN
+from libella.data import pad_mps_shapes
 
 warnings.filterwarnings("ignore")
 
