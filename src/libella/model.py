@@ -103,8 +103,8 @@ class LibellaGNN(nn.Module):
         edge_weights: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if len(src) > 0:
-            src = src.to(torch.int32).contiguous()
-            dst = dst.to(torch.int32).contiguous()
+            src = src.contiguous()
+            dst = dst.contiguous()
             
         h_id = self.id_enc(x_dense)
         h_0 = self.lin_appnp(self.ctx_enc(x_dense))
@@ -167,7 +167,10 @@ class LibellaGNN(nn.Module):
         Q = self.q_proj(h_id)
         K = self.k_proj(h_ctx)
         V = self.v_proj(h_ctx)
-        self_loops = torch.arange(N, dtype=torch.int32, device=x_dense.device)
+        
+        # 🚨 Match platform dtype instantly (No casting overhead)
+        idx_dtype = src.dtype if len(src) > 0 else (torch.int32 if x_dense.device.type == 'mps' else torch.int64)
+        self_loops = torch.arange(N, dtype=idx_dtype, device=x_dense.device)
         
         src_with_self = torch.cat([src, self_loops]) if len(src) > 0 else self_loops
         dst_with_self = torch.cat([dst, self_loops]) if len(src) > 0 else self_loops
