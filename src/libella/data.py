@@ -22,7 +22,6 @@ from sklearn.preprocessing import normalize
 from torch_geometric.data import Data
 from tqdm import tqdm
 from collections.abc import Iterator
-import torch.nn.functional as F
 
 from .config import cfg, paths
 from .utils import get_device
@@ -769,17 +768,20 @@ def pad_mps_shapes(
     if E_pad > E and N_pad == N:
         N_pad += node_bucket 
 
-    # 1. Pad Nodes (Fast C-level padding, no dummy variables needed)
+    # 1. Pad Nodes (with zeros)
     if N_pad > N:
-        # F.pad format for 2D is (pad_left, pad_right, pad_top, pad_bottom)
-        x = F.pad(x, (0, 0, 0, N_pad - N))
+        x_dummy = torch.zeros(N_pad - N, x.size(1), dtype=x.dtype, device=x.device)
+        x = torch.cat([x, x_dummy], dim=0)
 
-    # 2. Pad Edges 
+    # 2. Pad Edges (Dummy edges pointing from Dummy Node -> Dummy Node with weight 0)
     if E_pad > E:
-        # F.pad format for 1D is (pad_left, pad_right)
-        src = F.pad(src, (0, E_pad - E), value=N)
-        dst = F.pad(dst, (0, E_pad - E), value=N)
-        weights = F.pad(weights, (0, E_pad - E)) # defaults to value=0
+        # N is the index of the FIRST dummy node. We route all fake math through it.
+        dummy_idx = torch.full((E_pad - E,), N, dtype=src.dtype, device=src.device)
+        dummy_w = torch.zeros(E_pad - E, dtype=weights.dtype, device=weights.device)
+
+        src = torch.cat([src, dummy_idx], dim=0)
+        dst = torch.cat([dst, dummy_idx], dim=0)
+        weights = torch.cat([weights, dummy_w], dim=0)
 
     return x, src, dst, weights
 
