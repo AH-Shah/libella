@@ -168,6 +168,15 @@ def _train_loop(
 ) -> tuple[LibellaGNN, dict[str, list]]:
     print("\n-> Spatial Distillation...")
     device = get_device()
+    
+    amp_dtype = torch.bfloat16
+    if device.type == "cuda":
+        amp_enabled = torch.cuda.is_bf16_supported()  # Works for both NVIDIA and AMD ROCm
+    elif device.type == "mps":
+        amp_enabled = True  # Native Mac M-Series support
+    else:
+        amp_enabled = False # Fall back to FP32 for CPU/older hardware to prevent 1e-9 underflow
+        
     out_dirs = paths.make_dirs(cfg.suffix)
     out_dir = out_dirs["out"]
     checkpoint_path = out_dirs["checkpoint"]
@@ -234,7 +243,7 @@ def _train_loop(
                 model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)     
                 model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress)    
 
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                     fracs, pure_anchors = model(x, src, dst, weights)
                 
                 local_core = batch["local_core_idx"]
@@ -276,10 +285,10 @@ def _train_loop(
 
                     dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + (hub_multiplier) 
 
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                         recon = f_train @ pure_anchors
                         true_batch_loss, base_recon_val = model.calc_loss(
-                            recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
+                            recon, x_train.to(recon.dtype), pure_anchors, None, epoch, cfg.epochs, 
                             f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
                         )
 
@@ -321,7 +330,7 @@ def _train_loop(
                     val_idx = core_gpu[v_mask_gpu]
 
                     model.eval() 
-                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                         clean_fracs, clean_anchors = model(x, src, dst, weights)
 
                         f_val = fracs[val_idx]
