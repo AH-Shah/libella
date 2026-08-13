@@ -130,9 +130,10 @@ class LibellaGNN(nn.Module):
         if len(src) > 0:
             with torch.no_grad():
                 bio_h = torch.mm(x_dense, anchors_raw.detach().t())
-                # 🚨 MPS FIX: Use direct multiplication instead of .pow(2)
-                diff = bio_h[src] - bio_h[dst]
-                dist = (diff * diff).sum(dim=1)
+                diff = bio_h[src]
+                diff.sub_(bio_h[dst])
+                diff.pow_(2)
+                dist = diff.sum(dim=1)
             decay = torch.exp(-F.softplus(self.gamma) * dist)
         else:
             decay = torch.ones_like(edge_weights)
@@ -150,9 +151,11 @@ class LibellaGNN(nn.Module):
                 h_src_proj = self.gat_w_src(h_ctx)
                 h_dst_proj = self.gat_w_dst(h_ctx)
                 
-                h_edge = h_src_proj[src] + h_dst_proj[dst] + self.gat_w_edge(W_bil.unsqueeze(1))
+                h_edge = h_src_proj[src] 
+                h_edge.add_(h_dst_proj[dst])
+                h_edge.add_(self.gat_w_edge(W_bil.unsqueeze(1)))
                 
-                e_raw = self.gat_a(F.leaky_relu(h_edge)).squeeze(-1)
+                e_raw = self.gat_a(F.leaky_relu(h_edge, inplace=True)).squeeze(-1)
                 tau = torch.clamp(F.softplus(self.att_temp), min=0.05)
                 e_scaled = e_raw / tau
                 
@@ -266,25 +269,19 @@ class LibellaGNN(nn.Module):
         # 1. Fuse the weighting logic directly without .float() expansions
         if self.training:
             zero_mask = torch.rand_like(x_c) < 0.05 
-            # Logic: If >0, use dynamic_w. Else if zero_mask is True, use 1.0. Else use 0.0.
-            masked_w_mat = torch.where(
-                is_non_zero, 
-                current_dynamic_w, 
-                torch.where(zero_mask, 1.0, 0.0)
-            )
+            masked_w_mat = is_non_zero.to(x_c.dtype) * current_dynamic_w
+            masked_w_mat.add_( (~is_non_zero & zero_mask).to(x_c.dtype) )
         else:
             masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0)
 
-        raw_delta = recon_c - x_c
+        scaled_delta = recon_c - x_c
         
-        # 2. Fuse the asymmetry factor (Removes two massive .float() allocations)
-        # Logic: If it is non_zero AND the delta is negative, weight is 3.0. Otherwise 1.0.
-        asymmetry_factor = torch.where(is_non_zero & (raw_delta < 0), 3.0, 1.0)
+        scaled_delta = torch.where(is_non_zero & (scaled_delta < 0), scaled_delta * 3.0, scaled_delta)
         
-        # Multiply and clamp
-        scaled_delta = torch.clamp(raw_delta * asymmetry_factor, min=-30.0, max=30.0)
+        scaled_delta.clamp_(min=-30.0, max=30.0)
+        scaled_delta.add_(1e-6)
 
-        l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6)))
+        l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta)))
         
 
         N_cells = torch.clamp(torch.tensor(x_c.shape[0], dtype=torch.float32, device=x_c.device), min=1.0)
