@@ -183,7 +183,8 @@ class LibellaGNN(nn.Module):
         k_src = K[src_with_self]
         v_src = V[src_with_self]
         
-        cross_scores = (q_dst * k_src).sum(dim=-1) / (self.hidden_dim ** 0.5)
+        cross_scores = (q_dst * k_src).sum(dim=-1)
+        cross_scores.div_(self.hidden_dim ** 0.5)
         cross_att = scatter_softmax(cross_scores, dst_with_self, N)
         
 
@@ -310,7 +311,10 @@ class LibellaGNN(nn.Module):
         max_overlap = latent_ortho.max(dim=1)[0]
         
 
-        l_ortho = (F.relu(max_overlap - cfg.ortho_overlap_threshold) ** 2).mean()
+        overlap_excess = max_overlap.sub_(cfg.ortho_overlap_threshold)
+        F.relu(overlap_excess, inplace=True)
+        overlap_excess.pow_(2)
+        l_ortho = overlap_excess.mean()
         scaled_ortho = (l_ortho + collapse_penalty) * cfg.ortho_weight
         scaled_gene_ent = gene_entropy * 0.1
 
