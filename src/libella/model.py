@@ -275,9 +275,11 @@ class LibellaGNN(nn.Module):
         else:
             masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0)
 
-        scaled_delta = recon_c - x_c
+
+        scaled_delta = recon_c.sub_(x_c)
         
-        scaled_delta = torch.where(is_non_zero & (scaled_delta < 0), scaled_delta * 3.0, scaled_delta)
+        penalty_mask = is_non_zero & (scaled_delta < 0)
+        scaled_delta[penalty_mask] *= 3.0
         
         scaled_delta.clamp_(min=-30.0, max=30.0)
         scaled_delta.add_(1e-6)
