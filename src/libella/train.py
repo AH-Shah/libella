@@ -234,13 +234,12 @@ def _train_loop(
                 model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)     
                 model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress)    
 
-                fracs, pure_anchors = model(x, src, dst, weights)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    fracs, pure_anchors = model(x, src, dst, weights)
                 
                 local_core = batch["local_core_idx"]
                 core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
-
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    fracs, pure_anchors = model(x, src, dst, weights)
+                
                 
                 t_mask_np = batch["train_mask"][local_core]
                 if t_mask_np.sum() > 0:
@@ -277,11 +276,12 @@ def _train_loop(
 
                     dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + (hub_multiplier) 
 
-                    recon = f_train @ pure_anchors
-                    true_batch_loss, base_recon_val = model.calc_loss(
-                        recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
-                        f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
-                    )
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        recon = f_train @ pure_anchors
+                        true_batch_loss, base_recon_val = model.calc_loss(
+                            recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
+                            f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
+                        )
 
                     if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
                         nan_detected = True
@@ -321,7 +321,7 @@ def _train_loop(
                     val_idx = core_gpu[v_mask_gpu]
 
                     model.eval() 
-                    with torch.no_grad():
+                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                         clean_fracs, clean_anchors = model(x, src, dst, weights)
 
                         f_val = fracs[val_idx]
