@@ -186,6 +186,12 @@ def run_async_telemetry():
                 m_avg_v = m_stats["vram_delta"] / m_stats["count"]
                 print(f"    ↳ [Sub] {m_name:<26} | Avg Time: {m_avg_t:>7.2f} ms | Avg VRAM Δ: {m_avg_v:>7.2f} MB")
     print("="*85)
+    
+    # --- ADD THIS TO PREVENT PYTORCH SHUTDOWN CRASH ---
+    phase_records.clear()
+    module_records.clear()
+    import gc
+    gc.collect()
 
 if __name__ == "__main__":
     run_async_telemetry()
