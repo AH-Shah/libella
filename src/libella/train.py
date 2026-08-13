@@ -139,22 +139,25 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
 def prefetch_batches(
     meta_batches: list[list[dict[str, Any]]]
 ) -> Iterator[tuple[list[dict[str, Any]], list[Any]]]:
-    """Async fetch of SSD chunks parallel to GPU compute."""
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    """Pure async SSD read. No permanent RAM caching to prevent MPS fragmentation."""
+    with ThreadPoolExecutor(max_workers=4) as executor:
         if not meta_batches:
             return
             
-        # Kick off the very first SSD read
-        futures = [executor.submit(torch.load, b['chunk_file'], map_location='cpu', weights_only=False) for b in meta_batches[0]]
+        futures = [
+            executor.submit(torch.load, b['chunk_file'], map_location='cpu', weights_only=False) 
+            for b in meta_batches[0]
+        ]
         
         for i in range(len(meta_batches)):
-            # Wait for current batch to finish loading
             loaded_chunks = [f.result() for f in futures]
             
-            # 🚨 Kick off the reads for the NEXT batch BEFORE yielding to the GPU!
             if i + 1 < len(meta_batches):
-                futures = [executor.submit(torch.load, b['chunk_file'], map_location='cpu', weights_only=False) for b in meta_batches[i+1]]
-                
+                futures = [
+                    executor.submit(torch.load, b['chunk_file'], map_location='cpu', weights_only=False) 
+                    for b in meta_batches[i+1]
+                ]
+                    
             yield meta_batches[i], loaded_chunks
             
 def _train_loop(
@@ -166,7 +169,6 @@ def _train_loop(
     best_val_loss: float, 
     history: dict[str, list]
 ) -> tuple[LibellaGNN, dict[str, list]]:
-    """Execute main GPU training loop with meta-batching."""
     print("\n-> Spatial Distillation...")
     device = get_device()
     out_dirs = paths.make_dirs(cfg.suffix)
@@ -175,13 +177,14 @@ def _train_loop(
     
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
     ema_mean = None
+    
+    ram_cache: dict[Path, dict[str, Any]] = {}
 
     for epoch in tqdm(range(start_epoch, cfg.epochs), desc="Training", leave=False):
         model.train()
         train_loss, val_loss = 0.0, 0.0
         train_steps, val_steps = 0, 0
 
-        
         epoch_telemetry = {
             'ent': 0.0, 'col_r': 0.0, 'kl_w': 0.0, 'g_w': 0.0, 'p_w': 0.0, 
             'l_rec': 0.0, 'l_anc': 0.0, 'l_ort': 0.0
@@ -201,38 +204,44 @@ def _train_loop(
             for chunk_idx, batch_ref in enumerate(meta_meta):
                 batch = loaded_chunks[chunk_idx]
                 
-                x_coo = batch["x"].tocoo()
-                row = torch.from_numpy(x_coo.row).to(torch.int32).to(device)
-                col = torch.from_numpy(x_coo.col).to(torch.int32).to(device)
-                val = torch.from_numpy(x_coo.data).to(torch.float32).to(device)
-                shape = x_coo.shape
-                del x_coo 
-                
-                indices = torch.stack([row, col], dim=0)
-                x = torch.sparse_coo_tensor(indices, val, size=shape, device=device).to_dense()
-                del row, col, val, indices
-                
-                adj_coo = batch["adj"].tocoo()
 
+                if "x_indices" not in batch:
+                    x_coo = batch["x"].tocoo()
+                    batch["x_indices"] = torch.stack([
+                        torch.from_numpy(x_coo.row).to(torch.int64),
+                        torch.from_numpy(x_coo.col).to(torch.int64)
+                    ], dim=0)
+                    batch["x_val"] = torch.from_numpy(x_coo.data).to(torch.float32)
+                    batch["x_shape"] = x_coo.shape
+                    
+                    adj_coo = batch["adj"].tocoo()
+                    batch["adj_row"] = adj_coo.row
+                    batch["adj_col"] = adj_coo.col
+                    batch["adj_data"] = adj_coo.data
+                    
+            
+                    del batch["x"], batch["adj"]
+
+                x_ind = batch["x_indices"].to(device, non_blocking=True)
+                x_val = batch["x_val"].to(device, non_blocking=True)
+                x = torch.sparse_coo_tensor(
+                    x_ind, x_val, size=batch["x_shape"], device=device
+                ).to_dense()
+
+                # 2. Mask edges on CPU using lightweight NumPy arrays
                 if model.training:
-                    keep_mask = np.random.rand(len(adj_coo.row)) > 0.40
-                    row = adj_coo.row[keep_mask]
-                    col = adj_coo.col[keep_mask]
-                    data = adj_coo.data[keep_mask]
+                    keep_mask = np.random.rand(len(batch["adj_row"])) > 0.40
+                    row = batch["adj_row"][keep_mask]
+                    col = batch["adj_col"][keep_mask]
+                    data = batch["adj_data"][keep_mask]
                 else:
-                    row, col, data = adj_coo.row, adj_coo.col, adj_coo.data
+                    row, col, data = batch["adj_row"], batch["adj_col"], batch["adj_data"]
 
+                # 3. Transfer long indices to MPS
+                src = torch.from_numpy(row).to(torch.int32).to(device, non_blocking=True)
+                dst = torch.from_numpy(col).to(torch.int32).to(device, non_blocking=True)
+                weights = torch.from_numpy(data).to(torch.float32).to(device, non_blocking=True)
 
-                src = torch.from_numpy(row).to(torch.int32)
-                dst = torch.from_numpy(col).to(torch.int32)
-                weights = torch.from_numpy(data).to(torch.float32)
-
-                del adj_coo
-
-                src = src.to(device, non_blocking=True)
-                dst = dst.to(device, non_blocking=True)
-                weights = weights.to(device, non_blocking=True)
-                
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
 
                 linear_progress = epoch / max(1, cfg.epochs - 1)
@@ -325,8 +334,11 @@ def _train_loop(
                 if v_mask_np.sum() > 0:
                     v_mask_gpu = torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=device)
                     val_idx = core_gpu[v_mask_gpu]
-                    
+
+                    model.eval() 
                     with torch.no_grad():
+                        clean_fracs, clean_anchors = model(x, src, dst, weights)
+
                         f_val = fracs[val_idx]
                         x_val = x[val_idx]
                         val_recon = f_val @ pure_anchors
@@ -353,8 +365,9 @@ def _train_loop(
                     
                         val_loss += val_log_cosh.item()
                         val_steps += 1
-                        
-                    del v_mask_gpu, val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
+
+                    model.train()     
+                    del v_mask_gpu, val_idx, clean_fracs, clean_anchors, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
                     
 
                 del batch, src, dst, weights, x, fracs, pure_anchors, core_gpu, local_core, t_mask_np, v_mask_np

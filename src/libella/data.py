@@ -681,12 +681,11 @@ def _remap_and_norm(
     X_raw_sparse.data = np.clip(X_raw_sparse.data, 0, None)
     
     # 3. Create Normalized Matrix
-    X_in_sparse = X_raw_sparse.copy()
-    cell_sums = np.array(X_in_sparse.sum(axis=1)).flatten()
+    cell_sums = np.array(X_raw_sparse.sum(axis=1)).flatten()
     cell_sums[cell_sums == 0] = 1.0 
     scaling_factors = 1e4 / cell_sums
     
-    X_in_sparse = sp.diags(scaling_factors) @ X_in_sparse
+    X_in_sparse = sp.diags(scaling_factors) @ X_raw_sparse 
     X_in_sparse.data = np.log1p(X_in_sparse.data)
     
     return X_raw_sparse, X_in_sparse, coords
@@ -719,7 +718,7 @@ def build_pt_graph(f: Path, common_genes: list[str]) -> Path | None:
         gc.collect()
         
         adj_sym_coo = adj_sym.tocoo()
-        data.edge_index = torch.from_numpy(np.vstack((adj_sym_coo.row, adj_sym_coo.col)).astype(np.int64))
+        data.edge_index = torch.from_numpy(np.vstack((adj_sym_coo.row, adj_sym_coo.col)).astype(np.int32))
         data.edge_attr = torch.from_numpy(adj_sym_coo.data.astype(np.float32))
 
         out_dir = paths.make_dirs(cfg.suffix)["graphs"]

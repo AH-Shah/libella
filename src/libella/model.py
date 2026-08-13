@@ -87,7 +87,10 @@ class LibellaGNN(nn.Module):
         self.register_buffer('dynamic_w_ema', torch.tensor(1.0, dtype=torch.float32))
         
 
-        self.gat_w = nn.Linear(self.hidden_dim * 2 + 1, self.hidden_dim)
+
+        self.gat_w_src = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.gat_w_dst = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.gat_w_edge = nn.Linear(1, self.hidden_dim, bias=True)
         self.gat_a = nn.Linear(self.hidden_dim, 1, bias=False)
         self.att_temp = nn.Parameter(torch.tensor(cfg.att_temp))
         self.mp_update = nn.Linear(self.hidden_dim, self.hidden_dim)
@@ -140,18 +143,24 @@ class LibellaGNN(nn.Module):
         inv_alpha = 1.0 - alpha
         h_0_scaled = h_0 * alpha
 
-        # 3. GATv2 Message Passing (Context ONLY)
         h_ctx = h_0
         for _ in range(self.k_hops):
             out = torch.zeros_like(h_ctx)
             if len(src) > 0:
-                h_pair = torch.cat([h_ctx[src], h_ctx[dst], W_bil.unsqueeze(1)], dim=-1)
-                e_raw = self.gat_a(F.leaky_relu(self.gat_w(h_pair))).squeeze(-1)
+                h_src_proj = self.gat_w_src(h_ctx)
+                h_dst_proj = self.gat_w_dst(h_ctx)
+                
+                h_edge = h_src_proj[src] + h_dst_proj[dst] + self.gat_w_edge(W_bil.unsqueeze(1))
+                
+                e_raw = self.gat_a(F.leaky_relu(h_edge)).squeeze(-1)
                 tau = torch.clamp(F.softplus(self.att_temp), min=0.05)
                 e_scaled = e_raw / tau
+                
                 alpha_att = scatter_softmax(e_scaled, dst, N) 
+                
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
                 out.index_add_(0, dst, msg)
+                
             agg = F.silu(self.mp_update(out))
             h_ctx = agg * inv_alpha + h_0_scaled
 
@@ -249,19 +258,27 @@ class LibellaGNN(nn.Module):
         if self.training:
             self.dynamic_w_ema.lerp_(current_dynamic_w, weight=0.1)
             
-        w_mat = 1.0 + (x_c > 0).float() * (current_dynamic_w - 1.0)
         is_non_zero = (x_c > 0)
         
+        # 1. Fuse the weighting logic directly without .float() expansions
         if self.training:
             zero_mask = torch.rand_like(x_c) < 0.05 
-            active_mask = (is_non_zero | (~is_non_zero & zero_mask)).float()
+            # Logic: If >0, use dynamic_w. Else if zero_mask is True, use 1.0. Else use 0.0.
+            masked_w_mat = torch.where(
+                is_non_zero, 
+                current_dynamic_w, 
+                torch.where(zero_mask, 1.0, 0.0)
+            )
         else:
-            active_mask = torch.ones_like(x_c)
-            
-        masked_w_mat = w_mat * active_mask
+            masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0)
+
         raw_delta = recon_c - x_c
         
-        asymmetry_factor = 1.0 + (is_non_zero.float() * 2.0) * (raw_delta < 0).float()
+        # 2. Fuse the asymmetry factor (Removes two massive .float() allocations)
+        # Logic: If it is non_zero AND the delta is negative, weight is 3.0. Otherwise 1.0.
+        asymmetry_factor = torch.where(is_non_zero & (raw_delta < 0), 3.0, 1.0)
+        
+        # Multiply and clamp
         scaled_delta = torch.clamp(raw_delta * asymmetry_factor, min=-30.0, max=30.0)
 
         l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6)))
@@ -285,8 +302,10 @@ class LibellaGNN(nn.Module):
         raw_t_norm = F.normalize(anchors, p=2, dim=-1)
         latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t())
         
-        mask = 1.0 - torch.eye(latent_ortho.shape[0], device=latent_ortho.device)
-        latent_ortho = latent_ortho * mask
+        raw_t_norm = F.normalize(anchors, p=2, dim=-1)
+        latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t())
+        
+        latent_ortho.fill_diagonal_(0.0)
 
         max_overlap = latent_ortho.max(dim=1)[0]
         

@@ -111,18 +111,14 @@ def validate_panel(
     return valid_indices
 
 def _calc_I_perm(
-    F_mat: np.ndarray, 
-    A_sp: sp.csr_matrix, 
-    N: int, 
-    starts: np.ndarray, 
-    ends: np.ndarray, 
-    s_idx: np.ndarray
+    F_mat: np.ndarray, A_sp: sp.csr_matrix, N: int, starts: np.ndarray, ends: np.ndarray, s_idx: np.ndarray
 ) -> np.ndarray:
     """Fast localized topological permutations."""
+    rng = np.random.default_rng()
     perm_idx = np.empty(N, dtype=np.int32)
     for st, ed in zip(starts, ends):
         if ed - st > 1:
-            perm_idx[s_idx[st:ed]] = np.random.permutation(s_idx[st:ed])
+            perm_idx[s_idx[st:ed]] = rng.permutation(s_idx[st:ed])
         else:
             perm_idx[s_idx[st:ed]] = s_idx[st:ed]
     return F_mat[perm_idx].T @ (A_sp.dot(F_mat[perm_idx]))
@@ -206,11 +202,30 @@ def _run_inf(
     W_global = np.zeros((N_cells, saved_k), dtype=np.float32)
     with torch.no_grad():
         for batch in batcher:
-            x_dense = torch.from_numpy(batch["x"].toarray()).float().to(device)
+            # 1. Fast GPU Decompression: Send tiny sparse arrays to device FIRST, then decompress
+            x_coo = batch["x"].tocoo()
+            x_ind = torch.stack([
+                torch.from_numpy(x_coo.row).to(torch.int64),
+                torch.from_numpy(x_coo.col).to(torch.int64)
+            ]).to(device, non_blocking=True)
+            x_val = torch.from_numpy(x_coo.data).to(torch.float32).to(device, non_blocking=True)
+
+            x_coo = batch["x"].tocoo()
+            x_ind = torch.stack([
+                torch.from_numpy(x_coo.row).to(torch.int64),
+                torch.from_numpy(x_coo.col).to(torch.int64)
+            ]).to(device, non_blocking=True)
+            x_val = torch.from_numpy(x_coo.data).to(torch.float32).to(device, non_blocking=True)
+
+            x_dense = torch.sparse_coo_tensor(
+                x_ind, x_val, size=x_coo.shape, device=device
+            ).to_dense()
+
+            # 2. Transfer int32 edge arrays asynchronously
             adj_coo = batch["adj"].tocoo()
-            src = torch.from_numpy(adj_coo.row).long().to(device)
-            dst = torch.from_numpy(adj_coo.col).long().to(device)
-            weights = torch.from_numpy(adj_coo.data).float().to(device)
+            src = torch.from_numpy(adj_coo.row).to(torch.int32).to(device, non_blocking=True)
+            dst = torch.from_numpy(adj_coo.col).to(torch.int32).to(device, non_blocking=True)
+            weights = torch.from_numpy(adj_coo.data).to(torch.float32).to(device, non_blocking=True)
             x_dense, src, dst, weights = pad_mps_shapes(x_dense, src, dst, weights)
             fracs, _ = model(x_dense, src, dst, weights)
             fracs_cpu = fracs.cpu().numpy()
@@ -538,11 +553,23 @@ def get_ecotypes(
             patient_frac_matrix = np.zeros((N_cells, K_topics), dtype=np.float32)
             
             for batch in batcher:
-                x_dense = torch.from_numpy(batch["x"].toarray()).float().to(device)
+                # 1. Fast GPU Decompression: Send tiny sparse arrays to device FIRST, then decompress
+                x_coo = batch["x"].tocoo()
+                x_ind = torch.stack([
+                    torch.from_numpy(x_coo.row).to(torch.int64),
+                    torch.from_numpy(x_coo.col).to(torch.int64)
+                ]).to(device, non_blocking=True)
+                x_val = torch.from_numpy(x_coo.data).to(torch.float32).to(device, non_blocking=True)
+
+                x_dense = torch.sparse_coo_tensor(
+                    x_ind, x_val, size=x_coo.shape, device=device
+                ).to_dense()
+
+                # 2. Transfer int32 edge arrays asynchronously
                 adj_coo = batch["adj"].tocoo()
-                src = torch.from_numpy(adj_coo.row).long().to(device)
-                dst = torch.from_numpy(adj_coo.col).long().to(device)
-                weights = torch.from_numpy(adj_coo.data).float().to(device)
+                src = torch.from_numpy(adj_coo.row).to(torch.int32).to(device, non_blocking=True)
+                dst = torch.from_numpy(adj_coo.col).to(torch.int32).to(device, non_blocking=True)
+                weights = torch.from_numpy(adj_coo.data).to(torch.float32).to(device, non_blocking=True)
                 x_dense, src, dst, weights = pad_mps_shapes(x_dense, src, dst, weights)
                 
                 fracs, _ = model(x_dense, src, dst, weights)
@@ -735,7 +762,7 @@ def make_domains(
                     
                     fracs, _ = model(x_d, bs, bd, bw) 
                     probs = fracs / (fracs.sum(dim=1, keepdim=True) + 1e-9)
-                    W_local[b["orig_core_idx"]] = probs.cpu().numpy()[b["local_core_idx"]]
+                    W_local[b["orig_core_idx"]] = probs.detach().cpu().numpy()[b["local_core_idx"]]
                     
                 W_list.append(W_local)
                 del data, x_sp, adj_sp, batcher; gc.collect()
