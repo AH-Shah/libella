@@ -228,6 +228,11 @@ def _train_loop(
                 weights = weights.to(device)
                 
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
+                
+                # 🚨 Minimal Fix: Only Windows/CUDA get int64. Mac stays int32.
+                if device.type != 'mps':
+                    src = src.to(torch.int64)
+                    dst = dst.to(torch.int64)
 
                 linear_progress = epoch / max(1, cfg.epochs - 1)
                 adjusted_progress = max(0.0, (linear_progress - 0.25) / 0.75)
