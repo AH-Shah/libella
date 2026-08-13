@@ -6,7 +6,7 @@ from pathlib import Path
 
 # --- Import your actual project modules here ---
 # Adjust these imports based on your file structure.
-from .config import RunConfig, cfg  # Assuming this is how you load it
+from .config import cfg
 from .model import LibellaGNN
 from .utils import pad_mps_shapes
 
