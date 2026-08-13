@@ -137,9 +137,18 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
     return training_cache
 
 def prefetch_batches(
-    meta_batches: list[list[dict[str, Any]]]
+    meta_batches: list[list[dict[str, Any]]],
+    ram_cache: dict[Path, dict[str, Any]] | None = None,
 ) -> Iterator[tuple[list[dict[str, Any]], list[Any]]]:
-    """Pure async SSD read. No permanent RAM caching to prevent MPS fragmentation."""
+    """Fetch chunks using an in-RAM cache after Epoch 0, or async SSD reads on first pass."""
+    
+    if ram_cache is not None and len(ram_cache) > 0:
+        for meta_batch in meta_batches:
+            loaded_chunks = [ram_cache[b['chunk_file']] for b in meta_batch]
+            yield meta_batch, loaded_chunks
+        return
+
+
     with ThreadPoolExecutor(max_workers=4) as executor:
         if not meta_batches:
             return
@@ -157,6 +166,10 @@ def prefetch_batches(
                     executor.submit(torch.load, b['chunk_file'], map_location='cpu', weights_only=False) 
                     for b in meta_batches[i+1]
                 ]
+            
+            if ram_cache is not None:
+                for b, chunk in zip(meta_batches[i], loaded_chunks):
+                    ram_cache[b['chunk_file']] = chunk
                     
             yield meta_batches[i], loaded_chunks
             
@@ -199,7 +212,7 @@ def _train_loop(
         alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9)) 
         nan_detected = False
 
-        for step, (meta_meta, loaded_chunks) in enumerate(prefetch_batches(meta_batches)):
+        for step, (meta_meta, loaded_chunks) in enumerate(prefetch_batches(meta_batches, ram_cache=ram_cache)):
             optimizer.zero_grad(set_to_none=True)
             for chunk_idx, batch_ref in enumerate(meta_meta):
                 batch = loaded_chunks[chunk_idx]
