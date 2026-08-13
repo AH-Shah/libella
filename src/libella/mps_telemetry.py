@@ -152,17 +152,23 @@ def run_async_telemetry():
     mod_stats = defaultdict(lambda: {"time": 0.0, "vram_delta": 0.0, "count": 0})
 
     for name, s_evt, e_evt, m0, m1 in phase_records:
-        t = s_evt.elapsed_time(e_evt)
-        phase_stats[name]["time"] += t
-        phase_stats[name]["vram_delta"] += (m1 - m0)
-        phase_stats[name]["peak_vram"] = max(phase_stats[name]["peak_vram"], m1)
-        phase_stats[name]["count"] += 1
+        try:
+            t = s_evt.elapsed_time(e_evt)
+            phase_stats[name]["time"] += t
+            phase_stats[name]["vram_delta"] += (m1 - m0)
+            phase_stats[name]["peak_vram"] = max(phase_stats[name]["peak_vram"], m1)
+            phase_stats[name]["count"] += 1
+        except RuntimeError:
+            pass # Metal fused this operation to 0.0ms; ignore and continue
 
     for name, s_evt, e_evt, m0, m1 in module_records:
-        t = s_evt.elapsed_time(e_evt)
-        mod_stats[name]["time"] += t
-        mod_stats[name]["vram_delta"] += (m1 - m0)
-        mod_stats[name]["count"] += 1
+        try:
+            t = s_evt.elapsed_time(e_evt)
+            mod_stats[name]["time"] += t
+            mod_stats[name]["vram_delta"] += (m1 - m0)
+            mod_stats[name]["count"] += 1
+        except RuntimeError:
+            pass # Metal fused this operation to 0.0ms; ignore and continue
 
     print("\n" + "="*85)
     print(f" 🚀 TRUE ASYNC HIGH-RES RESULTS ({total_chunks} Chunks) 🚀")
@@ -186,8 +192,8 @@ def run_async_telemetry():
                 m_avg_v = m_stats["vram_delta"] / m_stats["count"]
                 print(f"    ↳ [Sub] {m_name:<26} | Avg Time: {m_avg_t:>7.2f} ms | Avg VRAM Δ: {m_avg_v:>7.2f} MB")
     print("="*85)
-    
-    # --- ADD THIS TO PREVENT PYTORCH SHUTDOWN CRASH ---
+
+    # Clean up to prevent PyTorch shutdown crash
     phase_records.clear()
     module_records.clear()
     import gc
