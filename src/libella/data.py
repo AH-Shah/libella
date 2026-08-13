@@ -181,6 +181,9 @@ def geo_subsample(
     global_n_bins: int
 ) -> np.ndarray:
     """Perform vectorized geometric subsampling on a universal grid."""
+    if target_cells <= 0:
+        return np.array([], dtype=int)
+        
     n_cells_total = coords.shape[0]
     if n_cells_total <= target_cells:
         return np.arange(n_cells_total)
@@ -292,13 +295,14 @@ def geo_sketch(
     
     for c in range(n_clusters):
         if 0 < cluster_sizes[c] <= rare_threshold:
-            quotas[c] = cluster_sizes[c]
-            remaining_target -= cluster_sizes[c]
+            take = min(cluster_sizes[c], max(0, remaining_target))
+            quotas[c] = take
+            remaining_target -= take
             
     abundant_clusters = [c for c in range(n_clusters) if cluster_sizes[c] > rare_threshold]
     total_abundant_cells = sum(cluster_sizes[c] for c in abundant_clusters)
     
-    if total_abundant_cells > 0:
+    if total_abundant_cells > 0 and remaining_target > 0:
         for c in abundant_clusters:
             quotas[c] = int(remaining_target * (cluster_sizes[c] / total_abundant_cells))
             
