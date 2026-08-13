@@ -302,11 +302,7 @@ class LibellaGNN(nn.Module):
         collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()
         gene_entropy = -(anchors * torch.log(anchors + 1e-9)).sum(dim=1).mean()
 
-        raw_t_norm = F.normalize(anchors, p=2, dim=-1)
-        latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t())
-        
-        raw_t_norm = F.normalize(anchors, p=2, dim=-1)
-        latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t())
+        latent_ortho = torch.mm(anc_norm, anc_norm.t())
         
         latent_ortho.fill_diagonal_(0.0)
 
