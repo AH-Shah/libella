@@ -73,7 +73,7 @@ def run_async_telemetry():
     print(f"\n[+] Executing TRUE ASYNC HIGH-RES Telemetry on {len(chunk_files)} chunks...")
     training_cache = [{"chunk_file": f} for f in chunk_files]
     
-    model = LibellaGNN(in_channels=2000, n_metaprograms=30).to(device)
+    model = LibellaGNN(in_channels=2000, n_metaprograms=38).to(device)
     model.train()
     attach_async_hooks(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
