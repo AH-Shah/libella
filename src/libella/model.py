@@ -313,8 +313,7 @@ class LibellaGNN(nn.Module):
 
         overlap_excess = max_overlap.sub_(cfg.ortho_overlap_threshold)
         F.relu(overlap_excess, inplace=True)
-        overlap_excess.pow_(2)
-        l_ortho = overlap_excess.mean()
+        l_ortho = overlap_excess.pow(2).mean()
         scaled_ortho = (l_ortho + collapse_penalty) * cfg.ortho_weight
         scaled_gene_ent = gene_entropy * 0.1
 
