@@ -213,20 +213,25 @@ def _train_loop(
                 del row, col, val, indices
                 
                 adj_coo = batch["adj"].tocoo()
-                src = torch.from_numpy(adj_coo.row).to(torch.int32)
-                dst = torch.from_numpy(adj_coo.col).to(torch.int32)
-                weights = torch.from_numpy(adj_coo.data).to(torch.float32)
-                del adj_coo
-                
+
                 if model.training:
-                    keep_mask = torch.rand(src.size(0)) > 0.40
-                    src = src[keep_mask]
-                    dst = dst[keep_mask]
-                    weights = weights[keep_mask]
-                
-                src = src.to(device)
-                dst = dst.to(device)
-                weights = weights.to(device)
+                    keep_mask = np.random.rand(len(adj_coo.row)) > 0.40
+                    row = adj_coo.row[keep_mask]
+                    col = adj_coo.col[keep_mask]
+                    data = adj_coo.data[keep_mask]
+                else:
+                    row, col, data = adj_coo.row, adj_coo.col, adj_coo.data
+
+
+                src = torch.from_numpy(row).to(torch.int32)
+                dst = torch.from_numpy(col).to(torch.int32)
+                weights = torch.from_numpy(data).to(torch.float32)
+
+                del adj_coo
+
+                src = src.to(device, non_blocking=True)
+                dst = dst.to(device, non_blocking=True)
+                weights = weights.to(device, non_blocking=True)
                 
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
 
