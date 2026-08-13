@@ -22,6 +22,7 @@ from sklearn.preprocessing import normalize
 from torch_geometric.data import Data
 from tqdm import tqdm
 from collections.abc import Iterator
+import torch.nn.functional as F
 
 from .config import cfg, paths
 from .utils import get_device
