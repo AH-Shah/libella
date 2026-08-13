@@ -200,16 +200,8 @@ def _train_loop(
             for chunk_idx, batch_ref in enumerate(meta_meta):
                 batch = loaded_chunks[chunk_idx]
                 
-                x_coo = batch["x"].tocoo()
-                row = torch.from_numpy(x_coo.row).to(torch.int32).to(device)
-                col = torch.from_numpy(x_coo.col).to(torch.int32).to(device)
-                val = torch.from_numpy(x_coo.data).to(torch.float32).to(device)
-                shape = x_coo.shape
-                del x_coo 
-                
-                indices = torch.stack([row, col], dim=0)
-                x = torch.sparse_coo_tensor(indices, val, size=shape, device=device).to_dense()
-                del row, col, val, indices
+                x_dense_np = batch["x"].toarray()
+                x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
                 
                 adj_coo = batch["adj"].tocoo()
                 src = torch.from_numpy(adj_coo.row).to(torch.int32)
@@ -529,5 +521,4 @@ def train_gnn(
     gc.collect()
     
     return model, history, optimal_k
-    
     
