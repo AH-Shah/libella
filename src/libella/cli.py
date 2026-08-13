@@ -71,6 +71,12 @@ def run_pipeline(manifest_path: Path) -> None:
     
     # Read Manifest
     manifest = pd.read_csv(manifest_path)
+    manifest.columns = manifest.columns.str.strip()
+    
+    for col in manifest.columns:
+        if manifest[col].dtype == 'object':
+            manifest[col] = manifest[col].astype(str).str.strip()
+
     if "filepath" not in manifest.columns:
         raise ValueError("Manifest CSV must contain a 'filepath' column.")
         
@@ -232,7 +238,7 @@ def main() -> None:
 
     args = parse_args()
     setup_config_from_args(args)
-    run_pipeline(Path(args.manifest))
+    run_pipeline(Path(args.manifest.strip()))
 
 if __name__ == "__main__":
     main()
