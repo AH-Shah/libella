@@ -67,10 +67,15 @@ def run_async_telemetry():
     device = torch.device("mps")
     torch.mps.empty_cache()
     
+    # 🚨 HARDWARE CHECK
+    amp_dtype = torch.bfloat16
+    amp_enabled = True if device.type == "mps" else False
+    print(f"\n[!] AMP Enabled: {amp_enabled} | Dtype: {amp_dtype}")
+    
     chunk_dir = Path("/Users/Hemato/project_3/benchmark/results_profile_50ep/run/temp_training_chunks/")
     chunk_files = list(chunk_dir.glob("*.pt"))
     
-    print(f"\n[+] Executing TRUE ASYNC HIGH-RES Telemetry on {len(chunk_files)} chunks...")
+    print(f"[+] Executing TRUE ASYNC HIGH-RES Telemetry on {len(chunk_files)} chunks...")
     training_cache = [{"chunk_file": f} for f in chunk_files]
     
     model = LibellaGNN(in_channels=2000, n_metaprograms=38).to(device)
@@ -81,6 +86,7 @@ def run_async_telemetry():
     meta_batches = make_meta_batches(training_cache, meta_batch_size=getattr(cfg, "meta_batch_size", 4))
     fetcher = prefetch_batches(meta_batches)
     total_chunks = 0
+    _dtype_verified = False # We will use this to spy on the dtypes once
 
     print("Running pipeline at full speed... (No Syncing during Math!)")
     wall_start = time.time()
@@ -110,7 +116,9 @@ def run_async_telemetry():
                     src, dst = src.to(torch.int64), dst.to(torch.int64)
 
             with TrackMPSAsync("[2] TOTAL FORWARD PASS"):
-                fracs, pure_anchors = model(x, src, dst, weights)
+                # 🚨 AUTOCAST ADDED HERE
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    fracs, pure_anchors = model(x, src, dst, weights)
             
             with TrackMPSAsync("[3] Masking & Targets Setup"):
                 local_core = batch["local_core_idx"]
@@ -126,13 +134,25 @@ def run_async_telemetry():
                 uniform_prior = torch.ones_like(current_p_mean) / pure_anchors.shape[0]
                 target_f_dist = torch.clamp(uniform_prior * 2.0 - current_p_mean.detach(), min=1e-5)
                 target_f_dist = target_f_dist / target_f_dist.sum()
-                recon = f_train @ pure_anchors
 
             with TrackMPSAsync("[4] Loss Function"):
-                loss, _ = model.calc_loss(
-                    recon, x_train, pure_anchors, None, ep=1, total_epochs=30, 
-                    f_train=f_train, target_f_dist=target_f_dist, kl_weight=5.0
-                )
+                # 🚨 AUTOCAST ADDED HERE
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    recon = f_train @ pure_anchors
+                    
+                    # 🚨 DTYPE SPY (Only runs on the very first chunk)
+                    if not _dtype_verified:
+                        print(f"\n🔍 [DTYPE SPY - CHUNK 1]")
+                        print(f"  ↳ x input: {x.dtype}")
+                        print(f"  ↳ fracs (Forward Output): {fracs.dtype}")
+                        print(f"  ↳ recon (Matmul Output): {recon.dtype}")
+                        print(f"  ↳ x_train passed to loss: {x_train.to(recon.dtype).dtype}\n")
+                        _dtype_verified = True
+
+                    loss, _ = model.calc_loss(
+                        recon, x_train.to(recon.dtype), pure_anchors, None, ep=1, total_epochs=30, 
+                        f_train=f_train, target_f_dist=target_f_dist, kl_weight=5.0
+                    )
 
             with TrackMPSAsync("[5] Backward Pass"):
                 (loss / len(meta_meta)).backward()
@@ -159,7 +179,7 @@ def run_async_telemetry():
             phase_stats[name]["peak_vram"] = max(phase_stats[name]["peak_vram"], m1)
             phase_stats[name]["count"] += 1
         except RuntimeError:
-            pass # Metal fused this operation to 0.0ms; ignore and continue
+            pass 
 
     for name, s_evt, e_evt, m0, m1 in module_records:
         try:
@@ -168,7 +188,7 @@ def run_async_telemetry():
             mod_stats[name]["vram_delta"] += (m1 - m0)
             mod_stats[name]["count"] += 1
         except RuntimeError:
-            pass # Metal fused this operation to 0.0ms; ignore and continue
+            pass 
 
     print("\n" + "="*85)
     print(f" 🚀 TRUE ASYNC HIGH-RES RESULTS ({total_chunks} Chunks) 🚀")
@@ -193,7 +213,6 @@ def run_async_telemetry():
                 print(f"    ↳ [Sub] {m_name:<26} | Avg Time: {m_avg_t:>7.2f} ms | Avg VRAM Δ: {m_avg_v:>7.2f} MB")
     print("="*85)
 
-    # Clean up to prevent PyTorch shutdown crash
     phase_records.clear()
     module_records.clear()
     import gc
