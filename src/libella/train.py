@@ -259,7 +259,8 @@ def _train_loop(
     tracker = PhaseTracker()
     
     tqdm.write("\n[*] Adaptive Scheduler Initialized...")
-
+    
+    optimal_k = model.n_metaprograms
     max_entropy_scalar = float(np.log(optimal_k))
 
     for epoch in tqdm(range(start_epoch, cfg.epochs), desc="Training", leave=False):
