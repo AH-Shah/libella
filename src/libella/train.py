@@ -193,7 +193,8 @@ def _train_loop(
     scheduler: torch.optim.lr_scheduler.LRScheduler, 
     training_cache: list[dict[str, Any]], 
     start_epoch: int, 
-    best_val_loss: float, 
+    best_composite_score: float, 
+    tracker_state: dict[str, Any] | None,
     history: dict[str, list]
 ) -> tuple[LibellaGNN, dict[str, list]]:
     print("\n-> Spatial Distillation...")
@@ -205,10 +206,10 @@ def _train_loop(
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
     ema_mean = None
 
-    checkpoint = torch.load("resume_latest.pt")
     tracker = PhaseTracker()
-    if "tracker_state" in checkpoint:
-        tracker.__dict__.update(checkpoint["tracker_state"]) # <--- Restores all history, OLS windows, and streak counters instantly
+    if tracker_state is not None:
+        tracker.__dict__.update(tracker_state)
+        print(f"  ↳ Restored PhaseTracker state (Phase {tracker.phase}, Progress: {tracker.internal_progress:.2f})")
         
     tqdm.write("\n[*] Adaptive Scheduler Initialized...")
     
