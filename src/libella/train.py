@@ -259,9 +259,12 @@ def _train_loop(
             optimizer.zero_grad(set_to_none=True)
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
 
-                
-                x_dense_np = batch["x"].toarray()
-                x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
+                if isinstance(batch["x"], torch.Tensor):
+                    x = batch["x"].to(dtype=torch.float32, device=device)
+                else:
+                    x_dense_np = batch["x"].toarray()
+                    x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
+                    del x_dense_np
                 
                 adj_coo = batch["adj"].tocoo()
                 src = torch.from_numpy(adj_coo.row).to(torch.int32)
