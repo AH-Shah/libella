@@ -125,7 +125,9 @@ def run_pilot(subset_chunks, optimal_k, common_genes):
                     t_idx = core_gpu[torch.from_numpy(t_mask_np).to(dtype=torch.bool, device=device)]
                     f_train, x_train = fracs[t_idx], x[t_idx]
                     recon = f_train @ pure_anchors
-                    t_loss, _ = model.calc_loss(recon, x_train, pure_anchors, None, epoch, max_epochs)
+                    
+                    # Pass f_train here instead of None
+                    t_loss, _ = model.calc_loss(recon, x_train, pure_anchors, f_train, epoch, max_epochs)
                     (t_loss / len(meta_meta)).backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(cfg, "grad_clip", 1.0))
