@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import math
 
 from .config import NOISE_REGEX
 
@@ -61,3 +62,57 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
     sum_val = torch.zeros(num_nodes, dtype=src.dtype, device=src.device).scatter_add(0, index, exp_val)
     return exp_val / (sum_val[index] + 1e-9)
 
+
+
+class PhaseTracker:
+    """Two-phase dynamic scheduler for decoupled representation and sparsification."""
+    def __init__(self, num_cells: int, num_samples: int) -> None:
+        size_ratio = max(1.0, num_cells / 100_000.0)
+        patient_bump = 1.0 + 0.15 * max(0.0, num_samples - 1)
+        
+        # Combined complexity scalar
+        comp = math.sqrt(size_ratio) * patient_bump
+        
+        # Phase 1: Representation (Strict minimums)
+        self.min_p1 = int(25 * comp)
+        self.window = max(4, int(6 * comp))
+        
+        # Phase 2: Gradual Sparsification
+        self.p2_duration = max(20, int(35 * comp))
+        
+        self.min_delta = 0.001
+        self.history = []
+        self.phase = 1
+        self.p2_step = 0
+
+    def get_progress(self) -> float:
+        """Fetch current non-linear progress multiplier."""
+        if self.phase == 1:
+            return 0.0
+            
+        linear_p = self.p2_step / max(1, self.p2_duration - 1)
+        return 0.5 * (1.0 - math.cos(math.pi * linear_p))
+
+    def step(self, loss: float, epoch: int) -> bool:
+        """Update internal state; return True if training is complete."""
+        if self.phase == 2:
+            self.p2_step += 1
+            return self.p2_step >= self.p2_duration
+
+        self.history.append(loss)
+        
+        if epoch < self.min_p1 or len(self.history) < (self.window * 2):
+            return False
+
+        recent = sum(self.history[-self.window:]) / self.window
+        previous = sum(self.history[-(self.window * 2):-self.window]) / self.window
+        
+        if ((previous - recent) / previous) < self.min_delta:
+            self.force_phase2()
+            
+        return False
+
+    def force_phase2(self) -> None:
+        if self.phase == 1:
+            self.phase = 2
+            self.p2_step = 0
