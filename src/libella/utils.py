@@ -65,36 +65,32 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
 
 
 class PhaseTracker:
-    """
-    EMA-Smoothed Closed-Loop Adaptive Scheduler. 
-    Filters out batch noise to make deterministic decisions on manifold health.
-    """
     def __init__(self) -> None:
         self.phase = 1
         
-        # Exponential Moving Averages (The Low-Pass Filter)
+        # EMAs to filter out all batch/epoch noise
         self.ema_rec = None
         self.ema_pw = None
         self.history_ema_rec = []
         self.history_ema_pw = []
         
         self.p1_baseline_rec = None
-        self.p1_epochs = 0
-        
         self.internal_progress = 0.0
-        self.epochs_at_max = 0
+        
+        # Smooth pressure changes (2% increments)
+        self.step_size = 0.02 
 
     def get_progress(self) -> float:
         if self.phase == 1:
             return 0.0
-        # Smooth interpolation: prevents sudden shocks
+        # Smooth curve so parameters don't jump violently
         return 0.5 * (1.0 - math.cos(math.pi * self.internal_progress))
 
     def step(self, epoch_telemetry: dict, epoch: int) -> bool:
-        current_rec = epoch_telemetry.get('l_rec', 0.0)
-        current_pw = epoch_telemetry.get('p_w', 0.0)
+        current_rec = float(epoch_telemetry.get('l_rec', 0.0))
+        current_pw = float(epoch_telemetry.get('p_w', 0.0))
         
-        # 1. Update EMAs (Alpha=0.4: 40% today, 60% history)
+        # 1. Update EMAs (Crushes noise)
         if self.ema_rec is None:
             self.ema_rec = current_rec
             self.ema_pw = current_pw
@@ -105,67 +101,51 @@ class PhaseTracker:
         self.history_ema_rec.append(self.ema_rec)
         self.history_ema_pw.append(self.ema_pw)
 
-        # ---------------------------------------------------------
-        # PHASE 1: Manifold Discovery (Wait for EMA Plateau)
-        # ---------------------------------------------------------
+        # 2. Measure Velocities (Look back 5 epochs)
+        rec_improvement = 1.0
+        pw_gain = 1.0
+        if len(self.history_ema_rec) >= 6:
+            past_rec = self.history_ema_rec[-6]
+            past_pw = self.history_ema_pw[-6]
+            
+            rec_improvement = (past_rec - self.ema_rec) / past_rec
+            pw_gain = self.ema_pw - past_pw
+
         if self.phase == 1:
-            # Require at least 8 epochs to establish a reliable smoothed curve
             if len(self.history_ema_rec) >= 8:
-                # Compare today's smoothed loss against 5 epochs ago
-                past_ema = self.history_ema_rec[-6]
-                current_ema = self.history_ema_rec[-1]
-                
-                # Formula: (Past - Current) / Past
-                improvement = (past_ema - current_ema) / past_ema
-                
-                # If the smoothed curve improved by < 0.5% over 5 epochs, we are flat.
-                if improvement < 0.005:
-                    self.force_phase2(epoch, current_ema)
-                    
+                # If rec_loss improvement is tiny (< 0.5%), it stopped.
+                if rec_improvement < 0.005:
+                    self.force_phase2(epoch, self.ema_rec)
             return False
 
-        # ---------------------------------------------------------
-        # PHASE 2: Loss-Gated Sparsification
-        # ---------------------------------------------------------
         if self.phase == 2:
-            base_step = 1.0 / max(45, self.p1_epochs * 3)
-            
-            # Check manifold health using SMOOTHED loss (Immune to 1-epoch noise spikes)
-            rec_ratio = self.ema_rec / max(1e-9, self.p1_baseline_rec)
-            
-            if rec_ratio <= 1.02:
-                # Safe: Manifold is intact, accelerate sparsity
-                self.internal_progress = min(1.0, self.internal_progress + base_step)
-            elif rec_ratio <= 1.05:
-                # Caution: Stress, slow down
-                self.internal_progress = min(1.0, self.internal_progress + (base_step * 0.33))
+            # Did the smoothed loss get 2% worse than our baseline?
+            if self.ema_rec > (self.p1_baseline_rec * 1.02):
+                # GET BACK (Relieve pressure)
+                self.internal_progress = max(0.0, self.internal_progress - self.step_size)
             else:
-                # Danger: Tearing. Relieve pressure.
-                self.internal_progress = max(0.0, self.internal_progress - (base_step * 0.5))
-
-            # ---------------------------------------------------------
-            # PHASE 3: Polish & Dynamic Termination
-            # ---------------------------------------------------------
-            if self.internal_progress >= 1.0:
-                self.epochs_at_max += 1
+                # KEEP SHARPENING
+                self.internal_progress = min(1.0, self.internal_progress + self.step_size)
                 
-                # Wait for 8 epochs to let the network settle at max parameters
-                if self.epochs_at_max >= 15:
-                    past_pw = self.history_ema_pw[-6]
-                    current_pw_ema = self.history_ema_pw[-1]
-                    
-                    # Absolute gain of P_W over 5 epochs
-                    pw_gain = current_pw_ema - past_pw
-                    
-                    # If smoothed sharpness grew by < 0.25% over 5 epochs, we are squeezed dry.
-                    if pw_gain < 0.25:
-                        return True
+                # Dynamic Baseline: If sharpening actually IMPROVED the loss, 
+                # save this new low as the standard to protect!
+                if self.ema_rec < self.p1_baseline_rec:
+                    self.p1_baseline_rec = self.ema_rec
+
+            if self.internal_progress >= 1.0:
+                # rec_flat: Improvement is < 0.2%
+                rec_flat = (rec_improvement < 0.002) 
+                
+                # pw_flat: Grew by < 0.25% absolute
+                pw_flat = (pw_gain < 0.25) 
+                
+                # Only terminate if BOTH metrics are exhausted
+                if rec_flat and pw_flat:
+                    return True
                         
         return False
         
     def force_phase2(self, epoch: int, current_ema: float) -> None:
-        """Triggered either naturally by loss plateaus, or forcefully by epoch limits."""
         if self.phase == 1:
             self.phase = 2
-            self.p1_baseline_rec = current_ema 
-            self.p1_epochs = epoch
+            self.p1_baseline_rec = current_ema
