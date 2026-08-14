@@ -85,7 +85,7 @@ class PhaseTracker:
         if self.phase == 1:
             return 0.0
         
-        # Smooth interpolation: prevents sudden shocks even if internal_progress jumps
+        # Smooth interpolation: prevents sudden shocks even if internal_progress jumps or regresses
         return 0.5 * (1.0 - math.cos(math.pi * self.internal_progress))
 
     def _get_trend(self, history: list, window: int = 3) -> float:
@@ -113,26 +113,20 @@ class PhaseTracker:
         if self.phase == 1:
             if epoch >= 6:
                 rec_improvement = self._get_trend(self.history_rec, window=3)
-                
                 # If Pure_Rec improves by < 0.2%, manifold is formed.
                 if rec_improvement < 0.002:
-                    self.phase = 2
-                    # Lock in a stable baseline average
-                    self.p1_baseline_rec = sum(self.history_rec[-3:]) / 3 
-                    self.p1_epochs = epoch
-                    print(f"\n[↳] Manifold saturated at Epoch {epoch}. Engaging Adaptive Sparsification...")
+                    self.force_phase2(epoch, current_rec)
             return False
 
         # ---------------------------------------------------------
         # PHASE 2: Loss-Gated Sparsification
         # ---------------------------------------------------------
         if self.phase == 2:
-            # The speed proxy: If it took 35 eps to learn the manifold, 
-            # the safest time to deform it is ~35 eps. (Max speed limit 10 eps)
+            # Speed limit based on how hard the manifold was to learn
             base_step = 1.0 / max(10, self.p1_epochs)
             
             # Check manifold health
-            rec_ratio = current_rec / self.p1_baseline_rec
+            rec_ratio = current_rec / max(1e-9, self.p1_baseline_rec)
             
             if rec_ratio <= 1.02:
                 # Safe: Manifold is intact, accelerate sparsity
@@ -159,7 +153,14 @@ class PhaseTracker:
                     
                     # If P_W fails to grow by at least 0.5% over the window, we are saturated.
                     if pw_absolute_gain < 0.5:
-                        print(f"\n[✓] Topic Sharpness (P_W) saturated at {current_pw:.2f}%. Terminating gracefully.")
                         return True
                         
         return False
+        
+    def force_phase2(self, epoch: int, current_rec: float) -> None:
+        """Triggered either naturally by loss plateaus, or forcefully by epoch limits."""
+        if self.phase == 1:
+            self.phase = 2
+            # Lock in a stable baseline average
+            self.p1_baseline_rec = sum(self.history_rec[-3:]) / 3 if len(self.history_rec) >= 3 else current_rec
+            self.p1_epochs = epoch
