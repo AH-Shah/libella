@@ -95,8 +95,8 @@ class PhaseTracker:
             self.ema_rec = current_rec
             self.ema_pw = current_pw
         else:
-            self.ema_rec = 0.2 * current_rec + 0.8 * self.ema_rec
-            self.ema_pw = 0.2 * current_pw + 0.8 * self.ema_pw
+            self.ema_rec = 0.4 * current_rec + 0.6 * self.ema_rec
+            self.ema_pw = 0.4 * current_pw + 0.6 * self.ema_pw
             
         self.history_ema_rec.append(self.ema_rec)
         self.history_ema_pw.append(self.ema_pw)
