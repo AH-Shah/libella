@@ -442,7 +442,7 @@ def _train_loop(
             # Quality Score: rewards low reconstruction loss balanced with high topic purity
             composite_score = current_rec / max(1.0, math.sqrt(current_pw / 100.0))
 
-            if composite_score < best_composite_score or (tracker.phase == 2 and tracker.get_progress() > 0.8):
+            if composite_score < best_composite_score:
                 best_composite_score = composite_score
                 torch.save({
                     "epoch": epoch,
