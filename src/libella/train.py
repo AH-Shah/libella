@@ -488,7 +488,11 @@ def _train_loop(
                 tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
                 break
 
-        
+        if checkpoint_path.exists():
+            print(f"  ↳ Restoring in-memory model to best Pareto checkpoint ({checkpoint_path.name})...")
+            best_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            model.load_state_dict(best_ckpt["model_state_dict"])
+
         return model, history
 
 def train_gnn(
