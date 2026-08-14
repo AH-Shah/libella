@@ -140,7 +140,7 @@ def prefetch_batches(
     meta_batches: list[list[dict[str, Any]]]
 ) -> Iterator[tuple[list[dict[str, Any]], list[Any]]]:
     """Async fetch of SSD chunks parallel to GPU compute."""
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         if not meta_batches:
             return
             
