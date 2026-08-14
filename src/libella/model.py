@@ -168,8 +168,7 @@ class LibellaGNN(nn.Module):
         Q = self.q_proj(h_id)
         K = self.k_proj(h_ctx)
         V = self.v_proj(h_ctx)
-        
-        # 🚨 Match platform dtype instantly (No casting overhead)
+
         idx_dtype = src.dtype if len(src) > 0 else (torch.int32 if x_dense.device.type == 'mps' else torch.int64)
         self_loops = torch.arange(N, dtype=idx_dtype, device=x_dense.device)
         
@@ -296,16 +295,16 @@ class LibellaGNN(nn.Module):
         collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()
         gene_entropy = -(anchors * torch.log(anchors + 1e-9)).sum(dim=1).mean()
 
-        latent_ortho = torch.mm(anc_norm, anc_norm.t())
+        raw_t_norm = F.normalize(anchors, p=2, dim=-1)
+        latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t())
         
-        latent_ortho.fill_diagonal_(0.0)
+        mask = 1.0 - torch.eye(latent_ortho.shape[0], device=latent_ortho.device)
+        latent_ortho = latent_ortho * mask
 
         max_overlap = latent_ortho.max(dim=1)[0]
         
 
-        overlap_excess = max_overlap.sub_(cfg.ortho_overlap_threshold)
-        F.relu(overlap_excess, inplace=True)
-        l_ortho = overlap_excess.pow(2).mean()
+        l_ortho = (F.relu(max_overlap - cfg.ortho_overlap_threshold) ** 2).mean()
         scaled_ortho = (l_ortho + collapse_penalty) * cfg.ortho_weight
         scaled_gene_ent = gene_entropy * 0.1
 
