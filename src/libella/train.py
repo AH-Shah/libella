@@ -141,20 +141,19 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
                 dst = torch.from_numpy(adj_coo.col).to(torch.int32)
                 weights = torch.from_numpy(adj_coo.data).to(torch.float32)
 
-                # Pre-convert Masks & Index slices
-                local_core = torch.from_numpy(chunk_data["local_core_idx"]).to(torch.int64)
-                t_mask = torch.from_numpy(chunk_data["train_mask"]).to(torch.bool)
-                v_mask = torch.from_numpy(chunk_data["val_mask"]).to(torch.bool)
+                # Pre-slice Core Node Indices (Eliminates runtime GPU mask filtering & syncs)
+                local_core = chunk_data["local_core_idx"]
+                train_core_idx = torch.from_numpy(local_core[chunk_data["train_mask"][local_core]]).to(torch.int64)
+                val_core_idx = torch.from_numpy(local_core[chunk_data["val_mask"][local_core]]).to(torch.int64)
 
                 packaged_chunk = {
                     "x": chunk_x,
                     "src": src,
                     "dst": dst,
                     "weights": weights,
-                    "local_core_idx": local_core,
-                    "train_mask": t_mask,
-                    "val_mask": v_mask,
-                    "patient_name": data.patient_name
+                    "train_core_idx": train_core_idx,
+                    "val_core_idx": val_core_idx,
+                    "patient_name": patient_name
                 }
                 
                 chunk_file = tmp_chunk_dir / f"{data.patient_name}_chunk_{chunk_idx}.pt"
