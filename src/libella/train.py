@@ -302,9 +302,9 @@ def _train_loop(
                     
   
                     chunk_losses = getattr(model, '_last_losses', {})
-                    epoch_telemetry['l_rec'] += chunk_losses.get('rec', 0.0)
-                    epoch_telemetry['l_anc'] += chunk_losses.get('anc', 0.0)
-                    epoch_telemetry['l_ort'] += chunk_losses.get('ort', 0.0)
+                    epoch_telemetry['l_rec'] += float(chunk_losses.get('rec', 0.0))
+                    epoch_telemetry['l_anc'] += float(chunk_losses.get('anc', 0.0))
+                    epoch_telemetry['l_ort'] += float(chunk_losses.get('ort', 0.0))
                     
                     # Accumulate chunk's p_mean on CPU to find true epoch dominant topic
                     epoch_p_mean_sum += current_p_mean.detach().cpu()
