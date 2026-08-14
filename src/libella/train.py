@@ -175,8 +175,8 @@ def _train_loop(
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
     ema_mean = None
 
-    total_cells = sum(b["x"].shape[0] for b in training_cache)
-    num_samples = len(training_cache)
+    total_cells = len(training_cache) * cfg.batch_size
+    num_samples = len(set(b["patient_name"] for b in training_cache))
     tracker = PhaseTracker(num_cells=total_cells, num_samples=num_samples)
     
     tqdm.write(
