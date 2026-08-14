@@ -53,7 +53,8 @@ def _init_model(
         optimizer, T_max=cfg.epochs, eta_min=1e-6
     )
     
-    best_val_loss = float("inf")
+    best_composite_score = float("inf")
+    tracker_state = None
     history = {"train_loss": [], "val_loss": [], "autopsy_metrics": []}
     start_epoch = 0
 
@@ -72,7 +73,8 @@ def _init_model(
             if ckpt.get("scheduler_state_dict"):
                 scheduler.load_state_dict(ckpt["scheduler_state_dict"])
                 
-            best_val_loss = ckpt.get("best_val_loss", float("inf"))
+            best_composite_score = ckpt.get("best_composite_score", ckpt.get("best_val_loss", float("inf")))
+            tracker_state = ckpt.get("tracker_state", None)
             history = ckpt.get("history", history)
             start_epoch = ckpt.get("epoch", -1) + 1
             print(f"  ↳ Successfully resumed from Epoch {start_epoch}")
@@ -80,7 +82,7 @@ def _init_model(
             print(f"  ↳ [!] Failed to load checkpoint: {e}. Raising error to prevent accidental overwrite.")
             raise e 
 
-    return model, optimizer, scheduler, best_val_loss, history, start_epoch
+    return model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch
 
 def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
     """Slice patient graphs into SSD chunks for OOM-safe training."""
