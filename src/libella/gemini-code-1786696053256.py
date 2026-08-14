@@ -2,10 +2,12 @@ import gc
 import json
 import os
 import pickle
+import queue
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from threading import Event, Thread
+from typing import Any, Dict, Iterator, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -14,15 +16,20 @@ import scipy.sparse as sp
 import torch
 from tqdm import tqdm
 
-# Ensure libella source directory is in python path
+# ---------------------------------------------------------------------
+# LIBELLA ROOT RESOLUTION & ENVIRONMENT INITIALIZATION
+# ---------------------------------------------------------------------
 LIBELLA_ROOT = Path(__file__).resolve().parent
 if str(LIBELLA_ROOT) not in sys.path:
     sys.path.insert(0, str(LIBELLA_ROOT))
 
-from libella.config import cfg, paths
+from libella.config import cfg, init_env, paths
 from libella.data import make_meta_batches, pad_mps_shapes
 from libella.model import LibellaGNN
 from libella.utils import PhaseTracker, get_device
+
+# Initialize environment runtime flags (Threading limits, MPS watermark, HDF5 locks)
+init_env()
 
 
 # =====================================================================
@@ -72,7 +79,7 @@ class MemoryAuditor:
             "duration_ms": duration,
         })
         
-        # Log any step expanding RAM or VRAM by > 50 MB
+        # Highlight any step expanding memory by > 50 MB
         if abs(delta_rss) > 50 or abs(delta_vram) > 50:
             print(
                 f"  ⚠️ [SPIKE] {self.step_name:<32} | "
@@ -83,9 +90,9 @@ class MemoryAuditor:
 
     @classmethod
     def print_diagnostic_table(cls):
-        print("\n" + "=" * 105)
-        print(" " * 35 + "📊 SUBPROCESS MEMORY AUDIT 📊")
-        print("=" * 105)
+        print("\n" + "=" * 110)
+        print(" " * 40 + "📊 SUBPROCESS MEMORY AUDIT 📊")
+        print("=" * 110)
         
         if not cls.records:
             print("No profiling events recorded.")
@@ -110,9 +117,9 @@ class MemoryAuditor:
         print(display_df.to_string(index=False))
         
         # Aggregated stats by operation type
-        print("\n" + "-" * 105)
+        print("\n" + "-" * 110)
         print("Aggregated Summary by Subprocess Type:")
-        print("-" * 105)
+        print("-" * 110)
         agg_df = df.groupby("step").agg({
             "delta_rss_mb": ["sum", "max"],
             "delta_vram_mb": ["sum", "max"],
@@ -121,27 +128,27 @@ class MemoryAuditor:
         agg_df.columns = ["Sum ΔRAM (MB)", "Max ΔRAM (MB)", "Sum ΔVRAM (MB)", "Max ΔVRAM (MB)", "Total Time (ms)", "Calls"]
         agg_df = agg_df.sort_values(by="Max ΔRAM (MB)", ascending=False)
         print(agg_df.to_string())
-        print("=" * 105 + "\n")
+        print("=" * 110 + "\n")
 
 
 # =====================================================================
 # 2. ROBUST MULTI-FORMAT PRIOR LOADER
 # =====================================================================
-def safe_load_priors(priors_path: Path) -> tuple[np.ndarray | None, int]:
+def safe_load_priors(priors_path: Path) -> Tuple[np.ndarray | None, int]:
     """Loads cNMF priors serialized with torch, joblib, numpy, or pickle."""
     raw_obj = None
 
-    # 1. Try torch.load (primary cause of \x10 header)
+    # 1. Try joblib (Default pipeline format)
     try:
-        raw_obj = torch.load(priors_path, map_location="cpu", weights_only=False)
+        import joblib
+        raw_obj = joblib.load(priors_path)
     except Exception:
         pass
 
-    # 2. Try joblib
+    # 2. Try torch.load
     if raw_obj is None:
         try:
-            import joblib
-            raw_obj = joblib.load(priors_path)
+            raw_obj = torch.load(priors_path, map_location="cpu", weights_only=False)
         except Exception:
             pass
 
@@ -149,26 +156,28 @@ def safe_load_priors(priors_path: Path) -> tuple[np.ndarray | None, int]:
     if raw_obj is None:
         try:
             raw_obj = np.load(priors_path, allow_pickle=True)
-            if hasattr(raw_obj, "files"):  # npz file
+            if hasattr(raw_obj, "files"):
                 raw_obj = {k: raw_obj[k] for k in raw_obj.files}
         except Exception:
             pass
 
     # 4. Try standard pickle
     if raw_obj is None:
-        with open(priors_path, "rb") as f:
-            raw_obj = pickle.load(f)
+        try:
+            with open(priors_path, "rb") as f:
+                raw_obj = pickle.load(f)
+        except Exception:
+            pass
 
-    # Extract components and K from loaded payload
     init_components = None
-    optimal_k = 30  # default fallback
+    optimal_k = cfg.n_prior_lineages
 
     if isinstance(raw_obj, dict):
         for key in ["init_components", "priors", "components", "basis", "H", "W"]:
             if key in raw_obj:
                 init_components = raw_obj[key]
                 break
-        optimal_k = raw_obj.get("optimal_k", raw_obj.get("k", init_components.shape[0] if init_components is not None else 30))
+        optimal_k = raw_obj.get("optimal_k", raw_obj.get("k", init_components.shape[0] if init_components is not None else optimal_k))
     elif isinstance(raw_obj, (tuple, list)):
         init_components = raw_obj[0]
         optimal_k = raw_obj[1] if len(raw_obj) > 1 and isinstance(raw_obj[1], int) else init_components.shape[0]
@@ -179,16 +188,79 @@ def safe_load_priors(priors_path: Path) -> tuple[np.ndarray | None, int]:
     if isinstance(init_components, torch.Tensor):
         init_components = init_components.detach().cpu().numpy()
 
+    # Append randomized slots if configured (1-1 match with train.py)
+    n_extra_slots = getattr(cfg, "extra_topics", 0)
+    if n_extra_slots > 0 and init_components is not None:
+        extra_slots = np.zeros((n_extra_slots, init_components.shape[1]), dtype=init_components.dtype)
+        init_components = np.vstack([init_components, extra_slots])
+        optimal_k += n_extra_slots
+
     return init_components, int(optimal_k)
 
 
 # =====================================================================
-# 3. DIAGNOSTIC SINGLE-EPOCH RUNNER
+# 3. BOUNDED PREFETCH PIPELINE (1-1 MATCH WITH TRAIN.PY)
+# =====================================================================
+def prefetch_batches_instrumented(
+    meta_batches: List[List[Dict[str, Any]]]
+) -> Iterator[Tuple[List[Dict[str, Any]], Iterator[Any]]]:
+    """Prefetches strictly 1 chunk at a time using a bounded queue to protect memory."""
+    if not meta_batches:
+        return
+
+    for meta_meta in meta_batches:
+        chunk_queue = queue.Queue(maxsize=1)
+        stop_event = Event()
+
+        def safe_put(item: Any) -> bool:
+            while not stop_event.is_set():
+                try:
+                    chunk_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def worker():
+            try:
+                for b in meta_meta:
+                    if stop_event.is_set():
+                        break
+                    with MemoryAuditor("0. SSD Chunk Read (Worker Thread)", b['chunk_file'].name):
+                        chunk = torch.load(b['chunk_file'], map_location='cpu', weights_only=False)
+                    if not safe_put(chunk):
+                        break
+            except Exception as e:
+                safe_put(e)
+            finally:
+                safe_put(None)
+
+        t = Thread(target=worker, daemon=True)
+        t.start()
+
+        def chunk_iterator():
+            try:
+                while True:
+                    chunk = chunk_queue.get()
+                    if chunk is None:
+                        break
+                    if isinstance(chunk, Exception):
+                        raise chunk
+                    yield chunk
+            finally:
+                stop_event.set()
+
+        yield meta_meta, chunk_iterator()
+
+
+# =====================================================================
+# 4. 1-1 SIMULATOR SINGLE-EPOCH RUNNER
 # =====================================================================
 def run_single_epoch_diagnostic(
     genes_path: Path,
     priors_path: Path,
-    chunks_dir: Path
+    chunks_dir: Path,
+    epoch_idx: int = 0
 ):
     device = get_device()
     print(f"\n[i] Compute Device: {device}")
@@ -252,11 +324,19 @@ def run_single_epoch_diagnostic(
     tracker = PhaseTracker()
     ema_mean = None
     
-    print(f"\n[➤] STARTING INSTRUMENTED EPOCH (Batch Accumulation: {accumulation_steps})...\n")
+    print(f"\n[➤] STARTING 1-1 SIMULATOR EPOCH (Batch Accumulation: {accumulation_steps})...\n")
     
     model.train()
     train_loss, val_loss = 0.0, 0.0
     train_steps, val_steps = 0, 0
+    nan_detected = False
+
+    epoch_telemetry = {
+        'ent': 0.0, 'col_r': 0.0, 'kl_w': 0.0, 'g_w': 0.0, 'p_w': 0.0, 
+        'l_rec': 0.0, 'l_anc': 0.0, 'l_ort': 0.0
+    }
+    epoch_p_mean_sum = torch.zeros(optimal_k, dtype=torch.float32)
+    train_chunk_count = 0
     
     with MemoryAuditor("make_meta_batches"):
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
@@ -264,65 +344,66 @@ def run_single_epoch_diagnostic(
     total_steps_per_epoch = len(meta_batches)
     alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
 
-    for step_idx, meta_batch in enumerate(tqdm(meta_batches, desc="Executing Single Epoch", leave=True)):
-        with MemoryAuditor("optimizer.zero_grad", f"Batch {step_idx}"):
+    for step_idx, (meta_meta, chunk_iter) in enumerate(tqdm(prefetch_batches_instrumented(meta_batches), total=total_steps_per_epoch, desc="Executing Simulator Epoch")):
+        with MemoryAuditor("optimizer.zero_grad", f"Step {step_idx}"):
             optimizer.zero_grad(set_to_none=True)
 
-        for chunk_idx, batch_ref in enumerate(meta_batch):
-            c_file: Path = batch_ref["chunk_file"]
-            tag = f"B{step_idx}_C{chunk_idx}_{c_file.name}"
+        for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
+            tag = f"S{step_idx}_C{chunk_idx}_{batch_ref['chunk_file'].name}"
 
-            # 1. SSD Read
-            with MemoryAuditor("1. torch.load (SSD)", tag):
-                batch = torch.load(c_file, map_location="cpu", weights_only=False)
-
-            # 2. SciPy CSR to Dense Matrix
-            with MemoryAuditor("2. batch['x'].toarray() (Dense)", tag):
+            # 1. SciPy CSR to Dense Matrix
+            with MemoryAuditor("1. batch['x'].toarray() (Dense)", tag):
                 x_dense_np = batch["x"].toarray()
 
-            # 3. Dense Tensor Transfer to Device
-            with MemoryAuditor("3. x.to(device)", tag):
+            # 2. Dense Tensor Transfer to Device
+            with MemoryAuditor("2. x.to(device)", tag):
                 x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
                 del x_dense_np
 
-            # 4. COO Adjacency Unpacking
-            with MemoryAuditor("4. Adjacency COO -> Device", tag):
+            # 3. COO Adjacency Unpacking & Edge Dropout
+            with MemoryAuditor("3. Adjacency COO -> Device", tag):
                 adj_coo = batch["adj"].tocoo()
                 src = torch.from_numpy(adj_coo.row).to(torch.int32)
                 dst = torch.from_numpy(adj_coo.col).to(torch.int32)
                 weights = torch.from_numpy(adj_coo.data).to(torch.float32)
                 del adj_coo
 
-                keep_mask = torch.rand(src.size(0)) > 0.40
-                src = src[keep_mask].to(device)
-                dst = dst[keep_mask].to(device)
-                weights = weights[keep_mask].to(device)
-                del keep_mask
+                if model.training:
+                    keep_mask = torch.rand(src.size(0)) > cfg.edge_dropout
+                    src = src[keep_mask]
+                    dst = dst[keep_mask]
+                    weights = weights[keep_mask]
+                    del keep_mask
 
-            # 5. MPS Bucket Padding
-            with MemoryAuditor("5. pad_mps_shapes", tag):
+                src = src.to(device)
+                dst = dst.to(device)
+                weights = weights.to(device)
+
+            # 4. MPS Bucket Padding & Index Type Conformance
+            with MemoryAuditor("4. pad_mps_shapes", tag):
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
                 if device.type != "mps":
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-            # 6. GNN Forward Pass
-            with MemoryAuditor("6. model.forward (GNN)", tag):
+            # 5. GNN Forward Pass & Dynamic Parameter Updates
+            with MemoryAuditor("5. model.forward (GNN)", tag):
                 progress = tracker.get_progress()
+                model.current_progress = progress
                 model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * progress)
                 model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)
                 model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress)
 
                 fracs, pure_anchors = model(x, src, dst, weights)
 
-            # 7. Core Node Extraction & Target Math
-            with MemoryAuditor("7. Calculate Targets & Priors", tag):
+            # 6. Core Node Extraction & Target Math
+            with MemoryAuditor("6. Calculate Targets & Dynamic KL", tag):
                 local_core = batch["local_core_idx"]
                 core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
                 t_mask_np = batch["train_mask"][local_core]
 
             if t_mask_np.sum() > 0:
-                with MemoryAuditor("8. Train Slice & Reconstruction", tag):
+                with MemoryAuditor("7. Train Slice & Reconstruction", tag):
                     t_mask_gpu = torch.from_numpy(t_mask_np).to(dtype=torch.bool, device=device)
                     train_idx = core_gpu[t_mask_gpu]
 
@@ -347,28 +428,52 @@ def run_single_epoch_diagnostic(
                     collapse_ratio = torch.clamp(1.0 - (ema_entropy / max_entropy), min=0.0, max=1.0).item()
 
                     peak_p = ema_mean.max().item()
-                    hub_multiplier = max(0.0, (peak_p / 0.15) - 1.0) * 10.0
+                    hub_multiplier = max(0.0, (peak_p / cfg.hub_threshold) - 1.0) * 10.0
                     dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier
 
                     recon = f_train @ pure_anchors
 
-                with MemoryAuditor("9. model.calc_loss", tag):
+                with MemoryAuditor("8. model.calc_loss", tag):
                     true_batch_loss, base_recon_val = model.calc_loss(
-                        recon, x_train, pure_anchors, None, 0, cfg.epochs,
+                        recon, x_train, pure_anchors, None, epoch_idx, cfg.epochs,
                         f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
                     )
 
-                with MemoryAuditor("10. loss.backward()", tag):
-                    (true_batch_loss / len(meta_batch)).backward()
+                    if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
+                        nan_detected = True
+                        print(f"  ↳ [!] NaN gradient encountered at step {step_idx}.")
+                        break
+
+                with MemoryAuditor("9. loss.backward()", tag):
+                    (true_batch_loss / len(meta_meta)).backward()
                     train_loss += true_batch_loss.item()
                     train_steps += 1
 
-                del t_mask_gpu, train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss
+                # Update Telemetry Stats
+                g_w_val = pure_anchors.max(dim=1).values.mean().item() * 100.0
+                p_w_val = p_train.max(dim=1).values.mean().item() * 100.0
+                ent_val = ema_entropy.detach().cpu().item() if isinstance(ema_entropy, torch.Tensor) else ema_entropy
 
-            # Validation Mask Evaluation
+                epoch_telemetry['ent'] += ent_val
+                epoch_telemetry['col_r'] += collapse_ratio
+                epoch_telemetry['kl_w'] += dynamic_kl_w
+                epoch_telemetry['g_w'] += g_w_val
+                epoch_telemetry['p_w'] += p_w_val
+
+                chunk_losses = getattr(model, '_last_losses', {})
+                epoch_telemetry['l_rec'] += float(chunk_losses.get('rec', 0.0))
+                epoch_telemetry['l_anc'] += float(chunk_losses.get('anc', 0.0))
+                epoch_telemetry['l_ort'] += float(chunk_losses.get('ort', 0.0))
+
+                epoch_p_mean_sum += current_p_mean.detach().cpu()
+                train_chunk_count += 1
+
+                del t_mask_gpu, train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss, base_recon_val
+
+            # Validation Mask Evaluation (1-1 Match with production)
             v_mask_np = batch["val_mask"][local_core]
             if v_mask_np.sum() > 0:
-                with MemoryAuditor("11. Val Evaluation (no_grad)", tag):
+                with MemoryAuditor("10. Val Evaluation (no_grad)", tag):
                     v_mask_gpu = torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=device)
                     val_idx = core_gpu[v_mask_gpu]
 
@@ -395,41 +500,77 @@ def run_single_epoch_diagnostic(
 
                     del v_mask_gpu, val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
 
-            with MemoryAuditor("12. Subgraph Cleanup", tag):
+            with MemoryAuditor("11. Subgraph Memory Cleanup", tag):
                 del batch, src, dst, weights, x, fracs, pure_anchors, core_gpu, local_core, t_mask_np, v_mask_np
                 model.current_f_prob = None
 
-        with MemoryAuditor("13. clip_grad & optimizer.step", f"Batch {step_idx}"):
+        if nan_detected:
+            optimizer.zero_grad(set_to_none=True)
+            break
+
+        # Accumulation Step Execution
+        with MemoryAuditor("12. clip_grad & optimizer.step", f"Step {step_idx}"):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
             optimizer.step()
-
-        with MemoryAuditor("14. gc.collect()", f"Batch {step_idx}"):
-            gc.collect()
-            if device.type == "mps":
-                torch.mps.empty_cache()
-            elif device.type == "cuda":
-                torch.cuda.empty_cache()
 
     with MemoryAuditor("scheduler.step"):
         scheduler.step()
 
-    print("\n[✓] Diagnostic Epoch Complete.")
-    print(f"    Train Loss: {train_loss / (train_steps + 1e-9):.4f} | Val Loss: {val_loss / (val_steps + 1e-9):.4f}")
+    # Step PhaseTracker and calculate true epoch averages
+    if train_chunk_count > 0:
+        for k in epoch_telemetry:
+            epoch_telemetry[k] /= train_chunk_count
+
+        epoch_p_mean = epoch_p_mean_sum / train_chunk_count
+        top_topic_val, top_topic_idx = epoch_p_mean.max(dim=0)
+        epoch_telemetry['top_t_pct'] = top_topic_val.item() * 100.0
+        epoch_telemetry['top_t_id'] = top_topic_idx.item()
+
+    is_done = tracker.step(epoch_telemetry, epoch_idx)
+
+    # Autopsy Telemetry Line
+    mean_train_loss = train_loss / (train_steps + 1e-9)
+    mean_val_loss = val_loss / (val_steps + 1e-9)
+
+    print("\n" + "-" * 110)
+    print(
+        f"[Ep {(epoch_idx+1):03d}] Pure_Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
+        f"V_Loss:{mean_val_loss:<5.3f} (Tot_Loss:{mean_train_loss:<5.3f}) | "
+        f"G_W:{epoch_telemetry.get('g_w', 0.0):<4.1f}% P_W:{epoch_telemetry.get('p_w', 0.0):<4.1f}% "
+        f"TopT:{epoch_telemetry.get('top_t_id', 0)}({epoch_telemetry.get('top_t_pct', 0.0):<4.1f}%) "
+        f"Ent:{epoch_telemetry.get('ent', 0.0):<4.2f} | "
+        f"KL_W:{epoch_telemetry.get('kl_w', 0.0):<4.2f} L_Anc:{epoch_telemetry.get('l_anc', 0.0):<4.2f} "
+        f"L_Ort:{epoch_telemetry.get('l_ort', 0.0):<4.2f}"
+    )
+    print("-" * 110)
+    print(f"[✓] 1-1 Diagnostic Epoch Simulation Finished. PhaseTracker Complete: {is_done}\n")
 
 
 # =====================================================================
-# 4. SCRIPT ENTRYPOINT
+# 5. SCRIPT ENTRYPOINT
 # =====================================================================
 if __name__ == "__main__":
-    GENES_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/common_genes.json")
-    PRIORS_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/global_cnmf_priors.pkl")
-    CHUNKS_DIR = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/temp_training_chunks")
+    out_dirs = paths.make_dirs(cfg.suffix)
+    
+    # Path routing aligned with project structure
+    GENES_FILE = out_dirs["genes"]
+    PRIORS_FILE = out_dirs["cnmf_priors"]
+    CHUNKS_DIR = out_dirs["out"] / "temp_training_chunks"
+
+    # Fallback to local test paths if not found in default paths
+    if not GENES_FILE.exists():
+        GENES_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/common_genes.json")
+    if not PRIORS_FILE.exists():
+        PRIORS_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/global_cnmf_priors.pkl")
+    if not CHUNKS_DIR.exists():
+        CHUNKS_DIR = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/temp_training_chunks")
 
     try:
         run_single_epoch_diagnostic(
             genes_path=GENES_FILE,
             priors_path=PRIORS_FILE,
-            chunks_dir=CHUNKS_DIR
+            chunks_dir=CHUNKS_DIR,
+            epoch_idx=0
         )
     finally:
         MemoryAuditor.print_diagnostic_table()
