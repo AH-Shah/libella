@@ -457,6 +457,24 @@ def _train_loop(
                     f"KL_W:{kl_w:<4.2f} L_Anc:{l_anc:<4.2f} L_Ort:{l_ort:<4.2f}"
                 )
 
+                        # --- Tracker Update & Failsafes ---
+                epochs_remaining = cfg.epochs - epoch - 1
+                if tracker.phase == 1 and epochs_remaining <= tracker.p2_duration:
+                    tqdm.write(f"\n[!] Forced Phase 2 transition to fit within max {cfg.epochs} epochs limit.")
+                    tracker.force_phase2()
+
+                is_done = tracker.step(epoch_telemetry.get('l_rec', 0.0), epoch)
+                
+                if tracker.phase == 2 and tracker.p2_step == 0:
+                    tqdm.write(
+                        f"\n[🚀] Phase 1 Complete (Pure_Rec Plateau). "
+                        f"Engaging Sparsification Phase for {tracker.p2_duration} epochs..."
+                    )
+                    
+                if is_done:
+                    tqdm.write(f"\n[✅] Sparsification complete. Purity maxed. Terminating early at Epoch {epoch}.")
+                    break
+
 
     torch.save({
         "epoch": cfg.epochs - 1,
