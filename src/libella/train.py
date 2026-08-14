@@ -429,9 +429,8 @@ def _train_loop(
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "best_val_loss": best_val_loss,
+                "tracker_state": tracker.__dict__,  # <--- Save the tracker's brain
+                "best_composite_score": best_composite_score,
                 "history": history
             }, out_dir / "resume_latest.pt")
 
