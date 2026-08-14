@@ -38,7 +38,7 @@ class RunConfig:
     
     batch_size: int = 10000
     meta_batch_size: int = 5
-    epochs: int = 500
+    epochs: int = 300
 
     # Graph Construction & Data
     k_neighbors: int = 11
