@@ -21,7 +21,7 @@ from .data import (
 )
 from .model import LibellaGNN
 from .prior import get_priors
-from .utils import get_device
+from .utils import get_device, PhaseTracker
 
 
 
@@ -175,6 +175,15 @@ def _train_loop(
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
     ema_mean = None
 
+    total_cells = sum(b["x"].shape[0] for b in training_cache)
+    num_samples = len(training_cache)
+    tracker = PhaseTracker(num_cells=total_cells, num_samples=num_samples)
+    
+    tqdm.write(
+        f"\n[*] Tracker Initialized | Cells: {total_cells} | Samples: {num_samples}\n"
+        f"    ↳ Min Phase 1: {tracker.min_p1} eps | Sparsification: {tracker.p2_duration} eps"
+    )
+
     for epoch in tqdm(range(start_epoch, cfg.epochs), desc="Training", leave=False):
         model.train()
         train_loss, val_loss = 0.0, 0.0
@@ -225,13 +234,11 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                linear_progress = epoch / max(1, cfg.epochs - 1)
-                adjusted_progress = max(0.0, (linear_progress - 0.25) / 0.75)
-                progress = 0.5 * (1.0 - math.cos(math.pi * adjusted_progress))
+                progress = tracker.get_progress()
 
                 model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * progress)    
                 model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)     
-                model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress)    
+                model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress) 
 
                 fracs, pure_anchors = model(x, src, dst, weights)
                 
@@ -443,7 +450,7 @@ def _train_loop(
                 l_anc = epoch_telemetry.get('l_anc', 0.0)
                 l_ort = epoch_telemetry.get('l_ort', 0.0)
                 
-                # 🚨 LOG FIX: 'Pure_Rec' is now the headline training convergence metric!
+  
                 tqdm.write(
                     f" [Ep {epoch:03d}] Pure_Rec:{l_rec:<5.3f} V_Loss:{history['val_loss'][-1]:<5.3f} (Tot_Loss:{history['train_loss'][-1]:<5.3f}) | "
                     f"G_W:{g_w:<4.1f}% P_W:{p_w:<4.1f}% TopT:{top_id}({top_pct:<4.1f}%) Ent:{ent_val:<4.2f} | "
