@@ -415,18 +415,39 @@ def _train_loop(
         history['autopsy_metrics'].append(epoch_metrics)
 
         # -------------------------------------------------------------
-        # 1. EVERY-5-EPOCHS: Checkpoints & Terminal Telemetry
+        # 1. Pareto Composite Quality Checkpointing (Strict Score Trigger)
+        # -------------------------------------------------------------
+        current_rec = epoch_telemetry.get("l_rec", float("inf"))
+        current_pw = epoch_telemetry.get("p_w", 0.0)
+        composite_score = current_rec / max(1.0, math.sqrt(current_pw / 100.0))
+
+        # Saves checkpoint ONLY when a new true Pareto peak is achieved
+        if composite_score < best_composite_score and not nan_detected:
+            best_composite_score = composite_score
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "best_composite_score": best_composite_score,
+                "metrics": epoch_metrics,
+                "history": history
+            }, checkpoint_path)
+
+        # -------------------------------------------------------------
+        # 2. Periodic Resume State Saving (Every 5 Epochs)
         # -------------------------------------------------------------
         if ((epoch + 1) % 5 == 0 or epoch == cfg.epochs - 1) and not nan_detected:
             autopsy_dir = out_dir / "autopsy_checkpoints"
             autopsy_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "metrics": epoch_metrics}, autopsy_dir / f"epoch_{(epoch+1):03d}.pt")
             
+            # Serialize complete tracker brain with zero tensor dependencies
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "tracker_state": tracker.__dict__,  # <--- Save the tracker's brain
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "best_composite_score": best_composite_score,
+                "tracker_state": tracker.__dict__,
                 "history": history
             }, out_dir / "resume_latest.pt")
 
