@@ -220,8 +220,7 @@ def _train_loop(
                 weights = weights.to(device)
                 
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
-                
-                # 🚨 Minimal Fix: Only Windows/CUDA get int64. Mac stays int32.
+
                 if device.type != 'mps':
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
@@ -316,11 +315,8 @@ def _train_loop(
                 if v_mask_np.sum() > 0:
                     v_mask_gpu = torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=device)
                     val_idx = core_gpu[v_mask_gpu]
-
-                    model.eval() 
+                    
                     with torch.no_grad():
-                        clean_fracs, clean_anchors = model(x, src, dst, weights)
-
                         f_val = fracs[val_idx]
                         x_val = x[val_idx]
                         val_recon = f_val @ pure_anchors
@@ -347,9 +343,8 @@ def _train_loop(
                     
                         val_loss += val_log_cosh.item()
                         val_steps += 1
-
-                    model.train()     
-                    del v_mask_gpu, val_idx, clean_fracs, clean_anchors, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
+                        
+                    del v_mask_gpu, val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
                     
 
                 del batch, src, dst, weights, x, fracs, pure_anchors, core_gpu, local_core, t_mask_np, v_mask_np
