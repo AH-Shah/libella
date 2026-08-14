@@ -18,6 +18,7 @@ from .inference import (
     process_pt,
     run_meta,
 )
+from .model import LibellaGNN              
 from .train import train_gnn
 from .utils import get_device, get_whitelist # Moved import here
 
