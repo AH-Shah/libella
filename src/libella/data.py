@@ -601,7 +601,7 @@ def get_consensus_genes(
     
     # If the whitelist already returned fewer genes than the cap, return them all
     if len(valid_genes) <= top_n:
-        print(f"  ↳ Whitelisted Feature Space: {len(valid_genes)} genes (Below {top_n} cap)")
+        print(f"  ↳ Whitelisted Feature Space: {len(valid_genes)} genes ")
         return valid_genes
         
     # --- RANK AGGREGATION TO FIND TOP SPATIAL PREDICTORS ---
