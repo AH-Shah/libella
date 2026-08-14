@@ -391,12 +391,11 @@ def _train_loop(
             epoch_telemetry['top_t_pct'] = top_topic_val.item() * 100.0
             epoch_telemetry['top_t_id'] = top_topic_idx.item()
 
-        # (Delete the old ls = {...} snapshot line)
         current_lr = round(optimizer.param_groups[0]['lr'], 6)
         
         epoch_metrics = {
             'epoch': epoch,
-            'train_loss': round(history['train_loss'][-1], 4), # Blended Total
+            'train_loss': round(history['train_loss'][-1], 4),
             'val_loss': round(history['val_loss'][-1], 4),
             'lr': current_lr,
             'loss_components': {
@@ -414,6 +413,9 @@ def _train_loop(
         }
         history['autopsy_metrics'].append(epoch_metrics)
 
+        # -------------------------------------------------------------
+        # 1. EVERY-5-EPOCHS: Checkpoints & Terminal Telemetry
+        # -------------------------------------------------------------
         if ((epoch + 1) % 5 == 0 or epoch == cfg.epochs - 1) and not nan_detected:
             autopsy_dir = out_dir / "autopsy_checkpoints"
             autopsy_dir.mkdir(parents=True, exist_ok=True)
@@ -438,42 +440,37 @@ def _train_loop(
                 }, checkpoint_path)
 
             with torch.no_grad():
-                g_w = epoch_telemetry.get('g_w', 0.0)
-                p_w = epoch_telemetry.get('p_w', 0.0)
-                top_id = epoch_telemetry.get('top_t_id', 0)
-                top_pct = epoch_telemetry.get('top_t_pct', 0.0)
-                ent_val = epoch_telemetry.get('ent', 0.0)
-                kl_w = epoch_telemetry.get('kl_w', 0.0)
-                
-                # Retrieve pure averaged losses
-                l_rec = epoch_telemetry.get('l_rec', 0.0)
-                l_anc = epoch_telemetry.get('l_anc', 0.0)
-                l_ort = epoch_telemetry.get('l_ort', 0.0)
-                
-  
+                # Print beautiful, single-line telemetry every 5 epochs
                 tqdm.write(
-                    f" [Ep {epoch:03d}] Pure_Rec:{l_rec:<5.3f} V_Loss:{history['val_loss'][-1]:<5.3f} (Tot_Loss:{history['train_loss'][-1]:<5.3f}) | "
-                    f"G_W:{g_w:<4.1f}% P_W:{p_w:<4.1f}% TopT:{top_id}({top_pct:<4.1f}%) Ent:{ent_val:<4.2f} | "
-                    f"KL_W:{kl_w:<4.2f} L_Anc:{l_anc:<4.2f} L_Ort:{l_ort:<4.2f}"
+                    f" [Ep {(epoch+1):03d}] Pure_Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
+                    f"V_Loss:{history['val_loss'][-1]:<5.3f} (Tot_Loss:{history['train_loss'][-1]:<5.3f}) | "
+                    f"G_W:{epoch_telemetry.get('g_w', 0.0):<4.1f}% P_W:{epoch_telemetry.get('p_w', 0.0):<4.1f}% "
+                    f"TopT:{epoch_telemetry.get('top_t_id', 0)}({epoch_telemetry.get('top_t_pct', 0.0):<4.1f}%) "
+                    f"Ent:{epoch_telemetry.get('ent', 0.0):<4.2f} | "
+                    f"KL_W:{epoch_telemetry.get('kl_w', 0.0):<4.2f} L_Anc:{epoch_telemetry.get('l_anc', 0.0):<4.2f} "
+                    f"L_Ort:{epoch_telemetry.get('l_ort', 0.0):<4.2f}"
                 )
 
-                        # --- Tracker Update & Failsafes ---
-                epochs_remaining = cfg.epochs - epoch - 1
-                if tracker.phase == 1 and epochs_remaining <= tracker.p2_duration:
-                    tqdm.write(f"\n[!] Forced Phase 2 transition to fit within max {cfg.epochs} epochs limit.")
-                    tracker.force_phase2()
+        # -------------------------------------------------------------
+        # 2. EVERY EPOCH: Tracker Math & Failsafes
+        # -------------------------------------------------------------
+        epochs_remaining = cfg.epochs - epoch - 1
+        if tracker.phase == 1 and epochs_remaining <= tracker.p2_duration:
+            tqdm.write(f"\n[!] Forced Phase 2 transition to fit within max {cfg.epochs} epochs limit.")
+            tracker.force_phase2()
 
-                is_done = tracker.step(epoch_telemetry.get('l_rec', 0.0), epoch)
-                
-                if tracker.phase == 2 and tracker.p2_step == 0:
-                    tqdm.write(
-                        f"\n[🚀] Phase 1 Complete (Pure_Rec Plateau). "
-                        f"Engaging Sparsification Phase for {tracker.p2_duration} epochs..."
-                    )
-                    
-                if is_done:
-                    tqdm.write(f"\n[✅] Sparsification complete. Purity maxed. Terminating early at Epoch {epoch}.")
-                    break
+        # Tracker requires epoch-by-epoch loss to calculate smooth windows
+        is_done = tracker.step(epoch_telemetry.get('l_rec', 0.0), epoch)
+        
+        if tracker.phase == 2 and tracker.p2_step == 0:
+            tqdm.write(
+                f"\n[🚀] Phase 1 Complete (Pure_Rec Plateau). "
+                f"Engaging Sparsification Phase for {tracker.p2_duration} epochs..."
+            )
+            
+        if is_done:
+            tqdm.write(f"\n[✅] Sparsification complete. Purity maxed. Terminating early at Epoch {(epoch+1)}.")
+            break
 
 
     torch.save({
