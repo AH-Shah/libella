@@ -183,7 +183,13 @@ def calibrate_scaling_laws():
     
     for frac in fractions:
         n_chunks = max(1, int(len(all_chunks) * frac))
-        subset = [{"chunk_file": c} for c in random.sample(all_chunks, n_chunks)]
+        subset = [
+            {
+                "chunk_file": c,
+                "patient_name": c.stem.rsplit("_chunk_", 1)[0] if "_chunk_" in c.stem else "sample_0"
+            }
+            for c in random.sample(all_chunks, n_chunks)
+        ]
         subset_cells = n_chunks * batch_size
         
         print(f"\n[➤] Running Pilot: {frac*100:.0f}% of Data ({subset_cells} cells, {n_chunks} chunks)...")
