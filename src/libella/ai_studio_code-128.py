@@ -127,7 +127,7 @@ def run_pilot(subset_chunks, optimal_k, common_genes):
                     recon = f_train @ pure_anchors
                     
                     # Pass f_train here instead of None
-                    t_loss, _ = model.calc_loss(recon, x_train, pure_anchors, f_train, epoch, max_epochs)
+                    t_loss, _ = model.calc_loss(recon, x_train, f_train, pure_anchors, epoch, max_epochs)
                     (t_loss / len(meta_meta)).backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(cfg, "grad_clip", 1.0))
