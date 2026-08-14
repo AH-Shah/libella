@@ -128,7 +128,7 @@ class PhaseTracker:
         # PHASE 2: Loss-Gated Sparsification
         # ---------------------------------------------------------
         if self.phase == 2:
-            base_step = 1.0 / max(10, self.p1_epochs)
+            base_step = 1.0 / max(45, self.p1_epochs * 3)
             
             # Check manifold health using SMOOTHED loss (Immune to 1-epoch noise spikes)
             rec_ratio = self.ema_rec / max(1e-9, self.p1_baseline_rec)
@@ -150,7 +150,7 @@ class PhaseTracker:
                 self.epochs_at_max += 1
                 
                 # Wait for 8 epochs to let the network settle at max parameters
-                if self.epochs_at_max >= 8:
+                if self.epochs_at_max >= 15:
                     past_pw = self.history_ema_pw[-6]
                     current_pw_ema = self.history_ema_pw[-1]
                     
