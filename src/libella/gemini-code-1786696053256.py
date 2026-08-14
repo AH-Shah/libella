@@ -4,6 +4,7 @@ import os
 import pickle
 import queue
 import sys
+import threading
 import time
 from pathlib import Path
 from threading import Event, Thread
@@ -28,24 +29,29 @@ from libella.data import make_meta_batches, pad_mps_shapes
 from libella.model import LibellaGNN
 from libella.utils import PhaseTracker, get_device
 
-# Initialize environment runtime flags (Threading limits, MPS watermark, HDF5 locks)
+# Lock runtime flags and MPS watermark (Non-blocking async mode)
 init_env()
 
 
 # =====================================================================
-# 1. GRANULAR STEP MEMORY PROFILER
+# 1. ASYNC THREAD-SAFE MEMORY AUDITOR
 # =====================================================================
 class MemoryAuditor:
-    """Tracks OS Resident Set Size (RSS) and Device VRAM across pipeline sub-steps."""
+    """Tracks OS RSS and Device VRAM without blocking GPU pipelines."""
     records: List[Dict[str, Any]] = []
+    _lock = threading.Lock()
     
-    def __init__(self, step_name: str, meta_info: str = ""):
+    def __init__(self, step_name: str, meta_info: str = "", is_worker_thread: bool = False):
         self.step_name = step_name
         self.meta_info = meta_info
+        self.is_worker = is_worker_thread
         self.process = psutil.Process(os.getpid())
         self.device = get_device()
         
     def _get_vram(self) -> float:
+        # Never query MPS backend from background threads to avoid Metal lockups
+        if self.is_worker:
+            return 0.0
         if self.device.type == "cuda" and torch.cuda.is_available():
             return torch.cuda.memory_allocated() / (1024 ** 2)
         elif self.device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
@@ -53,7 +59,7 @@ class MemoryAuditor:
         return 0.0
 
     def __enter__(self):
-        self.start_rss = self.process.memory_info().rss / (1024 ** 2)  # MB
+        self.start_rss = self.process.memory_info().rss / (1024 ** 2)
         self.start_vram = self._get_vram()
         self.start_time = time.perf_counter()
         return self
@@ -67,7 +73,7 @@ class MemoryAuditor:
         delta_rss = self.end_rss - self.start_rss
         delta_vram = self.end_vram - self.start_vram
         
-        self.records.append({
+        record = {
             "step": self.step_name,
             "info": self.meta_info,
             "start_rss_mb": self.start_rss,
@@ -77,14 +83,18 @@ class MemoryAuditor:
             "end_vram_mb": self.end_vram,
             "delta_vram_mb": delta_vram,
             "duration_ms": duration,
-        })
+        }
         
-        # Highlight any step expanding memory by > 50 MB
-        if abs(delta_rss) > 50 or abs(delta_vram) > 50:
+        with MemoryAuditor._lock:
+            self.records.append(record)
+        
+        # Report spikes > 50 MB
+        if abs(delta_rss) > 50 or (not self.is_worker and abs(delta_vram) > 50):
+            vram_str = f"VRAM: {self.end_vram:7.1f} MB (Δ {delta_vram:+6.1f} MB)" if not self.is_worker else "VRAM: [Worker CPU]"
             print(
                 f"  ⚠️ [SPIKE] {self.step_name:<32} | "
                 f"RAM: {self.end_rss:7.1f} MB (Δ {delta_rss:+6.1f} MB) | "
-                f"VRAM: {self.end_vram:7.1f} MB (Δ {delta_vram:+6.1f} MB) | "
+                f"{vram_str} | "
                 f"Time: {duration:6.1f}ms"
             )
 
@@ -98,9 +108,9 @@ class MemoryAuditor:
             print("No profiling events recorded.")
             return
 
-        df = pd.DataFrame(cls.records)
+        with cls._lock:
+            df = pd.DataFrame(cls.records)
         
-        # Sort by peak RSS delta
         top_spikes = df.sort_values(by="delta_rss_mb", ascending=False).head(15)
         
         display_df = pd.DataFrame({
@@ -116,7 +126,6 @@ class MemoryAuditor:
         print("\nTop 15 RAM Spikes (by Delta Expansion):")
         print(display_df.to_string(index=False))
         
-        # Aggregated stats by operation type
         print("\n" + "-" * 110)
         print("Aggregated Summary by Subprocess Type:")
         print("-" * 110)
@@ -132,27 +141,23 @@ class MemoryAuditor:
 
 
 # =====================================================================
-# 2. ROBUST MULTI-FORMAT PRIOR LOADER
+# 2. MULTI-FORMAT PRIOR LOADER
 # =====================================================================
 def safe_load_priors(priors_path: Path) -> Tuple[np.ndarray | None, int]:
-    """Loads cNMF priors serialized with torch, joblib, numpy, or pickle."""
     raw_obj = None
 
-    # 1. Try joblib (Default pipeline format)
     try:
         import joblib
         raw_obj = joblib.load(priors_path)
     except Exception:
         pass
 
-    # 2. Try torch.load
     if raw_obj is None:
         try:
             raw_obj = torch.load(priors_path, map_location="cpu", weights_only=False)
         except Exception:
             pass
 
-    # 3. Try numpy
     if raw_obj is None:
         try:
             raw_obj = np.load(priors_path, allow_pickle=True)
@@ -161,7 +166,6 @@ def safe_load_priors(priors_path: Path) -> Tuple[np.ndarray | None, int]:
         except Exception:
             pass
 
-    # 4. Try standard pickle
     if raw_obj is None:
         try:
             with open(priors_path, "rb") as f:
@@ -188,7 +192,6 @@ def safe_load_priors(priors_path: Path) -> Tuple[np.ndarray | None, int]:
     if isinstance(init_components, torch.Tensor):
         init_components = init_components.detach().cpu().numpy()
 
-    # Append randomized slots if configured (1-1 match with train.py)
     n_extra_slots = getattr(cfg, "extra_topics", 0)
     if n_extra_slots > 0 and init_components is not None:
         extra_slots = np.zeros((n_extra_slots, init_components.shape[1]), dtype=init_components.dtype)
@@ -199,12 +202,12 @@ def safe_load_priors(priors_path: Path) -> Tuple[np.ndarray | None, int]:
 
 
 # =====================================================================
-# 3. BOUNDED PREFETCH PIPELINE (1-1 MATCH WITH TRAIN.PY)
+# 3. DEADLOCK-PROOF ASYNC PREFETCHER
 # =====================================================================
-def prefetch_batches_instrumented(
+def prefetch_batches_async(
     meta_batches: List[List[Dict[str, Any]]]
 ) -> Iterator[Tuple[List[Dict[str, Any]], Iterator[Any]]]:
-    """Prefetches strictly 1 chunk at a time using a bounded queue to protect memory."""
+    """Prefetches strictly 1 chunk asynchronously without locking Metal or queues."""
     if not meta_batches:
         return
 
@@ -215,7 +218,7 @@ def prefetch_batches_instrumented(
         def safe_put(item: Any) -> bool:
             while not stop_event.is_set():
                 try:
-                    chunk_queue.put(item, timeout=0.1)
+                    chunk_queue.put(item, timeout=0.05)
                     return True
                 except queue.Full:
                     continue
@@ -226,7 +229,7 @@ def prefetch_batches_instrumented(
                 for b in meta_meta:
                     if stop_event.is_set():
                         break
-                    with MemoryAuditor("0. SSD Chunk Read (Worker Thread)", b['chunk_file'].name):
+                    with MemoryAuditor("0. SSD Chunk Read (Worker)", b['chunk_file'].name, is_worker_thread=True):
                         chunk = torch.load(b['chunk_file'], map_location='cpu', weights_only=False)
                     if not safe_put(chunk):
                         break
@@ -249,12 +252,18 @@ def prefetch_batches_instrumented(
                     yield chunk
             finally:
                 stop_event.set()
+                # Drain any remaining queue items to release the worker
+                while not chunk_queue.empty():
+                    try:
+                        chunk_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
         yield meta_meta, chunk_iterator()
 
 
 # =====================================================================
-# 4. 1-1 SIMULATOR SINGLE-EPOCH RUNNER
+# 4. SINGLE-EPOCH 1-1 SIMULATOR
 # =====================================================================
 def run_single_epoch_diagnostic(
     genes_path: Path,
@@ -318,9 +327,9 @@ def run_single_epoch_diagnostic(
         )
 
     # -------------------------------------------------------------
-    # Step D: Single Epoch Execution Loop
+    # Step D: Pipeline Execution Loop (100% Async)
     # -------------------------------------------------------------
-    accumulation_steps = getattr(cfg, "meta_batch_size", 4)
+    accumulation_steps = getattr(cfg, "meta_batch_size", 5)
     tracker = PhaseTracker()
     ema_mean = None
     
@@ -344,7 +353,7 @@ def run_single_epoch_diagnostic(
     total_steps_per_epoch = len(meta_batches)
     alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
 
-    for step_idx, (meta_meta, chunk_iter) in enumerate(tqdm(prefetch_batches_instrumented(meta_batches), total=total_steps_per_epoch, desc="Executing Simulator Epoch")):
+    for step_idx, (meta_meta, chunk_iter) in enumerate(tqdm(prefetch_batches_async(meta_batches), total=total_steps_per_epoch, desc="Executing Simulator Epoch")):
         with MemoryAuditor("optimizer.zero_grad", f"Step {step_idx}"):
             optimizer.zero_grad(set_to_none=True)
 
@@ -449,7 +458,7 @@ def run_single_epoch_diagnostic(
                     train_loss += true_batch_loss.item()
                     train_steps += 1
 
-                # Update Telemetry Stats
+                # Update Telemetry Metrics
                 g_w_val = pure_anchors.max(dim=1).values.mean().item() * 100.0
                 p_w_val = p_train.max(dim=1).values.mean().item() * 100.0
                 ent_val = ema_entropy.detach().cpu().item() if isinstance(ema_entropy, torch.Tensor) else ema_entropy
@@ -470,7 +479,7 @@ def run_single_epoch_diagnostic(
 
                 del t_mask_gpu, train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss, base_recon_val
 
-            # Validation Mask Evaluation (1-1 Match with production)
+            # Validation Mask Evaluation
             v_mask_np = batch["val_mask"][local_core]
             if v_mask_np.sum() > 0:
                 with MemoryAuditor("10. Val Evaluation (no_grad)", tag):
@@ -516,7 +525,7 @@ def run_single_epoch_diagnostic(
     with MemoryAuditor("scheduler.step"):
         scheduler.step()
 
-    # Step PhaseTracker and calculate true epoch averages
+    # Step PhaseTracker and aggregate telemetry
     if train_chunk_count > 0:
         for k in epoch_telemetry:
             epoch_telemetry[k] /= train_chunk_count
@@ -528,7 +537,7 @@ def run_single_epoch_diagnostic(
 
     is_done = tracker.step(epoch_telemetry, epoch_idx)
 
-    # Autopsy Telemetry Line
+    # Telemetry Line Output
     mean_train_loss = train_loss / (train_steps + 1e-9)
     mean_val_loss = val_loss / (val_steps + 1e-9)
 
@@ -552,12 +561,10 @@ def run_single_epoch_diagnostic(
 if __name__ == "__main__":
     out_dirs = paths.make_dirs(cfg.suffix)
     
-    # Path routing aligned with project structure
     GENES_FILE = out_dirs["genes"]
     PRIORS_FILE = out_dirs["cnmf_priors"]
     CHUNKS_DIR = out_dirs["out"] / "temp_training_chunks"
 
-    # Fallback to local test paths if not found in default paths
     if not GENES_FILE.exists():
         GENES_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/common_genes.json")
     if not PRIORS_FILE.exists():
