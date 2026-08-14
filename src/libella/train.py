@@ -259,52 +259,49 @@ def _train_loop(
     
     tqdm.write("\n[*] Adaptive Scheduler Initialized...")
 
+    max_entropy_scalar = float(np.log(optimal_k))
+
     for epoch in tqdm(range(start_epoch, cfg.epochs), desc="Training", leave=False):
         model.train()
-        train_loss, val_loss = 0.0, 0.0
         train_steps, val_steps = 0, 0
-
-        
-        epoch_telemetry = {
-            'ent': 0.0, 'col_r': 0.0, 'kl_w': 0.0, 'g_w': 0.0, 'p_w': 0.0, 
-            'l_rec': 0.0, 'l_anc': 0.0, 'l_ort': 0.0
-        }
-        epoch_p_mean_sum = 0
         train_chunk_count = 0
+
+        # GPU-resident accumulator buffers (Zero CPU-GPU sync stalls during loop)
+        train_loss_acc = torch.tensor(0.0, device=device)
+        val_loss_acc = torch.tensor(0.0, device=device)
+        epoch_p_mean_sum = torch.zeros(optimal_k, device=device)
         
+        gpu_telemetry = {
+            'ent': torch.tensor(0.0, device=device),
+            'col_r': torch.tensor(0.0, device=device),
+            'kl_w': torch.tensor(0.0, device=device),
+            'g_w': torch.tensor(0.0, device=device),
+            'p_w': torch.tensor(0.0, device=device),
+            'l_rec': torch.tensor(0.0, device=device),
+            'l_anc': torch.tensor(0.0, device=device),
+            'l_ort': torch.tensor(0.0, device=device)
+        }
+
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
-        optimizer.zero_grad(set_to_none=True)
-        
         total_steps_per_epoch = len(meta_batches)
-        alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9)) 
+        alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
         nan_detected = False
 
         for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
             optimizer.zero_grad(set_to_none=True)
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
 
-                if isinstance(batch["x"], torch.Tensor):
-                    x = batch["x"].to(dtype=torch.float32, device=device)
-                else:
-                    x_dense_np = batch["x"].toarray()
-                    x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
-                    del x_dense_np
+                # Direct non-blocking transfers from pre-tensorized SSD chunks
+                x = batch["x"].to(device=device, non_blocking=True)
+                src = batch["src"].to(device=device, non_blocking=True)
+                dst = batch["dst"].to(device=device, non_blocking=True)
+                weights = batch["weights"].to(device=device, non_blocking=True)
                 
-                adj_coo = batch["adj"].tocoo()
-                src = torch.from_numpy(adj_coo.row).to(torch.int32)
-                dst = torch.from_numpy(adj_coo.col).to(torch.int32)
-                weights = torch.from_numpy(adj_coo.data).to(torch.float32)
-                del adj_coo
-                
-                if model.training:
-                    keep_mask = torch.rand(src.size(0)) > 0.40
+                if model.training and len(src) > 0:
+                    keep_mask = torch.rand(src.size(0), device=device) > cfg.edge_dropout
                     src = src[keep_mask]
                     dst = dst[keep_mask]
                     weights = weights[keep_mask]
-                
-                src = src.to(device)
-                dst = dst.to(device)
-                weights = weights.to(device)
                 
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
 
@@ -320,95 +317,75 @@ def _train_loop(
 
                 fracs, pure_anchors = model(x, src, dst, weights)
                 
-                local_core = batch["local_core_idx"]
-                core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
+                # Guaranteed >0 train nodes by SSD preparation; unconditional zero-sync execution
+                train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
+
+                f_train = fracs[train_idx]
+                x_train = x[train_idx]
+
+                p_train = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
+                current_p_mean = p_train.mean(dim=0)
                 
-                t_mask_np = batch["train_mask"][local_core]
-                if t_mask_np.sum() > 0:
-                    t_mask_gpu = torch.from_numpy(t_mask_np).to(dtype=torch.bool, device=device)
-                    train_idx = core_gpu[t_mask_gpu]
-
-                    f_train = fracs[train_idx]
-                    x_train = x[train_idx]
+                # Pure GPU EMA Target Calculation (0 CPU-GPU syncs)
+                uniform_prior = torch.ones_like(current_p_mean) / pure_anchors.shape[0]
+                if ema_mean is None:
+                    ema_mean = current_p_mean.detach()
+                else:
+                    ema_mean = alpha_ema * current_p_mean.detach() + (1 - alpha_ema) * ema_mean
+                
+                ideal_c = uniform_prior * 2.0 - ema_mean
+                ideal_c = torch.clamp(ideal_c, min=1e-5) 
+                target_f_dist = ideal_c / ideal_c.sum()
                     
+                ema_entropy = -torch.sum(ema_mean * torch.log(ema_mean + 1e-9))
+                collapse_ratio = torch.clamp(1.0 - (ema_entropy / max_entropy_scalar), min=0.0, max=1.0)
 
-                    p_train = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
-                    current_p_mean = p_train.mean(dim=0)
-                    
-                    # 🚨 Glacier EMA Target Calculation
-                    uniform_prior = torch.ones_like(current_p_mean) / pure_anchors.shape[0]
-                    if ema_mean is None:
-                        ema_mean = current_p_mean.detach()
-                    else:
-                        ema_mean = alpha_ema * current_p_mean.detach() + (1 - alpha_ema) * ema_mean
-                    
-                    ideal_c = uniform_prior * 2.0 - ema_mean
-                    ideal_c = torch.clamp(ideal_c, min=1e-5) 
-                    target_f_dist = ideal_c / ideal_c.sum()
-                        
-                    ema_entropy = -torch.sum(ema_mean * torch.log(ema_mean + 1e-9))
-                    max_entropy = np.log(pure_anchors.shape[0])
-                    collapse_ratio = torch.clamp(1.0 - (ema_entropy / max_entropy), min=0.0, max=1.0).item()
+                peak_p = ema_mean.max()
+                hub_multiplier = F.relu((peak_p / cfg.hub_threshold) - 1.0) * 10.0 
 
+                dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier 
 
-                    ideal_p = 1.0 / pure_anchors.shape[0]
-                    peak_p = ema_mean.max().item()
-                    
-                    hub_multiplier = max(0.0, (peak_p / 0.15) - 1.0) * 10.0 
+                recon = f_train @ pure_anchors
+                true_batch_loss, base_recon_val = model.calc_loss(
+                    recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
+                    f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
+                )
 
-                    dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + (hub_multiplier) 
+                if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
+                    nan_detected = True
+                    break
 
-                    recon = f_train @ pure_anchors
-                    true_batch_loss, base_recon_val = model.calc_loss(
-                        recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
-                        f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
-                    )
+                (true_batch_loss / len(meta_meta)).backward()
+                
+                train_loss_acc += true_batch_loss.detach()
+                train_steps += 1
 
-                    if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
-                        nan_detected = True
-                        break
+                # Pure GPU Telemetry Accumulation
+                gpu_telemetry['g_w'] += pure_anchors.max(dim=1).values.mean().detach() * 100.0
+                gpu_telemetry['p_w'] += p_train.max(dim=1).values.mean().detach() * 100.0
+                gpu_telemetry['ent'] += ema_entropy.detach()
+                gpu_telemetry['col_r'] += collapse_ratio.detach()
+                gpu_telemetry['kl_w'] += dynamic_kl_w.detach()
+                
+                # Exact reconstruction loss from calc_loss return
+                gpu_telemetry['l_rec'] += base_recon_val.detach()
+                
+                epoch_p_mean_sum += current_p_mean.detach()
+                train_chunk_count += 1
 
-                    (true_batch_loss / len(meta_meta)).backward()
-                    
-                    train_loss += true_batch_loss.item() 
-                    train_steps += 1
+                del train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss, base_recon_val
 
-                    g_w_val = pure_anchors.max(dim=1).values.mean().item() * 100.0
-                    p_w_val = p_train.max(dim=1).values.mean().item() * 100.0
-
-                    ent_val = ema_entropy.detach().cpu().item() if isinstance(ema_entropy, torch.Tensor) else ema_entropy
-                    epoch_telemetry['ent'] += ent_val
-                    epoch_telemetry['col_r'] += collapse_ratio
-                    epoch_telemetry['kl_w'] += dynamic_kl_w
-                    epoch_telemetry['g_w'] += g_w_val
-                    epoch_telemetry['p_w'] += p_w_val
-                    
-  
-                    chunk_losses = getattr(model, '_last_losses', {})
-                    epoch_telemetry['l_rec'] += float(chunk_losses.get('rec', 0.0))
-                    epoch_telemetry['l_anc'] += float(chunk_losses.get('anc', 0.0))
-                    epoch_telemetry['l_ort'] += float(chunk_losses.get('ort', 0.0))
-                    
-                    # Accumulate chunk's p_mean on CPU to find true epoch dominant topic
-                    epoch_p_mean_sum += current_p_mean.detach().cpu()
-                    train_chunk_count += 1
-
-                    
-                    del t_mask_gpu, train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss, base_recon_val
-
-                v_mask_np = batch["val_mask"][local_core]
-                if v_mask_np.sum() > 0:
-                    v_mask_gpu = torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=device)
-                    val_idx = core_gpu[v_mask_gpu]
+                # Validation Evaluation (Zero-sync check using CPU-resident numel)
+                val_core_idx_cpu = batch["val_core_idx"]
+                if val_core_idx_cpu.numel() > 0:
+                    val_idx = val_core_idx_cpu.to(device=device, non_blocking=True)
                     
                     with torch.no_grad():
                         f_val = fracs[val_idx]
                         x_val = x[val_idx]
                         val_recon = f_val @ pure_anchors
                         
-                        w_mat = 1.0 + (x_val > 0).float() * (model.dynamic_w_ema - 1.0)
                         is_non_zero_val = (x_val > 0)
-                        
                         w_mat = torch.where(is_non_zero_val, model.dynamic_w_ema, 1.0)
                         zero_expectation_mask = torch.where(is_non_zero_val, 1.0, cfg.zero_mask_rate).to(x_val.dtype)
                         masked_w_mat_val = w_mat * zero_expectation_mask
@@ -418,27 +395,19 @@ def _train_loop(
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
                         val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
-                        
-                        
-                        N_cells_val = torch.clamp(torch.tensor(x_val.shape[0], dtype=torch.float32, device=device), min=1.0)
-                        # N_genes_val = x_val.shape[1]
-                        val_log_cosh = val_loss_sum / N_cells_val
+                        val_log_cosh = val_loss_sum / max(1, x_val.shape[0])
                     
-                        val_loss += val_log_cosh.item()
+                        val_loss_acc += val_log_cosh.detach()
                         val_steps += 1
                         
-                    del v_mask_gpu, val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
-                    
+                    del val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
 
-                del batch, src, dst, weights, x, fracs, pure_anchors, core_gpu, local_core, t_mask_np, v_mask_np
+                del batch, src, dst, weights, x, fracs, pure_anchors
                 model.current_f_prob = None  
-                
 
-            # A. OPTIMIZER STEP (Runs ONCE after accumulating all chunks in the meta_batch)
             if nan_detected:
-                optimizer.zero_grad(set_to_none=True) # Flush bad accumulation
+                optimizer.zero_grad(set_to_none=True)
                 break
-            
 
             base_params = [p for n, p in model.named_parameters() if 'topic_gene_logits' not in n]
             anchor_params = [p for n, p in model.named_parameters() if 'topic_gene_logits' in n]
@@ -446,25 +415,24 @@ def _train_loop(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
             optimizer.step()
 
-            del loaded_chunks
-            
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
             break
-                    
-        history['train_loss'].append(train_loss / (train_steps + 1e-9))
-        history['val_loss'].append(val_loss / (val_steps + 1e-9))
+
+        # Single CPU-GPU Synchronization at Epoch Boundary
+        history['train_loss'].append((train_loss_acc / (train_steps + 1e-9)).item())
+        history['val_loss'].append((val_loss_acc / (val_steps + 1e-9)).item())
 
         scheduler.step()
         gc.collect()
 
-        # 🚨 FAST AVERAGE: Calculate true epoch-level metrics
+        # Telemetry Resolution (Executed once per epoch)
+        epoch_telemetry = {}
         if train_chunk_count > 0:
-            for k in epoch_telemetry:
-                epoch_telemetry[k] /= train_chunk_count
+            for k, v in gpu_telemetry.items():
+                epoch_telemetry[k] = (v / train_chunk_count).item()
             
-            # Calculate true dominant topic over the whole epoch
-            epoch_p_mean = epoch_p_mean_sum / train_chunk_count
+            epoch_p_mean = (epoch_p_mean_sum / train_chunk_count).cpu()
             top_topic_val, top_topic_idx = epoch_p_mean.max(dim=0)
             epoch_telemetry['top_t_pct'] = top_topic_val.item() * 100.0
             epoch_telemetry['top_t_id'] = top_topic_idx.item()
