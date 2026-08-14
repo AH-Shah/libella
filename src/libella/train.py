@@ -324,15 +324,13 @@ def _train_loop(
                         w_mat = 1.0 + (x_val > 0).float() * (model.dynamic_w_ema - 1.0)
                         is_non_zero_val = (x_val > 0)
                         
-                        raw_delta_val = val_recon - x_val
-                        asym_val = 1.0 + (is_non_zero_val.float() * 2.0) * (raw_delta_val < 0).float()
-                        
-                        scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
-                        
-                    
-                        zero_expectation_mask = is_non_zero_val.float() + (~is_non_zero_val).float() * cfg.zero_mask_rate
-                        
+                        w_mat = torch.where(is_non_zero_val, model.dynamic_w_ema, 1.0)
+                        zero_expectation_mask = torch.where(is_non_zero_val, 1.0, cfg.zero_mask_rate).to(x_val.dtype)
                         masked_w_mat_val = w_mat * zero_expectation_mask
+                        
+                        raw_delta_val = val_recon - x_val
+                        asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * 2.0) * (raw_delta_val < 0).to(x_val.dtype)
+                        scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
                         val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
                         
