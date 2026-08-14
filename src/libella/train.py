@@ -12,7 +12,7 @@ import scipy.sparse as sp
 import torch
 from tqdm import tqdm
 import queue
-from threading import Thread
+from threading import Thread, Event
 
 from .config import cfg, paths
 from .data import (
@@ -143,34 +143,67 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
 def prefetch_batches(
     meta_batches: list[list[dict[str, Any]]]
 ) -> Iterator[tuple[list[dict[str, Any]], Iterator[Any]]]:
-    """Prefetch strictly 1 chunk at a time using a queue to protect Unified Memory."""
+    """Prefetch strictly 1 chunk at a time using a bounded queue to protect Unified Memory."""
     if not meta_batches:
         return
 
     for meta_meta in meta_batches:
-        # Strict maxsize=1 ensures we never hoard more than 1 prefetched chunk in RAM!
         chunk_queue = queue.Queue(maxsize=1)
-        
-        def worker():
-            for b in meta_meta:
-                # Load strictly one chunk
-                chunk = torch.load(b['chunk_file'], map_location='cpu', weights_only=False)
-                # Put blocks if the queue is full (preventing runaway RAM usage)
-                chunk_queue.put(chunk) 
-            chunk_queue.put(None) # Sentinel to signal we are done with this meta_batch
+        stop_event = Event()
 
-        # Use exactly 1 thread to minimize Python GIL contention with the main training loop
+        def safe_put(item: Any) -> bool:
+            """
+            Attempts to put an item in the queue. 
+            Returns False if the main thread aborted, meaning the worker should exit.
+            """
+            while not stop_event.is_set():
+                try:
+                    chunk_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False # Stop event was set, give up!
+
+        def worker():
+            try:
+                for b in meta_meta:
+                    if stop_event.is_set():
+                        break
+                    
+                    # 1. Load sub-graph chunk from SSD
+                    chunk = torch.load(b['chunk_file'], map_location='cpu', weights_only=False)
+                    
+                    # 2. Safely put into bounded queue. If it returns False, exit loop.
+                    if not safe_put(chunk):
+                        break
+                        
+            except Exception as e:
+                # Safely attempt to pass the error to the main thread
+                safe_put(e)
+            finally:
+                # Safely push the end-of-stream sentinel
+                safe_put(None)
+
         t = Thread(target=worker, daemon=True)
         t.start()
 
         def chunk_iterator():
-            while True:
-                chunk = chunk_queue.get()
-                if chunk is None:
-                    break
-                yield chunk
-                
-        # We yield the meta_meta list, and a GENERATOR of chunks, not a full list!
+            try:
+                while True:
+                    chunk = chunk_queue.get()
+                    
+                    if chunk is None:
+                        break
+                        
+                    if isinstance(chunk, Exception):
+                        raise chunk  # Surface background exceptions immediately on main thread
+                        
+                    yield chunk
+            finally:
+                # If training loop breaks early (e.g. NaN loss, or Generator is garbage collected), 
+                # immediately unblock the worker thread so it can exit.
+                stop_event.set()
+
         yield meta_meta, chunk_iterator()
             
 def _train_loop(
