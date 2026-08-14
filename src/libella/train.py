@@ -451,22 +451,6 @@ def _train_loop(
                 "history": history
             }, out_dir / "resume_latest.pt")
 
-            # Inside train.py (_train_loop, checkpoint section)
-            current_rec = epoch_telemetry.get('l_rec', float('inf'))
-            current_pw = epoch_telemetry.get('p_w', 0.0)
-
-            # Quality Score: rewards low reconstruction loss balanced with high topic purity
-            composite_score = current_rec / max(1.0, math.sqrt(current_pw / 100.0))
-
-            if composite_score < best_composite_score:
-                best_composite_score = composite_score
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "metrics": epoch_metrics,
-                    "history": history
-                }, checkpoint_path)
-
             with torch.no_grad():
                 # Print beautiful, single-line telemetry every 5 epochs
                 tqdm.write(
@@ -500,20 +484,12 @@ def _train_loop(
             )
             
         if is_done:
-            final_pw = epoch_telemetry.get('p_w', 0.0)
-            tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
-            break
+                final_pw = epoch_telemetry.get('p_w', 0.0)
+                tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
+                break
 
-
-    torch.save({
-        "epoch": cfg.epochs - 1,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "history": history
-    }, checkpoint_path)
         
-    return model, history
+        return model, history
 
 def train_gnn(
     graph_paths: list[Path], common_genes: list[str]
