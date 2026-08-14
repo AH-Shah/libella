@@ -203,17 +203,10 @@ def _train_loop(
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
     ema_mean = None
 
+    checkpoint = torch.load("resume_latest.pt")
     tracker = PhaseTracker()
-
-    if history.get("autopsy_metrics"):
-        for m in history["autopsy_metrics"]:
-            rec_val = m.get("loss_components", {}).get("rec", 0.0)
-            pw_val = m.get("p_w", 0.0)
-            if rec_val > 0:
-                tracker.raw_rec_history.append(rec_val)
-                tracker.raw_pw_history.append(pw_val)
-        if len(tracker.raw_rec_history) >= tracker.window_size:
-            tracker.best_rec_loss = min(tracker.raw_rec_history)
+    if "tracker_state" in checkpoint:
+        tracker.__dict__.update(checkpoint["tracker_state"]) # <--- Restores all history, OLS windows, and streak counters instantly
         
     tqdm.write("\n[*] Adaptive Scheduler Initialized...")
     
