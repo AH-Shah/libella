@@ -425,18 +425,18 @@ def _train_loop(
                 "history": history
             }, out_dir / "resume_latest.pt")
 
-            # In train.py (_train_loop)
-            # Score balances low reconstruction loss with high topic sharpness
+            # Inside train.py (_train_loop, checkpoint section)
             current_rec = epoch_telemetry.get('l_rec', float('inf'))
             current_pw = epoch_telemetry.get('p_w', 0.0)
-            composite_score = current_rec / max(1.0, (current_pw / 100.0) ** 0.5)
 
-            if composite_score < best_composite_score:
+            # Quality Score: rewards low reconstruction loss balanced with high topic purity
+            composite_score = current_rec / max(1.0, math.sqrt(current_pw / 100.0))
+
+            if composite_score < best_composite_score or (tracker.phase == 2 and tracker.get_progress() > 0.8):
                 best_composite_score = composite_score
                 torch.save({
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
-                    "best_score": best_composite_score,
                     "metrics": epoch_metrics,
                     "history": history
                 }, checkpoint_path)
@@ -457,8 +457,6 @@ def _train_loop(
         # 2. EVERY EPOCH: Tracker Math & Failsafes
         # -------------------------------------------------------------
         epochs_remaining = cfg.epochs - epoch - 1
-        
-        # Failsafe: Ensure we have at least 20 epochs left to perform Phase 2 & Polish
         if tracker.phase == 1 and epochs_remaining <= 20:
             tqdm.write(f"\n[!] Approaching max epochs ({cfg.epochs}). Forcing Phase 2.")
             tracker.force_phase2(epoch, epoch_telemetry.get('l_rec', 0.0))

@@ -95,30 +95,22 @@ class PhaseTracker:
 
     @staticmethod
     def _compute_ols_stats(series: List[float]) -> Tuple[float, float, float]:
-        """Fits OLS linear regression y = m*t + c and computes residual variance.
-        
-        Returns:
-            slope (m): Rate of change per step.
-            mean (mu): Average value in window.
-            residual_std (sigma): Standard deviation of deviations from regression line.
-        """
+        """Fits OLS linear regression y = m*t + c and computes residual variance."""
         n = len(series)
         if n < 3:
             return 0.0, float(series[-1]) if series else 0.0, 1.0
 
-        # Fast vector math
-        t = list(range(n))
         t_mean = (n - 1) / 2.0
         y_mean = sum(series) / n
 
-        num = sum((t[i] - t_mean) * (series[i] - y_mean) for i in range(n))
-        den = sum((t[i] - t_mean) ** 2 for i in range(n))
+        num = sum((i - t_mean) * (series[i] - y_mean) for i in range(n))
+        den = sum((i - t_mean) ** 2 for i in range(n))
         
         slope = num / max(1e-9, den)
         intercept = y_mean - slope * t_mean
 
-        # Compute residual standard deviation (noise floor after removing trend)
-        res_sq_sum = sum((series[i] - (slope * t[i] + intercept)) ** 2 for i in range(n))
+        # Residual standard deviation (noise floor after trend removal)
+        res_sq_sum = sum((series[i] - (slope * i + intercept)) ** 2 for i in range(n))
         residual_std = math.sqrt(res_sq_sum / max(1, n - 2))
 
         return slope, y_mean, residual_std
@@ -137,38 +129,32 @@ class PhaseTracker:
         self.raw_rec_history.append(current_rec)
         self.raw_pw_history.append(current_pw)
 
-        if current_rec < self.best_rec_loss:
-            self.best_rec_loss = current_rec
-
-        # Need at least window_size points to compute reliable statistics
         if len(self.raw_rec_history) < self.window_size:
             return False
 
-        # Extract active rolling window
         rec_window = self.raw_rec_history[-self.window_size:]
         pw_window = self.raw_pw_history[-self.window_size:]
 
-        # Fit OLS trends to both loss and topic purity
+        # Fit OLS trends
         rec_slope, rec_mu, rec_noise_std = self._compute_ols_stats(rec_window)
         pw_slope, pw_mu, _ = self._compute_ols_stats(pw_window)
 
-        # Total expected loss drop over the window
+        # Anchor budget to statistical mean of the window (Trough-Lock Fix)
+        if rec_mu < self.best_rec_loss:
+            self.best_rec_loss = rec_mu
+
         expected_drop = -rec_slope * self.window_size
-        
-        # Descent Signal-to-Noise Ratio (SNR)
-        # Ratio of systematic downward progress to random noise amplitude
         descent_snr = expected_drop / max(1e-5, rec_noise_std)
 
         # -----------------------------------------------------------------
         # PHASE 1: Variance-Adjusted Manifold Discovery
         # -----------------------------------------------------------------
         if self.phase == 1:
-            # Transition condition:
-            # 1. Downward velocity has dropped below 40% of the noise amplitude (SNR < 0.40)
-            # 2. Or absolute relative drop over entire window is < 0.5%
             relative_drop = expected_drop / max(1.0, rec_mu)
             
-            if descent_snr < 0.40 or relative_drop < 0.005:
+            # Transition when descent slope flattens into noise floor
+            # (guarding with rec_slope > -0.5 to prevent trigger on runaway divergence)
+            if (0.0 <= descent_snr < 0.40) or (abs(relative_drop) < 0.005 and rec_slope >= 0.0):
                 self.force_phase2(epoch, rec_mu)
             return False
 
@@ -176,27 +162,25 @@ class PhaseTracker:
         # PHASE 2: Dynamic Variance-Gated Squeezing
         # -----------------------------------------------------------------
         if self.phase == 2:
-            # Dynamic Upper Noise Ceiling: Best recorded loss + 2 * sigma noise floor
-            # Automatically expands or contracts with the current epoch's variance
-            dynamic_tolerance = max(self.best_rec_loss * 0.02, 2.0 * rec_noise_std)
+            # Dynamic Ceiling: min 2.5% budget, expanding up to 2*sigma noise floor
+            dynamic_tolerance = max(self.best_rec_loss * 0.025, 2.0 * rec_noise_std)
             loss_ceiling = self.best_rec_loss + dynamic_tolerance
 
-            # If loss breaks through the 2*sigma boundary, ease pressure
-            if current_rec > loss_ceiling:
+            # Smooth mean evaluated against ceiling prevents single-batch outlier braking
+            if rec_mu > loss_ceiling:
                 self.internal_progress = max(0.0, self.internal_progress - (self.step_size * 0.5))
             else:
-                # Progress healthy: Advance sharpening pressure
                 self.internal_progress = min(1.0, self.internal_progress + self.step_size)
 
             # -------------------------------------------------------------
-            # TERMINATION AUDIT (Active only at full pressure)
+            # TERMINATION AUDIT (Evaluated once at full pressure)
             # -------------------------------------------------------------
             if self.internal_progress >= 1.0:
-                # 1. Topic Sharpness (P_W) slope has flattened (< +0.03% gain per epoch)
+                # 1. P_W slope flattened (< +0.03% gain per epoch)
                 pw_saturated = (pw_slope < 0.03)
                 
-                # 2. Reconstruction slope has flattened (|drop| is negligible relative to noise)
-                rec_saturated = (abs(rec_slope * self.window_size) < max(1.0, rec_noise_std * 0.5))
+                # 2. Rec loss change is smaller than half a standard deviation of noise
+                rec_saturated = (abs(expected_drop) < max(1.0, rec_noise_std * 0.5))
 
                 if pw_saturated and rec_saturated:
                     self.termination_streak += 1
@@ -213,3 +197,5 @@ class PhaseTracker:
         if self.phase == 1:
             self.phase = 2
             self.p1_baseline_rec = current_baseline
+            if self.best_rec_loss == float("inf") or current_baseline < self.best_rec_loss:
+                self.best_rec_loss = current_baseline
