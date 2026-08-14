@@ -187,12 +187,14 @@ def run_pipeline(manifest_path: Path) -> None:
             model, hist, optimal_k = train_gnn(g_paths, common_genes)
             plot_curves(hist)
             
-            del model; gc.collect()
+            # Immediately destroy training model from memory
+            del model
+            gc.collect()
             if torch.backends.mps.is_available(): torch.mps.empty_cache()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
             if cfg.phase == "TRAIN":
-                print("\n[✓] Phase 'TRAIN' complete. Exiting.")
+                print("\n[✓] Phase 'TRAIN' complete. Model checkpoint saved. Exiting.")
                 return
 
     # --- INFERENCE & TOPOLOGY BLOCK ---
@@ -203,7 +205,29 @@ def run_pipeline(manifest_path: Path) -> None:
         # Ensure dependencies exist if we launched straight into inference
         if 'common_genes' not in locals():
             with open(genes_path, "r") as f: common_genes = json.load(f)
-        if 'meta_names' not in locals():
+
+        if not names_path.exists() or cfg.force_retrain:
+            print("  ↳ Extracting Ecotypes from trained GNN checkpoint...")
+            target_ckpt = out_dirs["checkpoint"] if out_dirs["checkpoint"].exists() else nmf_model_path
+            
+            if not target_ckpt.exists():
+                raise FileNotFoundError(f"No trained model checkpoint found at {target_ckpt}. Run --phase TRAIN first.")
+                
+            ckpt = torch.load(target_ckpt, map_location=get_device(), weights_only=False)
+            optimal_k = ckpt["model_state_dict"]["topic_gene_logits"].shape[0]
+            
+            # Instantiate clean inference model
+            infer_model = LibellaGNN(in_channels=len(common_genes), n_metaprograms=optimal_k).to(get_device())
+            infer_model.load_state_dict(ckpt["model_state_dict"])
+            infer_model.eval()
+            
+            common_genes, meta_names, used_topics = get_ecotypes(infer_model, all_prebuilt_graphs, common_genes)
+            
+            del infer_model, ckpt
+            gc.collect()
+            if torch.backends.mps.is_available(): torch.mps.empty_cache()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+        else:
             with open(names_path, "r") as f: 
                 name_data = json.load(f)
                 meta_names = name_data["names"]
