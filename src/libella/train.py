@@ -175,14 +175,9 @@ def _train_loop(
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
     ema_mean = None
 
-    total_cells = len(training_cache) * cfg.batch_size
-    num_samples = len(set(b["patient_name"] for b in training_cache))
-    tracker = PhaseTracker(num_cells=total_cells, num_samples=num_samples)
+    tracker = PhaseTracker()
     
-    tqdm.write(
-        f"\n[*] Tracker Initialized | Cells: {total_cells} | Samples: {num_samples}\n"
-        f"    ↳ Min Phase 1: {tracker.min_p1} eps | Sparsification: {tracker.p2_duration} eps"
-    )
+    tqdm.write("\n[*] Adaptive Scheduler Initialized...")
 
     for epoch in tqdm(range(start_epoch, cfg.epochs), desc="Training", leave=False):
         model.train()
@@ -455,21 +450,27 @@ def _train_loop(
         # 2. EVERY EPOCH: Tracker Math & Failsafes
         # -------------------------------------------------------------
         epochs_remaining = cfg.epochs - epoch - 1
-        if tracker.phase == 1 and epochs_remaining <= tracker.p2_duration:
-            tqdm.write(f"\n[!] Forced Phase 2 transition to fit within max {cfg.epochs} epochs limit.")
-            tracker.force_phase2()
-
-        # Tracker requires epoch-by-epoch loss to calculate smooth windows
-        is_done = tracker.step(epoch_telemetry.get('l_rec', 0.0), epoch)
         
-        if tracker.phase == 2 and tracker.p2_step == 0:
+        # Failsafe: Ensure we have at least 20 epochs left to perform Phase 2 & Polish
+        if tracker.phase == 1 and epochs_remaining <= 20:
+            tqdm.write(f"\n[!] Approaching max epochs ({cfg.epochs}). Forcing Phase 2.")
+            tracker.force_phase2(epoch, epoch_telemetry.get('l_rec', 0.0))
+
+        # Track previous phase state so we can print the transition cleanly
+        was_phase_1 = (tracker.phase == 1)
+
+        # Step the tracker with the full telemetry dictionary
+        is_done = tracker.step(epoch_telemetry, epoch)
+        
+        if was_phase_1 and tracker.phase == 2:
             tqdm.write(
-                f"\n[↳] Phase 1 Complete (Reconstruction). "
-                f"Engaging Sparsification Phase for {tracker.p2_duration} epochs..."
+                f"\n[↳] Phase 1 Complete at Epoch {epoch} (Baseline Rec: {tracker.p1_baseline_rec:.2f}). "
+                f"\n    Engaging Adaptive Loss-Gated Sparsification..."
             )
             
         if is_done:
-            tqdm.write(f"\n[✓] Sparsification complete. Terminating early at Epoch {(epoch+1)}.")
+            final_pw = epoch_telemetry.get('p_w', 0.0)
+            tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
             break
 
 
