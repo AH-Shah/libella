@@ -262,6 +262,7 @@ class LibellaGNN(nn.Module):
         if self.training:
             self.dynamic_w_ema.lerp_(current_dynamic_w, weight=0.1)
             
+        w_mat = 1.0 + (x_c > 0).float() * (current_dynamic_w - 1.0)
         is_non_zero = (x_c > 0)
         
         if self.training:
@@ -269,21 +270,15 @@ class LibellaGNN(nn.Module):
             active_mask = (is_non_zero | zero_mask).to(x_c.dtype)
             masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0) * active_mask
         else:
-            masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0)
-
-
-        scaled_delta = recon_c.sub_(x_c)
+            active_mask = torch.ones_like(x_c)
+            
+        masked_w_mat = w_mat * active_mask
+        raw_delta = recon_c - x_c
         
-        penalty_mask = is_non_zero & (scaled_delta < 0)
-        weight_multiplier = penalty_mask.to(scaled_delta.dtype).mul_(2.0).add_(1.0)
-        
-        scaled_delta.mul_(weight_multiplier)
+        asymmetry_factor = 1.0 + (is_non_zero.float() * 2.0) * (raw_delta < 0).float()
+        scaled_delta = torch.clamp(raw_delta * asymmetry_factor, min=-30.0, max=30.0)
 
-        
-        scaled_delta.clamp_(min=-30.0, max=30.0)
-        scaled_delta.add_(1e-6)
-
-        l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta)))
+        l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6)))
         
 
         N_cells = torch.clamp(torch.tensor(x_c.shape[0], dtype=torch.float32, device=x_c.device), min=1.0)
