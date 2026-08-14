@@ -187,7 +187,6 @@ def run_pipeline(manifest_path: Path) -> None:
             model, hist, optimal_k = train_gnn(g_paths, common_genes)
             plot_curves(hist)
             
-            common_genes, meta_names, used_topics = get_ecotypes(model, g_paths, common_genes)
             del model; gc.collect()
             if torch.backends.mps.is_available(): torch.mps.empty_cache()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
