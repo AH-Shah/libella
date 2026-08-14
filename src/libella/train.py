@@ -215,11 +215,10 @@ def _train_loop(
         alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9)) 
         nan_detected = False
 
-        for step, (meta_meta, loaded_chunks) in enumerate(prefetch_batches(meta_batches)):
+        for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
             optimizer.zero_grad(set_to_none=True)
-            for chunk_idx, batch_ref in enumerate(meta_meta):
-                batch = loaded_chunks[chunk_idx]
-                loaded_chunks[chunk_idx] = None
+            for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
+
                 
                 x_dense_np = batch["x"].toarray()
                 x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
