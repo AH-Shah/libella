@@ -126,7 +126,7 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
             if data.train_mask.numpy()[core_idx].sum() > 0:
                 chunk_data = batcher.get_chunk(chunk_idx)
                 
-                # Pre-densify X
+                # Pre-convert dense X
                 if hasattr(chunk_data["x"], "toarray"):
                     chunk_x = torch.from_numpy(chunk_data["x"].toarray()).to(torch.float32)
                 elif not isinstance(chunk_data["x"], torch.Tensor):
@@ -134,13 +134,13 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
                 else:
                     chunk_x = chunk_data["x"].to(torch.float32)
 
-                # Pre-convert Adjacency COO to Torch Tensors
+                # Pre-convert Adjacency COO
                 adj_coo = chunk_data["adj"].tocoo()
                 src = torch.from_numpy(adj_coo.row).to(torch.int32)
                 dst = torch.from_numpy(adj_coo.col).to(torch.int32)
                 weights = torch.from_numpy(adj_coo.data).to(torch.float32)
 
-                # Pre-convert Masks & Indices
+                # Pre-convert Masks & Index slices
                 local_core = torch.from_numpy(chunk_data["local_core_idx"]).to(torch.int64)
                 t_mask = torch.from_numpy(chunk_data["train_mask"]).to(torch.bool)
                 v_mask = torch.from_numpy(chunk_data["val_mask"]).to(torch.bool)

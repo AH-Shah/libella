@@ -66,6 +66,9 @@ class LibellaGNN(nn.Module):
         self.in_channels = in_channels
 
         
+        self.register_buffer('ortho_mask', 1.0 - torch.eye(n_metaprograms, dtype=torch.float32))
+
+        
         if init_components is not None:
             active_mask = (init_components > 0)
 
