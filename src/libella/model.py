@@ -149,17 +149,15 @@ class LibellaGNN(nn.Module):
             if len(src) > 0:
                 h_src_proj = self.gat_w_src(h_ctx)
                 h_dst_proj = self.gat_w_dst(h_ctx)
+                edge_proj = self.gat_w_edge(W_bil.unsqueeze(1))
+
+                h_edge = h_src_proj[src] + h_dst_proj[dst] + edge_proj
                 
-                h_edge = h_src_proj[src] 
-                h_edge.add_(h_dst_proj[dst])
-                h_edge.add_(self.gat_w_edge(W_bil.unsqueeze(1)))
-                
-                e_raw = self.gat_a(F.leaky_relu(h_edge, inplace=True)).squeeze(-1)
+                e_raw = self.gat_a(F.leaky_relu(h_edge)).squeeze(-1)
                 tau = torch.clamp(F.softplus(self.att_temp), min=0.05)
                 e_scaled = e_raw / tau
                 
-                alpha_att = scatter_softmax(e_scaled, dst, N).to(h_ctx.dtype) 
-
+                alpha_att = scatter_softmax(e_scaled, dst, N) 
                 
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
                 out.index_add_(0, dst, msg)
