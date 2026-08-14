@@ -464,12 +464,12 @@ def _train_loop(
         
         if tracker.phase == 2 and tracker.p2_step == 0:
             tqdm.write(
-                f"\n[🚀] Phase 1 Complete (Pure_Rec Plateau). "
+                f"\n[↳] Phase 1 Complete (Reconstruction). "
                 f"Engaging Sparsification Phase for {tracker.p2_duration} epochs..."
             )
             
         if is_done:
-            tqdm.write(f"\n[✅] Sparsification complete. Purity maxed. Terminating early at Epoch {(epoch+1)}.")
+            tqdm.write(f"\n[✓] Sparsification complete. Terminating early at Epoch {(epoch+1)}.")
             break
 
 
