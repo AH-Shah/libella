@@ -1,321 +1,395 @@
-import argparse
 import gc
 import json
 import os
+import pickle
 import sys
 import time
-import threading
-import dataclasses
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import psutil
+import scipy.sparse as sp
 import torch
 from tqdm import tqdm
 
-# Import your pipeline modules
-from libella.config import RunConfig, cfg, paths, init_env
-from libella.data import get_consensus_genes, build_graph_safe
-from libella.inference import (
-    get_ecotypes,
-    make_domains,
-    plot_curves,
-    process_pt,
-    run_meta,
-)
-from libella.train import train_gnn
-from libella.utils import get_device, get_whitelist
+# Ensure libella source directory is in python path
+LIBELLA_ROOT = Path(__file__).resolve().parent
+if str(LIBELLA_ROOT) not in sys.path:
+    sys.path.insert(0, str(LIBELLA_ROOT))
+
+from libella.config import cfg, paths
+from libella.data import make_meta_batches, pad_mps_shapes
+from libella.model import LibellaGNN
+from libella.utils import PhaseTracker, get_device
 
 
-# ==========================================
-# 1. HIGH-PRECISION MEMORY TRACKER
-# ==========================================
-class MemoryProfileReport:
-    records: List[Dict] = []
-
-    @classmethod
-    def print_summary(cls):
-        print("\n" + "=" * 90)
-        print(" " * 28 + "🏁 MEMORY PROFILING REPORT 🏁")
-        print("=" * 90)
-        
-        df = pd.DataFrame(cls.records)
-        if df.empty:
-            print("No memory records collected.")
-            return
-
-        # Sort by peak RSS memory to surface the heaviest bottleneck immediately
-        df = df.sort_values(by="peak_rss_bytes", ascending=False)
-
-        print(f"\n🏆 TOP PEAK MEMORY CONSUMERS (Total System Peak: {df['peak_rss_bytes'].max() / (1024**3):.2f} GB):")
-        print("-" * 90)
-        
-        display_df = pd.DataFrame({
-            "Stage / Subprocess": df["stage"],
-            "Target / Details": df["detail"],
-            "Start RAM": df["start_rss_gb"].map(lambda x: f"{x:.2f} GB"),
-            "Peak RAM": df["peak_rss_gb"].map(lambda x: f"{x:.2f} GB"),
-            "Delta (RAM)": df["delta_rss_gb"].map(lambda x: f"{x:+.2f} GB"),
-            "Peak RAM (Bytes)": df["peak_rss_bytes"].map(lambda x: f"{x:,}"),
-            "Duration": df["duration_sec"].map(lambda x: f"{x:.2f}s")
-        })
-        print(display_df.to_string(index=False))
-        print("=" * 90 + "\n")
-
-
-class TrackMemory:
-    """Context manager that samples process memory at 10ms intervals to catch transient spikes."""
+# =====================================================================
+# 1. GRANULAR STEP MEMORY PROFILER
+# =====================================================================
+class MemoryAuditor:
+    """Tracks OS Resident Set Size (RSS) and Device VRAM across pipeline sub-steps."""
+    records: List[Dict[str, Any]] = []
     
-    def __init__(self, stage: str, detail: str = ""):
-        self.stage = stage
-        self.detail = detail
+    def __init__(self, step_name: str, meta_info: str = ""):
+        self.step_name = step_name
+        self.meta_info = meta_info
         self.process = psutil.Process(os.getpid())
-        self.peak_rss = 0
-        self._stop_event = threading.Event()
-        self._thread = None
-        self.start_rss = 0
-        self.start_time = 0
-
-    def _sample_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                current_rss = self.process.memory_info().rss
-                if current_rss > self.peak_rss:
-                    self.peak_rss = current_rss
-            except Exception:
-                pass
-            time.sleep(0.01)  # 10ms sampling interval
+        self.device = get_device()
+        
+    def _get_vram(self) -> float:
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            return torch.cuda.memory_allocated() / (1024 ** 2)
+        elif self.device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+            return torch.mps.current_allocated_memory() / (1024 ** 2)
+        return 0.0
 
     def __enter__(self):
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-
-        self.start_rss = self.process.memory_info().rss
-        self.peak_rss = self.start_rss
+        self.start_rss = self.process.memory_info().rss / (1024 ** 2) # MB
+        self.start_vram = self._get_vram()
         self.start_time = time.perf_counter()
-
-        # Start sampling thread
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._sample_loop, daemon=True)
-        self._thread.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._stop_event.set()
-        self._thread.join()
-
-        end_rss = self.process.memory_info().rss
-        duration = time.perf_counter() - self.start_time
+        self.end_time = time.perf_counter()
+        self.end_rss = self.process.memory_info().rss / (1024 ** 2)
+        self.end_vram = self._get_vram()
         
-        # Check one last time
-        if end_rss > self.peak_rss:
-            self.peak_rss = end_rss
-
-        delta_rss = end_rss - self.start_rss
-
-        MemoryProfileReport.records.append({
-            "stage": self.stage,
-            "detail": self.detail,
-            "start_rss_gb": self.start_rss / (1024 ** 3),
-            "peak_rss_gb": self.peak_rss / (1024 ** 3),
-            "peak_rss_bytes": self.peak_rss,
-            "delta_rss_gb": delta_rss / (1024 ** 3),
-            "duration_sec": duration
+        duration = (self.end_time - self.start_time) * 1000 # ms
+        delta_rss = self.end_rss - self.start_rss
+        delta_vram = self.end_vram - self.start_vram
+        
+        self.records.append({
+            "step": self.step_name,
+            "info": self.meta_info,
+            "start_rss_mb": self.start_rss,
+            "end_rss_mb": self.end_rss,
+            "delta_rss_mb": delta_rss,
+            "start_vram_mb": self.start_vram,
+            "end_vram_mb": self.end_vram,
+            "delta_vram_mb": delta_vram,
+            "duration_ms": duration,
         })
+        
+        # Live log for any step expanding RAM by more than 100 MB
+        if abs(delta_rss) > 100 or abs(delta_vram) > 100:
+            print(
+                f"  ⚠️ [SPIKE] {self.step_name:<30} | "
+                f"RAM: {self.end_rss:7.1f} MB (Δ {delta_rss:+6.1f} MB) | "
+                f"VRAM: {self.end_vram:7.1f} MB (Δ {delta_vram:+6.1f} MB) | "
+                f"Time: {duration:6.1f}ms"
+            )
 
-        print(
-            f"  ↳ [MEM] {self.stage} ({self.detail}) | "
-            f"Peak: {self.peak_rss / (1024**3):.2f} GB ({self.peak_rss:,} bytes) | "
-            f"Delta: {delta_rss / (1024**3):+.2f} GB | Time: {duration:.2f}s"
+    @classmethod
+    def print_diagnostic_table(cls):
+        print("\n" + "=" * 105)
+        print(" " * 35 + "📊 SUBPROCESS MEMORY AUDIT 📊")
+        print("=" * 105)
+        
+        if not cls.records:
+            print("No profiling events recorded.")
+            return
+
+        df = pd.DataFrame(cls.records)
+        
+        # Sort by peak RSS to surface the top memory offenders
+        top_spikes = df.sort_values(by="delta_rss_mb", ascending=False).head(15)
+        
+        display_df = pd.DataFrame({
+            "Subprocess / Step": top_spikes["step"],
+            "Context / Chunk": top_spikes["info"],
+            "Start RAM": top_spikes["start_rss_mb"].map(lambda x: f"{x:.1f} MB"),
+            "End RAM": top_spikes["end_rss_mb"].map(lambda x: f"{x:.1f} MB"),
+            "Δ RAM": top_spikes["delta_rss_mb"].map(lambda x: f"{x:+.1f} MB"),
+            "Δ VRAM": top_spikes["delta_vram_mb"].map(lambda x: f"{x:+.1f} MB"),
+            "Duration": top_spikes["duration_ms"].map(lambda x: f"{x:.1f} ms"),
+        })
+        
+        print("\nTop 15 RAM Spikes (by Delta Expansion):")
+        print(display_df.to_string(index=False))
+        
+        # Aggregated stats by operation type
+        print("\n" + "-" * 105)
+        print("Aggregated Summary by Subprocess Type:")
+        print("-" * 105)
+        agg_df = df.groupby("step").agg({
+            "delta_rss_mb": ["sum", "max"],
+            "delta_vram_mb": ["sum", "max"],
+            "duration_ms": ["sum", "count"]
+        })
+        agg_df.columns = ["Sum ΔRAM (MB)", "Max ΔRAM (MB)", "Sum ΔVRAM (MB)", "Max ΔVRAM (MB)", "Total Time (ms)", "Calls"]
+        agg_df = agg_df.sort_values(by="Max ΔRAM (MB)", ascending=False)
+        print(agg_df.to_string())
+        print("=" * 105 + "\n")
+
+
+# =====================================================================
+# 2. RUNTIME SETUP FOR SPECIFIED ASSETS
+# =====================================================================
+def run_single_epoch_diagnostic(
+    genes_path: Path,
+    priors_path: Path,
+    chunks_dir: Path
+):
+    device = get_device()
+    print(f"\n[i] Compute Device: {device}")
+    
+    # -------------------------------------------------------------
+    # Step A: Load Pre-Computed Common Genes & CNMF Priors
+    # -------------------------------------------------------------
+    with MemoryAuditor("Load common_genes.json"):
+        with open(genes_path, "r") as f:
+            common_genes = json.load(f)
+        print(f"  ↳ Loaded {len(common_genes)} consensus genes.")
+
+    with MemoryAuditor("Load global_cnmf_priors.pkl"):
+        with open(priors_path, "rb") as f:
+            prior_data = pickle.load(f)
+            
+        if isinstance(prior_data, dict):
+            init_components = prior_data.get("init_components", prior_data.get("priors"))
+            optimal_k = prior_data.get("optimal_k", init_components.shape[0] if init_components is not None else 30)
+        elif isinstance(prior_data, tuple):
+            init_components, optimal_k = prior_data[0], prior_data[1]
+        else:
+            init_components = prior_data
+            optimal_k = init_components.shape[0]
+
+        print(f"  ↳ Loaded cNMF Prior Components shape: {init_components.shape if init_components is not None else None} (K={optimal_k})")
+
+    # -------------------------------------------------------------
+    # Step B: Build Training Cache from SSD Chunks
+    # -------------------------------------------------------------
+    with MemoryAuditor("Index temp_training_chunks"):
+        chunk_files = sorted(list(chunks_dir.glob("*.pt")))
+        if not chunk_files:
+            raise FileNotFoundError(f"No .pt chunk files found in {chunks_dir}")
+            
+        training_cache = []
+        for chunk_file in chunk_files:
+            patient_name = chunk_file.stem.split("_chunk_")[0]
+            training_cache.append({
+                "patient_name": patient_name,
+                "chunk_file": chunk_file
+            })
+        print(f"  ↳ Indexed {len(training_cache)} SSD sub-graph chunks across patients.")
+
+    # -------------------------------------------------------------
+    # Step C: Model & Optimizer Initialization
+    # -------------------------------------------------------------
+    with MemoryAuditor("Instantiate LibellaGNN"):
+        model = LibellaGNN(
+            in_channels=len(common_genes),
+            n_metaprograms=optimal_k,
+            init_components=init_components
+        ).to(device)
+
+    with MemoryAuditor("Initialize AdamW & Schedulers"):
+        base_params = [p for n, p in model.named_parameters() if "topic_gene_logits" not in n]
+        anchor_params = [p for n, p in model.named_parameters() if "topic_gene_logits" in n]
+
+        optimizer = torch.optim.AdamW([
+            {"params": base_params, "lr": cfg.lr_base, "weight_decay": cfg.wd_base},
+            {"params": anchor_params, "lr": cfg.lr_anchor, "weight_decay": cfg.wd_anchor}
+        ])
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg.epochs, eta_min=1e-6
         )
 
-
-# ==========================================
-# 2. INSTRUMENTED PIPELINE
-# ==========================================
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Profile Libella Pipeline Memory Footprint")
-    parser.add_argument("manifest", type=str, help="Path to manifest CSV.")
-    parser.add_argument("--out-dir", type=str, default="./libella_output", help="Output directory.")
-    parser.add_argument("--mode", type=str, choices=["DEV", "DISCOVERY", "PUBLISH"], default="PUBLISH")
-    parser.add_argument("--force-retrain", action="store_true", help="Force retraining.")
+    # -------------------------------------------------------------
+    # Step D: Single Epoch Instrumented Execution Loop
+    # -------------------------------------------------------------
+    accumulation_steps = getattr(cfg, "meta_batch_size", 4)
+    tracker = PhaseTracker()
+    ema_mean = None
     
-    dummy_cfg = RunConfig()
-    for field in dataclasses.fields(RunConfig):
-        if field.name not in ["mode", "force_retrain", "suffix"]:
-            arg_name = f"--{field.name.replace('_', '-')}"
-            f_type = type(getattr(dummy_cfg, field.name)) if getattr(dummy_cfg, field.name) is not None else float
-            if f_type == bool:
-                parser.add_argument(arg_name, type=lambda x: (str(x).lower() == 'true'), default=None)
-            else:
-                parser.add_argument(arg_name, type=f_type, default=None)
-
-    return parser.parse_args()
-
-
-def setup_config_from_args(args: argparse.Namespace) -> None:
-    new_cfg = RunConfig.from_mode(args.mode)
-    new_cfg.force_retrain = args.force_retrain
+    print(f"\n[➤] STARTING INSTRUMENTED EPOCH (Batch Accumulation: {accumulation_steps})...\n")
     
-    for field in dataclasses.fields(RunConfig):
-        if field.name not in ["mode", "force_retrain", "suffix"]:
-            val = getattr(args, field.name, None)
-            if val is not None:
-                setattr(new_cfg, field.name, val)
+    model.train()
+    train_loss, val_loss = 0.0, 0.0
+    train_steps, val_steps = 0, 0
     
-    for key, value in vars(new_cfg).items():
-        setattr(cfg, key, value)
-        
-    paths.out_base = Path(args.out_dir).resolve()
+    with MemoryAuditor("make_meta_batches"):
+        meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
 
+    total_steps_per_epoch = len(meta_batches)
+    alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
 
-def run_pipeline_instrumented(manifest_path: Path) -> None:
-    init_env()
-    out_dirs = paths.make_dirs(cfg.suffix)
-    
-    with TrackMemory("Manifest Ingestion", manifest_path.name):
-        manifest = pd.read_csv(manifest_path)
-        manifest.columns = manifest.columns.str.strip()
-        for col in manifest.columns:
-            if manifest[col].dtype == 'object':
-                manifest[col] = manifest[col].astype(str).str.strip()
+    for step_idx, meta_batch in enumerate(tqdm(meta_batches, desc="Executing Single Epoch", leave=True)):
+        with MemoryAuditor("optimizer.zero_grad", f"Batch {step_idx}"):
+            optimizer.zero_grad(set_to_none=True)
 
-        manifest["discovery"] = manifest["discovery"].astype(str).str.lower().isin(["true", "1", "yes", "t"])
-        manifest["projection"] = manifest["projection"].astype(str).str.lower().isin(["true", "1", "yes", "t"])
+        for chunk_idx, batch_ref in enumerate(meta_batch):
+            c_file: Path = batch_ref["chunk_file"]
+            tag = f"B{step_idx}_C{chunk_idx}_{c_file.name}"
 
-        if "patient_id" not in manifest.columns:
-            manifest["patient_id"] = manifest["filepath"].apply(lambda x: Path(x).stem)
-        if "dataset_id" not in manifest.columns:
-            manifest["dataset_id"] = "Unknown"
-            
-        file_metadata = {
-            Path(row["filepath"]): {"pt_id": str(row["patient_id"]), "ds_id": str(row["dataset_id"])}
-            for _, row in manifest.iterrows()
-        }
-            
-        discovery_files = [Path(f) for f in manifest[manifest["discovery"]]["filepath"]]
-        projection_files = [Path(f) for f in manifest[manifest["projection"]]["filepath"]]
-        
-        if cfg.mode == "DEV":
-            discovery_files = discovery_files[:2]
-            projection_files = projection_files[:2]
+            # 1. SSD Read
+            with MemoryAuditor("1. torch.load (SSD)", tag):
+                batch = torch.load(c_file, map_location="cpu", weights_only=False)
 
-    nmf_model_path = out_dirs["nmf_model"]
-    genes_path = out_dirs["genes"]
-    names_path = out_dirs["names"]
-    out_dir = out_dirs["out"]
+            # 2. SciPy CSR to Dense Matrix
+            with MemoryAuditor("2. batch['x'].toarray() (Dense)", tag):
+                x_dense_np = batch["x"].toarray()
 
-    if nmf_model_path.exists() and genes_path.exists() and names_path.exists() and not cfg.force_retrain:
-        with TrackMemory("Load Pretrained Model", "Disk to Memory"):
-            _ = torch.load(nmf_model_path, map_location="cpu", weights_only=False)
-            with open(genes_path, "r") as f: common_genes = json.load(f)
-            with open(names_path, "r") as f: name_data = json.load(f)
-            meta_names = name_data["names"]
-            used_topics = np.array(name_data["used_indices"])
-    else:
-        # --- PHASE 1a: Graph Building ---
-        if cfg.phase in ["ALL", "BUILD_GRAPHS", "EXTRACT_PRIORS", "TRAIN"]:
-            clean_whitelist = set() if cfg.unsupervised else get_whitelist(paths.sig_csv)
-            
-            # Pre-flight Check
-            if not cfg.unsupervised and len(discovery_files) > 0:
-                with TrackMemory("Pre-flight Scanpy Check", discovery_files[0].name):
-                    import scanpy as sc
-                    _tmp_adata = sc.read_h5ad(discovery_files[0], backed='r')
-                    _upper_genes = set(str(g).upper() for g in _tmp_adata.var_names)
-                    _overlap = len(_upper_genes.intersection(clean_whitelist))
+            # 3. Dense Tensor Transfer to Compute Device
+            with MemoryAuditor("3. x.to(device)", tag):
+                x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
+                del x_dense_np
 
-            # Consensus Gene Extraction
-            consensus_cache = out_dir / f"consensus_genes_cache_{cfg.top_n_genes}.json"
-            if consensus_cache.exists() and not cfg.force_retrain:
-                with open(consensus_cache, "r") as f: common_genes = json.load(f)
-            else:
-                with TrackMemory("Consensus Genes Calculation", f"{len(discovery_files)} files"):
-                    common_genes = get_consensus_genes(discovery_files, clean_whitelist, top_n=cfg.top_n_genes)
-                with open(consensus_cache, "w") as f: json.dump(common_genes, f)
-                with open(genes_path, "w") as f: json.dump([str(g) for g in common_genes], f)
+            # 4. COO Adjacency Unpacking
+            with MemoryAuditor("4. Adjacency COO -> Device", tag):
+                adj_coo = batch["adj"].tocoo()
+                src = torch.from_numpy(adj_coo.row).to(torch.int32)
+                dst = torch.from_numpy(adj_coo.col).to(torch.int32)
+                weights = torch.from_numpy(adj_coo.data).to(torch.float32)
+                del adj_coo
 
-            # Per-File Spatial Graph Construction
-            g_paths = []
-            for f in tqdm(discovery_files, desc="Building Spatial Graphs", leave=False):
-                with TrackMemory("build_graph_safe", f.name):
-                    if res := build_graph_safe(f, common_genes):
-                        g_paths.append(res)
-                gc.collect()
+                # Edge dropout during training
+                keep_mask = torch.rand(src.size(0)) > 0.40
+                src = src[keep_mask].to(device)
+                dst = dst[keep_mask].to(device)
+                weights = weights[keep_mask].to(device)
+                del keep_mask
 
-        # --- PHASE 1b: Training ---
-        if cfg.phase in ["ALL", "EXTRACT_PRIORS", "TRAIN"]:
-            if 'g_paths' not in locals():
-                g_paths = list(out_dirs["graphs"].glob("*_graph.pt"))
-                with open(genes_path, "r") as f: common_genes = json.load(f)
+            # 5. Bucket Padding
+            with MemoryAuditor("5. pad_mps_shapes", tag):
+                x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
+                if device.type != "mps":
+                    src = src.to(torch.int64)
+                    dst = dst.to(torch.int64)
 
-            with TrackMemory("train_gnn", f"{len(g_paths)} graphs"):
-                model, hist, optimal_k = train_gnn(g_paths, common_genes)
-                plot_curves(hist)
+            # 6. GNN Forward Pass
+            with MemoryAuditor("6. model.forward (GNN)", tag):
+                progress = tracker.get_progress()
+                model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * progress)
+                model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)
+                model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress)
 
-            with TrackMemory("get_ecotypes", f"{len(g_paths)} graphs"):
-                common_genes, meta_names, used_topics = get_ecotypes(model, g_paths, common_genes)
+                fracs, pure_anchors = model(x, src, dst, weights)
 
-            del model
+            # 7. Core Node Extraction & Targets
+            with MemoryAuditor("7. Calculate Targets & Priors", tag):
+                local_core = batch["local_core_idx"]
+                core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
+                t_mask_np = batch["train_mask"][local_core]
+
+            if t_mask_np.sum() > 0:
+                with MemoryAuditor("8. Train Slice & Reconstruction", tag):
+                    t_mask_gpu = torch.from_numpy(t_mask_np).to(dtype=torch.bool, device=device)
+                    train_idx = core_gpu[t_mask_gpu]
+
+                    f_train = fracs[train_idx]
+                    x_train = x[train_idx]
+
+                    p_train = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
+                    current_p_mean = p_train.mean(dim=0)
+
+                    uniform_prior = torch.ones_like(current_p_mean) / pure_anchors.shape[0]
+                    if ema_mean is None:
+                        ema_mean = current_p_mean.detach()
+                    else:
+                        ema_mean = alpha_ema * current_p_mean.detach() + (1 - alpha_ema) * ema_mean
+
+                    ideal_c = uniform_prior * 2.0 - ema_mean
+                    ideal_c = torch.clamp(ideal_c, min=1e-5)
+                    target_f_dist = ideal_c / ideal_c.sum()
+
+                    ema_entropy = -torch.sum(ema_mean * torch.log(ema_mean + 1e-9))
+                    max_entropy = np.log(pure_anchors.shape[0])
+                    collapse_ratio = torch.clamp(1.0 - (ema_entropy / max_entropy), min=0.0, max=1.0).item()
+
+                    peak_p = ema_mean.max().item()
+                    hub_multiplier = max(0.0, (peak_p / 0.15) - 1.0) * 10.0
+                    dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier
+
+                    recon = f_train @ pure_anchors
+
+                # 8. Loss Computation
+                with MemoryAuditor("9. model.calc_loss", tag):
+                    true_batch_loss, base_recon_val = model.calc_loss(
+                        recon, x_train, pure_anchors, None, 0, cfg.epochs,
+                        f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
+                    )
+
+                # 9. Autograd Graph Backward Pass
+                with MemoryAuditor("10. loss.backward()", tag):
+                    (true_batch_loss / len(meta_batch)).backward()
+                    train_loss += true_batch_loss.item()
+                    train_steps += 1
+
+                # Clean train intermediates
+                del t_mask_gpu, train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss
+
+            # 10. Validation Loss Computation
+            v_mask_np = batch["val_mask"][local_core]
+            if v_mask_np.sum() > 0:
+                with MemoryAuditor("11. Val Evaluation (no_grad)", tag):
+                    v_mask_gpu = torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=device)
+                    val_idx = core_gpu[v_mask_gpu]
+
+                    with torch.no_grad():
+                        f_val = fracs[val_idx]
+                        x_val = x[val_idx]
+                        val_recon = f_val @ pure_anchors
+
+                        is_non_zero_val = (x_val > 0)
+                        w_mat = torch.where(is_non_zero_val, model.dynamic_w_ema, 1.0)
+                        zero_expectation_mask = torch.where(is_non_zero_val, 1.0, cfg.zero_mask_rate).to(x_val.dtype)
+                        masked_w_mat_val = w_mat * zero_expectation_mask
+
+                        raw_delta_val = val_recon - x_val
+                        asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * 2.0) * (raw_delta_val < 0).to(x_val.dtype)
+                        scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
+
+                        val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
+                        N_cells_val = torch.clamp(torch.tensor(x_val.shape[0], dtype=torch.float32, device=device), min=1.0)
+                        val_log_cosh = val_loss_sum / N_cells_val
+
+                        val_loss += val_log_cosh.item()
+                        val_steps += 1
+
+                    del v_mask_gpu, val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
+
+            # Clean graph chunk buffers
+            with MemoryAuditor("12. Subgraph Cleanup", tag):
+                del batch, src, dst, weights, x, fracs, pure_anchors, core_gpu, local_core, t_mask_np, v_mask_np
+                model.current_f_prob = None
+
+        # 11. Parameter Update Step
+        with MemoryAuditor("13. clip_grad & optimizer.step", f"Batch {step_idx}"):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
+            optimizer.step()
+
+        # Step-Level Garbage Collection
+        with MemoryAuditor("14. gc.collect()", f"Batch {step_idx}"):
             gc.collect()
+            if device.type == "mps":
+                torch.mps.empty_cache()
+            elif device.type == "cuda":
+                torch.cuda.empty_cache()
 
-    # --- PHASE 2: Inference & Domain Smoothing ---
-    if cfg.phase in ["ALL", "INFERENCE"]:
-        all_prebuilt_graphs = list(out_dirs["graphs"].glob("*_graph.pt"))
-        
-        if 'common_genes' not in locals():
-            with open(genes_path, "r") as f: common_genes = json.load(f)
-        if 'meta_names' not in locals():
-            with open(names_path, "r") as f: 
-                name_data = json.load(f)
-                meta_names = name_data["names"]
-                used_topics = np.array(name_data["used_indices"])
+    with MemoryAuditor("scheduler.step"):
+        scheduler.step()
 
-        with TrackMemory("make_domains", f"{len(all_prebuilt_graphs)} graphs"):
-            make_domains(
-                graph_paths=all_prebuilt_graphs, 
-                common_genes=common_genes,
-                model_path=nmf_model_path,
-                out_dir=out_dir
-            )
-        
-        # --- PHASE 3: Per-Patient Projection ---
-        results = []
-        for f in tqdm(projection_files, desc="Projecting Patient Ecologies"):
-            pt_id = file_metadata[f]["pt_id"]
-            ds_id = file_metadata[f]["ds_id"]
-            with TrackMemory("process_pt", f"Patient: {pt_id}"):
-                if res := process_pt(f, common_genes, meta_names, used_topics, pt_id, ds_id):
-                    results.append(res)
-            gc.collect()
-                
-        if results:
-            with TrackMemory("run_meta", f"{len(results)} patient results"):
-                run_meta(results)
+    print("\n[✓] Diagnostic Epoch Complete.")
+    print(f"    Train Loss: {train_loss / (train_steps + 1e-9):.4f} | Val Loss: {val_loss / (val_steps + 1e-9):.4f}")
 
 
-def main():
-    try:
-        import multiprocessing
-        multiprocessing.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass
-
-    args = parse_args()
-    setup_config_from_args(args)
-    
-    try:
-        run_pipeline_instrumented(Path(args.manifest.strip()))
-    finally:
-        # Ensure the report prints even if an OOM/Exception occurs mid-run
-        MemoryProfileReport.print_summary()
-
-
+# =====================================================================
+# 3. SCRIPT ENTRYPOINT
+# =====================================================================
 if __name__ == "__main__":
-    main()
+    GENES_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/common_genes.json")
+    PRIORS_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/global_cnmf_priors.pkl")
+    CHUNKS_DIR = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/temp_training_chunks")
+
+    try:
+        run_single_epoch_diagnostic(
+            genes_path=GENES_FILE,
+            priors_path=PRIORS_FILE,
+            chunks_dir=CHUNKS_DIR
+        )
+    finally:
+        # Prints diagnostic report even if interrupted or OOM killed
+        MemoryAuditor.print_diagnostic_table()
