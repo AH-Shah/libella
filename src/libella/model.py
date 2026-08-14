@@ -282,12 +282,8 @@ class LibellaGNN(nn.Module):
 
         l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6)))
         
-
-        N_cells = torch.clamp(torch.tensor(x_c.shape[0], dtype=torch.float32, device=x_c.device), min=1.0)
-        
-        l_recon = l_recon_sum / N_cells
-
-
+        # Direct scalar division without creating GPU tensor objects
+        l_recon = l_recon_sum / max(1, x_c.shape[0])
 
         anc_norm = F.normalize(anchors, p=2, dim=1)
         ref_probs = F.softmax(self.anchor_logits, dim=-1)
@@ -301,8 +297,8 @@ class LibellaGNN(nn.Module):
         raw_t_norm = F.normalize(anchors, p=2, dim=-1)
         latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t())
         
-        mask = 1.0 - torch.eye(latent_ortho.shape[0], device=latent_ortho.device)
-        latent_ortho = latent_ortho * mask
+        
+        latent_ortho = latent_ortho * self.ortho_mask
 
         max_overlap = latent_ortho.max(dim=1)[0]
         
