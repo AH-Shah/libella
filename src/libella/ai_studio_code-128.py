@@ -176,7 +176,7 @@ def calibrate_scaling_laws():
 
     batch_size = getattr(cfg, "batch_size", first_chunk["x"].shape[0])
     total_cells = len(all_chunks) * batch_size
-    fractions = [0.05, 0.15, 0.25]
+    fractions = [0.05, 0.15, 0.25, 0.5, 1]
     
     results_cells = []
     results_steps = []
