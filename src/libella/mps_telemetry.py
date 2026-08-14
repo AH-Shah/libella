@@ -104,7 +104,7 @@ def run_async_telemetry():
             
             with TrackMPSAsync("[1] CPU Densify & Extract (SciPy)"):
                 x_dense_np = batch["x"].toarray()
-                x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
+                x = torch.from_numpy(x_dense_np).to(dtype=amp_dtype if amp_enabled else torch.float32, device=device)
                 
                 adj_coo = batch["adj"].tocoo()
                 src = torch.from_numpy(adj_coo.row).to(torch.int32).to(device)
