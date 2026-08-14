@@ -1,141 +1,240 @@
-import argparse
-import subprocess
-import re
-import os
 import sys
-import pandas as pd
-import matplotlib.pyplot as plt
+import os
 from pathlib import Path
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Stress Test the Two-Phase Dynamic Tracker")
-    parser.add_argument("manifest", type=str, help="Path to your manifest CSV (e.g., 500k cells or 3.8M cells)")
-    parser.add_argument("--script", type=str, default="/Users/Hemato/project_3/libella/src/libella/cli.py", help="Path to CLI script or module name")
-    parser.add_argument("--out-dir", type=str, default="./libella_calibration_test", help="Isolated output directory")
-    parser.add_argument("--max-epochs", type=int, default=300, help="Give the tracker plenty of room")
-    return parser.parse_args()
+# --- Auto-resolve libella package path ---
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_SRC = CURRENT_DIR.parent / "src" if (CURRENT_DIR.parent / "src").exists() else CURRENT_DIR
+if str(PROJECT_SRC) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SRC))
 
-def run_and_capture(args):
-    """Runs the Libella CLI as a module and parses the tracker logs in real-time."""
-    script_path = Path(args.script).resolve()
-    env = os.environ.copy()
+import gc
+import random
+import math
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+
+from libella.config import cfg, paths, RunConfig
+from libella.utils import get_device
+from libella.train import _init_model, make_meta_batches, prefetch_batches, pad_mps_shapes
+
+
+def power_law(x, a, b):
+    """Deep Learning Scaling Law: Steps = a * (Dataset_Size)^b"""
+    return a * np.power(x, b)
+
+
+def fit_scaling_curve(x_data, y_data):
+    """Fits power law with a robust log-space fallback if non-linear fit diverges."""
+    x_arr = np.array(x_data, dtype=np.float64)
+    y_arr = np.array(y_data, dtype=np.float64)
     
-    # Automatically convert file path to -m module execution so relative imports work
-    if script_path.is_file():
-        package_dir = script_path.parent        # .../libella/src/libella
-        src_root = package_dir.parent           # .../libella/src
-        module_name = f"{package_dir.name}.{script_path.stem}"  # libella.cli
+    try:
+        # p0: reasonable initial guesses for a (intercept) and b (scaling exponent ~0.3 - 0.7)
+        popt, _ = curve_fit(
+            power_law, 
+            x_arr, 
+            y_arr, 
+            p0=[10.0, 0.5], 
+            bounds=(0, [np.inf, 2.0]), 
+            maxfev=5000
+        )
+        return popt[0], popt[1]
+    except Exception:
+        # Fallback: Log-linear regression log(y) = log(a) + b*log(x)
+        log_x = np.log(x_arr)
+        log_y = np.log(y_arr)
+        slope, intercept = np.polyfit(log_x, log_y, deg=1)
+        a = np.exp(intercept)
+        b = max(0.01, min(slope, 1.5))
+        return a, b
+
+
+def run_pilot(subset_chunks, optimal_k, common_genes):
+    """Runs a Phase 1-only loop to find the exact overfitting point."""
+    device = get_device()
+    model, optimizer, _, _, _, _ = _init_model(common_genes, optimal_k, None, None)
+    model.train()
+    
+    # Lock Phase 1 parameters
+    model.current_scale = getattr(cfg, "scale_start", 1.0)
+    model.current_alpha = getattr(cfg, "alpha_start", 0.0)
+    model.current_temp = getattr(cfg, "temp_start", 1.0)
+    
+    accumulation_steps = getattr(cfg, "meta_batch_size", 4)
+    meta_batches = make_meta_batches(subset_chunks, meta_batch_size=accumulation_steps)
+    
+    best_val = float('inf')
+    best_step = 1
+    patience = 5
+    counter = 0
+    total_steps = 0
+    
+    max_epochs = 150
+    
+    for epoch in range(max_epochs):
+        val_loss = 0.0
+        val_steps = 0
         
-        env["PYTHONPATH"] = f"{src_root}:{env.get('PYTHONPATH', '')}"
-        runner_cmd = [sys.executable, "-m", module_name]
-    else:
-        # Fallback if a module name like 'libella.cli' was passed directly
-        runner_cmd = [sys.executable, "-m", args.script]
+        for step, (meta_meta, loaded_chunks) in enumerate(prefetch_batches(meta_batches)):
+            optimizer.zero_grad(set_to_none=True)
+            for chunk_idx, batch_ref in enumerate(meta_meta):
+                batch = loaded_chunks[chunk_idx]
+                
+                # Setup Tensors
+                x = torch.from_numpy(batch["x"].toarray()).to(dtype=torch.float32, device=device)
+                adj_coo = batch["adj"].tocoo()
+                src = torch.from_numpy(adj_coo.row).to(torch.int32).to(device)
+                dst = torch.from_numpy(adj_coo.col).to(torch.int32).to(device)
+                weights = torch.from_numpy(adj_coo.data).to(torch.float32).to(device)
+                x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
+                
+                if device.type != 'mps':
+                    src, dst = src.to(torch.int64), dst.to(torch.int64)
 
-    cmd = runner_cmd + [
-        args.manifest,
-        "--out-dir", args.out_dir,
-        "--force-retrain",
-        "--epochs", str(args.max_epochs),
-        "--phase", "TRAIN"
-    ]
-    
-    print(f"🚀 Launching Stress Test: {' '.join(cmd)}\n")
-    
-    epoch_regex = re.compile(
-        r"\[Ep\s+(\d+)\]\s+Pure_Rec:([\d.]+)\s+V_Loss:([\d.]+).*?P_W:([\d.]+)%.*?L_Anc:([\d.]+)"
-    )
-    
-    tracker_data = []
-    phase_2_start = None
-    stop_epoch = None
-    
-    process = subprocess.Popen(
-        cmd, 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.STDOUT, 
-        text=True, 
-        bufsize=1,
-        env=env
-    )
-    
-    for line in process.stdout:
-        print(line, end="")
-        
-        # 1. Parse Epoch Data
-        match = epoch_regex.search(line)
-        if match:
-            tracker_data.append({
-                "Epoch": int(match.group(1)),
-                "Pure_Rec": float(match.group(2)),
-                "V_Loss": float(match.group(3)),
-                "P_W": float(match.group(4)),
-                "L_Anc": float(match.group(5))
-            })
+                fracs, pure_anchors = model(x, src, dst, weights)
+                
+                # --- Quick Val Loss ---
+                local_core = batch["local_core_idx"]
+                core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
+                v_mask_np = batch["val_mask"][local_core]
+                
+                if v_mask_np.sum() > 0:
+                    val_idx = core_gpu[torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=device)]
+                    f_val = fracs[val_idx]
+                    x_val = x[val_idx]
+                    val_recon = f_val @ pure_anchors
+                    
+                    is_non_zero_val = (x_val > 0)
+                    w_mat = torch.where(is_non_zero_val, 1.0, 1.0)
+                    zero_mask = torch.where(is_non_zero_val, 1.0, getattr(cfg, "zero_mask_rate", 0.1)).to(x_val.dtype)
+                    
+                    raw_delta = val_recon - x_val
+                    asym = 1.0 + (is_non_zero_val.to(x_val.dtype) * 2.0) * (raw_delta < 0).to(x_val.dtype)
+                    scaled_delta = torch.clamp(raw_delta * asym, min=-getattr(cfg, "delta_clamp", 15.0), max=getattr(cfg, "delta_clamp", 15.0))
+                    
+                    v_loss = torch.sum((w_mat * zero_mask) * torch.log(torch.cosh(scaled_delta + 1e-6)))
+                    val_loss += (v_loss / max(1.0, float(x_val.shape[0]))).item()
+                    val_steps += 1
+                
+                # --- Mock Training Step to advance weights ---
+                t_mask_np = batch["train_mask"][local_core]
+                if t_mask_np.sum() > 0:
+                    t_idx = core_gpu[torch.from_numpy(t_mask_np).to(dtype=torch.bool, device=device)]
+                    f_train, x_train = fracs[t_idx], x[t_idx]
+                    recon = f_train @ pure_anchors
+                    t_loss, _ = model.calc_loss(recon, x_train, pure_anchors, None, epoch, max_epochs)
+                    (t_loss / len(meta_meta)).backward()
             
-        # 2. Track Phase Transitions
-        if "[🚀] Phase 1 Complete" in line:
-            phase_2_start = tracker_data[-1]["Epoch"] if tracker_data else 0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(cfg, "grad_clip", 1.0))
+            optimizer.step()
+            total_steps += 1
             
-        if "[✅] Sparsification complete" in line or "Forced Phase 2 transition" in line:
-            stop_epoch = tracker_data[-1]["Epoch"] if tracker_data else 0
+        # Check Overfitting
+        avg_val = val_loss / max(1, val_steps)
+        if avg_val < best_val:
+            best_val = avg_val
+            best_step = total_steps
+            counter = 0
+        else:
+            counter += 1
+            
+        if counter >= patience:
+            break
 
-    process.wait()
+    # Clean up GPU allocation
+    del model, optimizer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+    gc.collect()
+
+    return max(1, best_step)
+
+
+def calibrate_scaling_laws():
+    print("\n🚀 INITIATING EMPIRICAL SCALING CALIBRATION 🚀")
+    out_dirs = paths.make_dirs(cfg.suffix)
+    chunk_dir = out_dirs["out"] / "temp_training_chunks"
     
-    if not tracker_data:
-        print("\n[!] No training data parsed. Did the pipeline crash before Epoch 1?")
+    all_chunks = sorted(list(chunk_dir.glob("*_chunk_*.pt")))
+    if not all_chunks:
+        print(f"[!] No pre-sliced chunks found in {chunk_dir}.")
+        print("    Run the main pipeline up to 'BUILD_GRAPHS' first.")
         return
         
-    df = pd.DataFrame(tracker_data)
-    plot_calibration(df, phase_2_start, stop_epoch, Path(args.out_dir))
+    # Dynamically extract actual gene dimension and K from chunks/cfg
+    first_chunk = torch.load(all_chunks[0], map_location="cpu", weights_only=False)
+    actual_num_genes = first_chunk["x"].shape[1]
+    optimal_k = getattr(cfg, "k", 100)
+    common_genes = [f"Gene_{i}" for i in range(actual_num_genes)]
+    
+    print(f"[*] Detected dataset structure: {len(all_chunks)} chunks | {actual_num_genes} genes | k={optimal_k}")
 
-def plot_calibration(df: pd.DataFrame, phase_2_start: int, stop_epoch: int, out_dir: Path):
-    """Generates a visual report of the Phase Tracker's behavior."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "calibration_report.png"
+    batch_size = getattr(cfg, "batch_size", first_chunk["x"].shape[0])
+    total_cells = len(all_chunks) * batch_size
+    fractions = [0.05, 0.15, 0.25]
     
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    results_cells = []
+    results_steps = []
     
-    # --- Left Axis: Losses ---
-    ax1.set_xlabel("Epoch", fontweight='bold')
-    ax1.set_ylabel("Loss", color='tab:blue', fontweight='bold')
-    l1 = ax1.plot(df["Epoch"], df["Pure_Rec"], color='tab:blue', linewidth=2.5, label="Pure Rec")
-    l2 = ax1.plot(df["Epoch"], df["V_Loss"], color='tab:cyan', linestyle='--', alpha=0.6, label="Val Loss")
-    ax1.tick_params(axis='y', labelcolor='tab:blue')
-    
-    # --- Right Axis: Sparsification ---
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("Cell Purity (P_W %) / Anchor Drift", color='tab:red', fontweight='bold')
-    l3 = ax2.plot(df["Epoch"], df["P_W"], color='tab:red', linewidth=2.5, label="Cell Purity (P_W %)")
-    l4 = ax2.plot(df["Epoch"], df["L_Anc"] * 100, color='tab:orange', linestyle=':', linewidth=2, label="Anchor Drift (Scaled)")
-    ax2.tick_params(axis='y', labelcolor='tab:red')
-    
-    # --- Tracker Markers ---
-    if phase_2_start is not None:
-        ax1.axvline(x=phase_2_start, color='green', linestyle='--', linewidth=2, zorder=0)
-        ax1.text(phase_2_start + 1, df["Pure_Rec"].max(), "🚀 Phase 2\n(Sparsification)", color='green', fontweight='bold')
-        ax1.axvspan(0, phase_2_start, color='gray', alpha=0.1)
+    for frac in fractions:
+        n_chunks = max(1, int(len(all_chunks) * frac))
+        subset = [{"chunk_file": c} for c in random.sample(all_chunks, n_chunks)]
+        subset_cells = n_chunks * batch_size
         
-    if stop_epoch is not None:
-        ax1.axvline(x=stop_epoch, color='black', linestyle='-.', linewidth=2, zorder=0)
-        ax1.text(stop_epoch + 1, df["Pure_Rec"].mean(), "✅ Terminated", color='black', fontweight='bold')
-
-    lines = l1 + l2 + l3 + l4
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc='center right')
+        print(f"\n[➤] Running Pilot: {frac*100:.0f}% of Data ({subset_cells} cells, {n_chunks} chunks)...")
+        opt_steps = run_pilot(subset, optimal_k, common_genes)
+        
+        print(f"    ↳ Overfit Boundary Detected at {opt_steps} optimization steps.")
+        results_cells.append(subset_cells)
+        results_steps.append(opt_steps)
+        
+    # --- Fit Scaling Law ---
+    print("\n📊 Fitting Deep Learning Power Law (Steps = a * Cells^b)...")
+    a_param, b_param = fit_scaling_curve(results_cells, results_steps)
     
-    plt.title(f"Tracker Calibration Report | Final P_W: {df['P_W'].iloc[-1]}%", fontsize=14, fontweight='bold')
+    target_steps = power_law(total_cells, a_param, b_param)
+    
+    # Convert Steps back to Epochs for the full dataset
+    chunks_per_epoch = max(1.0, len(all_chunks) / getattr(cfg, "meta_batch_size", 4))
+    optimal_epochs = max(1, int(target_steps / chunks_per_epoch))
+    p2_epochs = max(10, int(optimal_epochs * 0.3))
+    
+    print("\n" + "="*55)
+    print(f"🎯 CALIBRATION COMPLETE FOR {total_cells} CELLS")
+    print("="*55)
+    print(f"Fitted Law: Steps = {a_param:.4f} * Cells^{b_param:.4f}")
+    print(f"Predicted Optimal Steps: {int(target_steps)}")
+    print(f"Chunks per Epoch:        {chunks_per_epoch:.1f}")
+    print(f"\n✅ RECOMMENDED SCHEDULE:")
+    print(f"   Phase 1 (Representation): {optimal_epochs} Epochs")
+    print(f"   Phase 2 (Sparsification): {p2_epochs} Epochs")
+    print(f"   Total cfg.epochs to set:  {optimal_epochs + p2_epochs}")
+    print("="*55)
+    
+    # Plot curve
+    plot_path = out_dirs["out"] / "scaling_law_calibration.png"
+    x_line = np.linspace(min(results_cells), total_cells, 100)
+    y_line = power_law(x_line, a_param, b_param)
+    
+    plt.figure(figsize=(8, 5))
+    plt.plot(x_line, y_line, '--', color='gray', label="Fitted Scaling Law")
+    plt.scatter(results_cells, results_steps, color='blue', s=100, label="Pilot Runs (Actual)")
+    plt.scatter([total_cells], [target_steps], color='red', marker='*', s=200, label="Full Dataset Prediction")
+    
+    plt.title(f"Empirical Scaling Law ($Steps = {a_param:.2f} \\times Cells^{{{b_param:.2f}}}$)")
+    plt.xlabel("Dataset Size (Cells)")
+    plt.ylabel("Optimal Gradient Steps")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    
-    print(f"\n" + "="*50)
-    print(f"📊 CALIBRATION REPORT SAVED TO: {out_path}")
-    print("="*50)
-    print(f"Final Pure_Rec: {df['Pure_Rec'].iloc[-1]:.3f}")
-    print(f"Final Cell Purity (P_W): {df['P_W'].iloc[-1]:.2f}%")
-    if phase_2_start:
-        print(f"Phase 2 Triggered At: Epoch {phase_2_start}")
-    print("="*50)
+    plt.savefig(plot_path, dpi=150)
+    print(f"📉 Saved visualization to '{plot_path}'")
+
 
 if __name__ == "__main__":
-    run_and_capture(parse_args())
+    calibrate_scaling_laws()
