@@ -46,7 +46,7 @@ class MemoryAuditor:
         return 0.0
 
     def __enter__(self):
-        self.start_rss = self.process.memory_info().rss / (1024 ** 2) # MB
+        self.start_rss = self.process.memory_info().rss / (1024 ** 2)  # MB
         self.start_vram = self._get_vram()
         self.start_time = time.perf_counter()
         return self
@@ -56,7 +56,7 @@ class MemoryAuditor:
         self.end_rss = self.process.memory_info().rss / (1024 ** 2)
         self.end_vram = self._get_vram()
         
-        duration = (self.end_time - self.start_time) * 1000 # ms
+        duration = (self.end_time - self.start_time) * 1000  # ms
         delta_rss = self.end_rss - self.start_rss
         delta_vram = self.end_vram - self.start_vram
         
@@ -72,10 +72,10 @@ class MemoryAuditor:
             "duration_ms": duration,
         })
         
-        # Live log for any step expanding RAM by more than 100 MB
-        if abs(delta_rss) > 100 or abs(delta_vram) > 100:
+        # Log any step expanding RAM or VRAM by > 50 MB
+        if abs(delta_rss) > 50 or abs(delta_vram) > 50:
             print(
-                f"  ⚠️ [SPIKE] {self.step_name:<30} | "
+                f"  ⚠️ [SPIKE] {self.step_name:<32} | "
                 f"RAM: {self.end_rss:7.1f} MB (Δ {delta_rss:+6.1f} MB) | "
                 f"VRAM: {self.end_vram:7.1f} MB (Δ {delta_vram:+6.1f} MB) | "
                 f"Time: {duration:6.1f}ms"
@@ -93,7 +93,7 @@ class MemoryAuditor:
 
         df = pd.DataFrame(cls.records)
         
-        # Sort by peak RSS to surface the top memory offenders
+        # Sort by peak RSS delta
         top_spikes = df.sort_values(by="delta_rss_mb", ascending=False).head(15)
         
         display_df = pd.DataFrame({
@@ -125,7 +125,65 @@ class MemoryAuditor:
 
 
 # =====================================================================
-# 2. RUNTIME SETUP FOR SPECIFIED ASSETS
+# 2. ROBUST MULTI-FORMAT PRIOR LOADER
+# =====================================================================
+def safe_load_priors(priors_path: Path) -> tuple[np.ndarray | None, int]:
+    """Loads cNMF priors serialized with torch, joblib, numpy, or pickle."""
+    raw_obj = None
+
+    # 1. Try torch.load (primary cause of \x10 header)
+    try:
+        raw_obj = torch.load(priors_path, map_location="cpu", weights_only=False)
+    except Exception:
+        pass
+
+    # 2. Try joblib
+    if raw_obj is None:
+        try:
+            import joblib
+            raw_obj = joblib.load(priors_path)
+        except Exception:
+            pass
+
+    # 3. Try numpy
+    if raw_obj is None:
+        try:
+            raw_obj = np.load(priors_path, allow_pickle=True)
+            if hasattr(raw_obj, "files"):  # npz file
+                raw_obj = {k: raw_obj[k] for k in raw_obj.files}
+        except Exception:
+            pass
+
+    # 4. Try standard pickle
+    if raw_obj is None:
+        with open(priors_path, "rb") as f:
+            raw_obj = pickle.load(f)
+
+    # Extract components and K from loaded payload
+    init_components = None
+    optimal_k = 30  # default fallback
+
+    if isinstance(raw_obj, dict):
+        for key in ["init_components", "priors", "components", "basis", "H", "W"]:
+            if key in raw_obj:
+                init_components = raw_obj[key]
+                break
+        optimal_k = raw_obj.get("optimal_k", raw_obj.get("k", init_components.shape[0] if init_components is not None else 30))
+    elif isinstance(raw_obj, (tuple, list)):
+        init_components = raw_obj[0]
+        optimal_k = raw_obj[1] if len(raw_obj) > 1 and isinstance(raw_obj[1], int) else init_components.shape[0]
+    elif isinstance(raw_obj, (np.ndarray, torch.Tensor)):
+        init_components = raw_obj
+        optimal_k = init_components.shape[0]
+
+    if isinstance(init_components, torch.Tensor):
+        init_components = init_components.detach().cpu().numpy()
+
+    return init_components, int(optimal_k)
+
+
+# =====================================================================
+# 3. DIAGNOSTIC SINGLE-EPOCH RUNNER
 # =====================================================================
 def run_single_epoch_diagnostic(
     genes_path: Path,
@@ -136,7 +194,7 @@ def run_single_epoch_diagnostic(
     print(f"\n[i] Compute Device: {device}")
     
     # -------------------------------------------------------------
-    # Step A: Load Pre-Computed Common Genes & CNMF Priors
+    # Step A: Load Genes & Priors
     # -------------------------------------------------------------
     with MemoryAuditor("Load common_genes.json"):
         with open(genes_path, "r") as f:
@@ -144,19 +202,9 @@ def run_single_epoch_diagnostic(
         print(f"  ↳ Loaded {len(common_genes)} consensus genes.")
 
     with MemoryAuditor("Load global_cnmf_priors.pkl"):
-        with open(priors_path, "rb") as f:
-            prior_data = pickle.load(f)
-            
-        if isinstance(prior_data, dict):
-            init_components = prior_data.get("init_components", prior_data.get("priors"))
-            optimal_k = prior_data.get("optimal_k", init_components.shape[0] if init_components is not None else 30)
-        elif isinstance(prior_data, tuple):
-            init_components, optimal_k = prior_data[0], prior_data[1]
-        else:
-            init_components = prior_data
-            optimal_k = init_components.shape[0]
-
-        print(f"  ↳ Loaded cNMF Prior Components shape: {init_components.shape if init_components is not None else None} (K={optimal_k})")
+        init_components, optimal_k = safe_load_priors(priors_path)
+        comp_shape = init_components.shape if init_components is not None else None
+        print(f"  ↳ Loaded cNMF Prior Components shape: {comp_shape} (Optimal K={optimal_k})")
 
     # -------------------------------------------------------------
     # Step B: Build Training Cache from SSD Chunks
@@ -198,7 +246,7 @@ def run_single_epoch_diagnostic(
         )
 
     # -------------------------------------------------------------
-    # Step D: Single Epoch Instrumented Execution Loop
+    # Step D: Single Epoch Execution Loop
     # -------------------------------------------------------------
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)
     tracker = PhaseTracker()
@@ -232,7 +280,7 @@ def run_single_epoch_diagnostic(
             with MemoryAuditor("2. batch['x'].toarray() (Dense)", tag):
                 x_dense_np = batch["x"].toarray()
 
-            # 3. Dense Tensor Transfer to Compute Device
+            # 3. Dense Tensor Transfer to Device
             with MemoryAuditor("3. x.to(device)", tag):
                 x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
                 del x_dense_np
@@ -245,14 +293,13 @@ def run_single_epoch_diagnostic(
                 weights = torch.from_numpy(adj_coo.data).to(torch.float32)
                 del adj_coo
 
-                # Edge dropout during training
                 keep_mask = torch.rand(src.size(0)) > 0.40
                 src = src[keep_mask].to(device)
                 dst = dst[keep_mask].to(device)
                 weights = weights[keep_mask].to(device)
                 del keep_mask
 
-            # 5. Bucket Padding
+            # 5. MPS Bucket Padding
             with MemoryAuditor("5. pad_mps_shapes", tag):
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
                 if device.type != "mps":
@@ -268,7 +315,7 @@ def run_single_epoch_diagnostic(
 
                 fracs, pure_anchors = model(x, src, dst, weights)
 
-            # 7. Core Node Extraction & Targets
+            # 7. Core Node Extraction & Target Math
             with MemoryAuditor("7. Calculate Targets & Priors", tag):
                 local_core = batch["local_core_idx"]
                 core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
@@ -305,23 +352,20 @@ def run_single_epoch_diagnostic(
 
                     recon = f_train @ pure_anchors
 
-                # 8. Loss Computation
                 with MemoryAuditor("9. model.calc_loss", tag):
                     true_batch_loss, base_recon_val = model.calc_loss(
                         recon, x_train, pure_anchors, None, 0, cfg.epochs,
                         f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
                     )
 
-                # 9. Autograd Graph Backward Pass
                 with MemoryAuditor("10. loss.backward()", tag):
                     (true_batch_loss / len(meta_batch)).backward()
                     train_loss += true_batch_loss.item()
                     train_steps += 1
 
-                # Clean train intermediates
                 del t_mask_gpu, train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss
 
-            # 10. Validation Loss Computation
+            # Validation Mask Evaluation
             v_mask_np = batch["val_mask"][local_core]
             if v_mask_np.sum() > 0:
                 with MemoryAuditor("11. Val Evaluation (no_grad)", tag):
@@ -351,17 +395,14 @@ def run_single_epoch_diagnostic(
 
                     del v_mask_gpu, val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
 
-            # Clean graph chunk buffers
             with MemoryAuditor("12. Subgraph Cleanup", tag):
                 del batch, src, dst, weights, x, fracs, pure_anchors, core_gpu, local_core, t_mask_np, v_mask_np
                 model.current_f_prob = None
 
-        # 11. Parameter Update Step
         with MemoryAuditor("13. clip_grad & optimizer.step", f"Batch {step_idx}"):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
             optimizer.step()
 
-        # Step-Level Garbage Collection
         with MemoryAuditor("14. gc.collect()", f"Batch {step_idx}"):
             gc.collect()
             if device.type == "mps":
@@ -377,7 +418,7 @@ def run_single_epoch_diagnostic(
 
 
 # =====================================================================
-# 3. SCRIPT ENTRYPOINT
+# 4. SCRIPT ENTRYPOINT
 # =====================================================================
 if __name__ == "__main__":
     GENES_FILE = Path("/Users/Hemato/project_3/libella/src/libella/libella_output/run/common_genes.json")
@@ -391,5 +432,4 @@ if __name__ == "__main__":
             chunks_dir=CHUNKS_DIR
         )
     finally:
-        # Prints diagnostic report even if interrupted or OOM killed
         MemoryAuditor.print_diagnostic_table()
