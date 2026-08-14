@@ -33,7 +33,7 @@ def _init_model(
     optimal_k: int, 
     init_components: np.ndarray | None, 
     checkpoint_path: Path | None = None
-) -> tuple[LibellaGNN, torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler, float, dict[str, list], int]:
+) -> tuple[LibellaGNN, torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler, float, dict[str, Any] | None, dict[str, list], int]:
     """Initialize GNN model, optimizers, and load state if available."""
     device = get_device()
     model = LibellaGNN(
@@ -528,7 +528,8 @@ def train_gnn(
         
         _, optimal_k, _ = get_priors(graph_paths)
         
-        model, optimizer, scheduler, _, history, _ = _init_model(
+
+        model, optimizer, scheduler, _, _, history, _ = _init_model(
             common_genes, optimal_k, None, checkpoint
         )
         return model, history, optimal_k
@@ -549,7 +550,7 @@ def train_gnn(
         optimal_k += n_extra_slots
     gc.collect()
 
-    model, optimizer, scheduler, best_val_loss, history, start_epoch = _init_model(
+    model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
         common_genes, optimal_k, init_components, checkpoint
     )
     del checkpoint, init_components
@@ -563,7 +564,7 @@ def train_gnn(
     gc.collect()  
 
     model, history = _train_loop(
-        model, optimizer, scheduler, training_cache, start_epoch, best_val_loss, history
+        model, optimizer, scheduler, training_cache, start_epoch, best_composite_score, tracker_state, history
     )
     gc.collect()
     
