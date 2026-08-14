@@ -181,8 +181,7 @@ class LibellaGNN(nn.Module):
         k_src = K[src_with_self]
         v_src = V[src_with_self]
         
-        cross_scores = (q_dst * k_src).sum(dim=-1)
-        cross_scores.div_(self.hidden_dim ** 0.5)
+        cross_scores = (q_dst * k_src).sum(dim=-1) / (self.hidden_dim ** 0.5)
         cross_att = scatter_softmax(cross_scores, dst_with_self, N)
         
 
@@ -265,7 +264,6 @@ class LibellaGNN(nn.Module):
             
         is_non_zero = (x_c > 0)
         
-        # 1. Fuse the weighting logic directly without .float() expansions
         if self.training:
             zero_mask = torch.rand_like(x_c) < 0.05 
             masked_w_mat = is_non_zero.to(x_c.dtype) * current_dynamic_w
