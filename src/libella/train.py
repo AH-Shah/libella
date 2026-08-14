@@ -125,6 +125,13 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
         for chunk_idx, core_idx in enumerate(batcher.chunks):
             if data.train_mask.numpy()[core_idx].sum() > 0:
                 chunk_data = batcher.get_chunk(chunk_idx)
+                
+                # Pre-densify matrix directly to torch tensor before SSD serialization
+                if hasattr(chunk_data["x"], "toarray"):
+                    chunk_data["x"] = torch.from_numpy(chunk_data["x"].toarray()).to(torch.float32)
+                elif not isinstance(chunk_data["x"], torch.Tensor):
+                    chunk_data["x"] = torch.tensor(chunk_data["x"], dtype=torch.float32)
+                
                 chunk_file = tmp_chunk_dir / f"{data.patient_name}_chunk_{chunk_idx}.pt"
                 torch.save(chunk_data, chunk_file)
                 
