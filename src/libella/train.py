@@ -173,70 +173,18 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
 
 def prefetch_batches(
     meta_batches: list[list[dict[str, Any]]]
-) -> Iterator[tuple[list[dict[str, Any]], Iterator[Any]]]:
-    """Prefetch strictly 1 chunk at a time using a bounded queue to protect Unified Memory."""
+) -> Iterator[tuple[list[dict[str, Any]], list[Any]]]:
+    """Direct synchronous loader: 0 threads, 0 locks, 0 deadlocks on Apple Silicon."""
     if not meta_batches:
         return
 
     for meta_meta in meta_batches:
-        chunk_queue = queue.Queue(maxsize=1)
-        stop_event = Event()
-
-        def safe_put(item: Any) -> bool:
-            """
-            Attempts to put an item in the queue. 
-            Returns False if the main thread aborted, meaning the worker should exit.
-            """
-            while not stop_event.is_set():
-                try:
-                    chunk_queue.put(item, timeout=0.1)
-                    return True
-                except queue.Full:
-                    continue
-            return False # Stop event was set, give up!
-
-        def worker():
-            try:
-                for b in meta_meta:
-                    if stop_event.is_set():
-                        break
-                    
-                    # 1. Load sub-graph chunk from SSD
-                    chunk = torch.load(b['chunk_file'], map_location='cpu', weights_only=False)
-                    
-                    # 2. Safely put into bounded queue. If it returns False, exit loop.
-                    if not safe_put(chunk):
-                        break
-                        
-            except Exception as e:
-                # Safely attempt to pass the error to the main thread
-                safe_put(e)
-            finally:
-                # Safely push the end-of-stream sentinel
-                safe_put(None)
-
-        t = Thread(target=worker, daemon=True)
-        t.start()
-
-        def chunk_iterator():
-            try:
-                while True:
-                    chunk = chunk_queue.get()
-                    
-                    if chunk is None:
-                        break
-                        
-                    if isinstance(chunk, Exception):
-                        raise chunk  # Surface background exceptions immediately on main thread
-                        
-                    yield chunk
-            finally:
-                # If training loop breaks early (e.g. NaN loss, or Generator is garbage collected), 
-                # immediately unblock the worker thread so it can exit.
-                stop_event.set()
-
-        yield meta_meta, chunk_iterator()
-            
+        chunks = []
+        for b in meta_meta:
+            chunk = torch.load(b["chunk_file"], map_location="cpu", weights_only=False)
+            chunks.append(chunk)
+        yield meta_meta, chunks
+                 
 def _train_loop(
     model: LibellaGNN, 
     optimizer: torch.optim.Optimizer, 
@@ -289,12 +237,9 @@ def _train_loop(
         nan_detected = False
 
         for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
-            print(f"\n[DEBUG Step {step+1}/{total_steps_per_epoch}] Starting meta-batch...", flush=True)
             optimizer.zero_grad(set_to_none=True)
-            
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
-                print(f"  ↳ [DEBUG Chunk {chunk_idx+1}/{len(meta_meta)}] 1. Loading tensors to GPU...", flush=True)
-                
+
                 # Direct non-blocking transfers from pre-tensorized SSD chunks
                 x = batch["x"].to(device=device, non_blocking=True)
                 src = batch["src"].to(device=device, non_blocking=True)
@@ -307,7 +252,6 @@ def _train_loop(
                     dst = dst[keep_mask]
                     weights = weights[keep_mask]
                 
-                print(f"  ↳ [DEBUG Chunk {chunk_idx+1}] 2. Padding shapes (x: {x.shape})...", flush=True)
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
 
                 if device.type != 'mps':
@@ -315,21 +259,23 @@ def _train_loop(
                     dst = dst.to(torch.int64)
 
                 progress = tracker.get_progress()
+
                 model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * progress)    
                 model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)     
                 model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress) 
 
-                print(f"  ↳ [DEBUG Chunk {chunk_idx+1}] 3. Running model forward pass...", flush=True)
                 fracs, pure_anchors = model(x, src, dst, weights)
                 
-                print(f"  ↳ [DEBUG Chunk {chunk_idx+1}] 4. Extracting training core slice...", flush=True)
+                # Guaranteed >0 train nodes by SSD preparation; unconditional zero-sync execution
                 train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
+
                 f_train = fracs[train_idx]
                 x_train = x[train_idx]
 
                 p_train = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
                 current_p_mean = p_train.mean(dim=0)
                 
+                # Pure GPU EMA Target Calculation (0 CPU-GPU syncs)
                 uniform_prior = torch.ones_like(current_p_mean) / pure_anchors.shape[0]
                 if ema_mean is None:
                     ema_mean = current_p_mean.detach()
@@ -345,9 +291,9 @@ def _train_loop(
 
                 peak_p = ema_mean.max()
                 hub_multiplier = F.relu((peak_p / cfg.hub_threshold) - 1.0) * 10.0 
+
                 dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier 
 
-                print(f"  ↳ [DEBUG Chunk {chunk_idx+1}] 5. Calculating loss...", flush=True)
                 recon = f_train @ pure_anchors
                 true_batch_loss, base_recon_val = model.calc_loss(
                     recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
@@ -358,17 +304,19 @@ def _train_loop(
                     nan_detected = True
                     break
 
-                print(f"  ↳ [DEBUG Chunk {chunk_idx+1}] 6. Running backward gradient accumulation...", flush=True)
                 (true_batch_loss / len(meta_meta)).backward()
                 
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
 
+                # Pure GPU Telemetry Accumulation
                 gpu_telemetry['g_w'] += pure_anchors.max(dim=1).values.mean().detach() * 100.0
                 gpu_telemetry['p_w'] += p_train.max(dim=1).values.mean().detach() * 100.0
                 gpu_telemetry['ent'] += ema_entropy.detach()
                 gpu_telemetry['col_r'] += collapse_ratio.detach()
                 gpu_telemetry['kl_w'] += dynamic_kl_w.detach()
+                
+                # Exact reconstruction loss from calc_loss return
                 gpu_telemetry['l_rec'] += base_recon_val.detach()
                 
                 epoch_p_mean_sum += current_p_mean.detach()
@@ -376,10 +324,9 @@ def _train_loop(
 
                 del train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss, base_recon_val
 
-                # Validation Evaluation
+                # Validation Evaluation (Zero-sync check using CPU-resident numel)
                 val_core_idx_cpu = batch["val_core_idx"]
                 if val_core_idx_cpu.numel() > 0:
-                    print(f"  ↳ [DEBUG Chunk {chunk_idx+1}] 7. Running validation loss...", flush=True)
                     val_idx = val_core_idx_cpu.to(device=device, non_blocking=True)
                     
                     with torch.no_grad():
@@ -404,18 +351,12 @@ def _train_loop(
                         
                     del val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
 
-                print(f"  ↳ [DEBUG Chunk {chunk_idx+1}] 8. Chunk complete.", flush=True)
                 del batch, src, dst, weights, x, fracs, pure_anchors
                 model.current_f_prob = None  
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
                 break
-
-            print(f"[DEBUG Step {step+1}] 9. Executing clip_grad & optimizer.step()...", flush=True)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
-            optimizer.step()
-            print(f"[DEBUG Step {step+1}] 10. Step complete!", flush=True)
 
             base_params = [p for n, p in model.named_parameters() if 'topic_gene_logits' not in n]
             anchor_params = [p for n, p in model.named_parameters() if 'topic_gene_logits' in n]
