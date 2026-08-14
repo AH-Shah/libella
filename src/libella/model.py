@@ -159,7 +159,8 @@ class LibellaGNN(nn.Module):
                 tau = torch.clamp(F.softplus(self.att_temp), min=0.05)
                 e_scaled = e_raw / tau
                 
-                alpha_att = scatter_softmax(e_scaled, dst, N) 
+                alpha_att = scatter_softmax(e_scaled, dst, N).to(h_ctx.dtype) 
+
                 
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
                 out.index_add_(0, dst, msg)
@@ -185,7 +186,7 @@ class LibellaGNN(nn.Module):
         
         cross_scores = (q_dst * k_src).sum(dim=-1)
         cross_scores.div_(self.hidden_dim ** 0.5)
-        cross_att = scatter_softmax(cross_scores, dst_with_self, N)
+        cross_att = scatter_softmax(cross_scores, dst_with_self, N).to(Q.dtype)
         
 
         pulled_msg = (v_src * cross_att.unsqueeze(1)).contiguous()
