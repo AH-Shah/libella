@@ -95,18 +95,18 @@ class PhaseTracker:
             self.ema_rec = current_rec
             self.ema_pw = current_pw
         else:
-            self.ema_rec = 0.4 * current_rec + 0.6 * self.ema_rec
-            self.ema_pw = 0.4 * current_pw + 0.6 * self.ema_pw
+            self.ema_rec = 0.3 * current_rec + 0.7 * self.ema_rec
+            self.ema_pw = 0.3 * current_pw + 0.7 * self.ema_pw
             
         self.history_ema_rec.append(self.ema_rec)
         self.history_ema_pw.append(self.ema_pw)
 
-        # 2. Measure Velocities (Look back 8 epochs)
+        # 2. Measure Velocities (Look back 10 epochs)
         rec_improvement = 1.0
         pw_gain = 1.0
-        if len(self.history_ema_rec) >= 9:
-            past_rec = self.history_ema_rec[-9]
-            past_pw = self.history_ema_pw[-9]
+        if len(self.history_ema_rec) >= 11:
+            past_rec = self.history_ema_rec[-11]
+            past_pw = self.history_ema_pw[-11]
             
             rec_improvement = (past_rec - self.ema_rec) / past_rec
             pw_gain = self.ema_pw - past_pw
