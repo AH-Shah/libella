@@ -126,14 +126,38 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
             if data.train_mask.numpy()[core_idx].sum() > 0:
                 chunk_data = batcher.get_chunk(chunk_idx)
                 
-                # Pre-densify matrix directly to torch tensor before SSD serialization
+                # Pre-densify X
                 if hasattr(chunk_data["x"], "toarray"):
-                    chunk_data["x"] = torch.from_numpy(chunk_data["x"].toarray()).to(torch.float32)
+                    chunk_x = torch.from_numpy(chunk_data["x"].toarray()).to(torch.float32)
                 elif not isinstance(chunk_data["x"], torch.Tensor):
-                    chunk_data["x"] = torch.tensor(chunk_data["x"], dtype=torch.float32)
+                    chunk_x = torch.tensor(chunk_data["x"], dtype=torch.float32)
+                else:
+                    chunk_x = chunk_data["x"].to(torch.float32)
+
+                # Pre-convert Adjacency COO to Torch Tensors
+                adj_coo = chunk_data["adj"].tocoo()
+                src = torch.from_numpy(adj_coo.row).to(torch.int32)
+                dst = torch.from_numpy(adj_coo.col).to(torch.int32)
+                weights = torch.from_numpy(adj_coo.data).to(torch.float32)
+
+                # Pre-convert Masks & Indices
+                local_core = torch.from_numpy(chunk_data["local_core_idx"]).to(torch.int64)
+                t_mask = torch.from_numpy(chunk_data["train_mask"]).to(torch.bool)
+                v_mask = torch.from_numpy(chunk_data["val_mask"]).to(torch.bool)
+
+                packaged_chunk = {
+                    "x": chunk_x,
+                    "src": src,
+                    "dst": dst,
+                    "weights": weights,
+                    "local_core_idx": local_core,
+                    "train_mask": t_mask,
+                    "val_mask": v_mask,
+                    "patient_name": data.patient_name
+                }
                 
                 chunk_file = tmp_chunk_dir / f"{data.patient_name}_chunk_{chunk_idx}.pt"
-                torch.save(chunk_data, chunk_file)
+                torch.save(packaged_chunk, chunk_file)
                 
                 training_cache.append({
                     "patient_name": data.patient_name, 
