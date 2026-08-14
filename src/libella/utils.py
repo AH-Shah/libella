@@ -65,54 +65,101 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
 
 
 class PhaseTracker:
-    """Two-phase dynamic scheduler for decoupled representation and sparsification."""
-    def __init__(self, num_cells: int, num_samples: int) -> None:
-        size_ratio = max(1.0, num_cells / 100_000.0)
-        patient_bump = 1.0 + 0.15 * max(0.0, num_samples - 1)
+    """
+    Closed-Loop Adaptive Scheduler. 
+    Progress is gated by the health of the reconstruction manifold.
+    """
+    def __init__(self) -> None:
+        self.history_rec = []
+        self.history_pw = []
         
-        # Combined complexity scalar
-        comp = math.sqrt(size_ratio) * patient_bump
-        
-        # Phase 1: Representation (Strict minimums)
-        self.min_p1 = int(25 * comp)
-        self.window = max(4, int(6 * comp))
-        
-        # Phase 2: Gradual Sparsification
-        self.p2_duration = max(20, int(35 * comp))
-        
-        self.min_delta = 0.001
-        self.history = []
         self.phase = 1
-        self.p2_step = 0
+        self.p1_baseline_rec = None
+        self.p1_epochs = 0
+        
+        self.internal_progress = 0.0
+        self.epochs_at_max = 0
 
     def get_progress(self) -> float:
-        """Fetch current non-linear progress multiplier."""
+        """Apply an S-curve easing to our adaptive linear progress."""
         if self.phase == 1:
             return 0.0
-            
-        linear_p = self.p2_step / max(1, self.p2_duration - 1)
-        return 0.5 * (1.0 - math.cos(math.pi * linear_p))
-
-    def step(self, loss: float, epoch: int) -> bool:
-        """Update internal state; return True if training is complete."""
-        if self.phase == 2:
-            self.p2_step += 1
-            return self.p2_step >= self.p2_duration
-
-        self.history.append(loss)
         
-        if epoch < self.min_p1 or len(self.history) < (self.window * 2):
+        # Smooth interpolation: prevents sudden shocks even if internal_progress jumps
+        return 0.5 * (1.0 - math.cos(math.pi * self.internal_progress))
+
+    def _get_trend(self, history: list, window: int = 3) -> float:
+        """Calculate the relative change between two recent windows."""
+        if len(history) < (window * 2):
+            return 1.0 
+            
+        recent = sum(history[-window:]) / window
+        previous = sum(history[-(window * 2):-window]) / window
+        
+        if previous == 0: return 0.0
+        return (previous - recent) / previous
+
+    def step(self, epoch_telemetry: dict, epoch: int) -> bool:
+        """Update controller state; return True if training is optimally complete."""
+        current_rec = epoch_telemetry.get('l_rec', 0.0)
+        current_pw = epoch_telemetry.get('p_w', 0.0)
+        
+        self.history_rec.append(current_rec)
+        self.history_pw.append(current_pw)
+
+        # ---------------------------------------------------------
+        # PHASE 1: Manifold Discovery (Wait for Plateau)
+        # ---------------------------------------------------------
+        if self.phase == 1:
+            if epoch >= 6:
+                rec_improvement = self._get_trend(self.history_rec, window=3)
+                
+                # If Pure_Rec improves by < 0.2%, manifold is formed.
+                if rec_improvement < 0.002:
+                    self.phase = 2
+                    # Lock in a stable baseline average
+                    self.p1_baseline_rec = sum(self.history_rec[-3:]) / 3 
+                    self.p1_epochs = epoch
+                    print(f"\n[↳] Manifold saturated at Epoch {epoch}. Engaging Adaptive Sparsification...")
             return False
 
-        recent = sum(self.history[-self.window:]) / self.window
-        previous = sum(self.history[-(self.window * 2):-self.window]) / self.window
-        
-        if ((previous - recent) / previous) < self.min_delta:
-            self.force_phase2()
+        # ---------------------------------------------------------
+        # PHASE 2: Loss-Gated Sparsification
+        # ---------------------------------------------------------
+        if self.phase == 2:
+            # The speed proxy: If it took 35 eps to learn the manifold, 
+            # the safest time to deform it is ~35 eps. (Max speed limit 10 eps)
+            base_step = 1.0 / max(10, self.p1_epochs)
             
-        return False
+            # Check manifold health
+            rec_ratio = current_rec / self.p1_baseline_rec
+            
+            if rec_ratio <= 1.02:
+                # Safe: Manifold is intact, accelerate sparsity
+                self.internal_progress = min(1.0, self.internal_progress + base_step)
+            elif rec_ratio <= 1.05:
+                # Caution: Manifold under stress, slow down
+                self.internal_progress = min(1.0, self.internal_progress + (base_step * 0.33))
+            else:
+                # Danger: Manifold tearing. Relieve pressure to let optimizer recover.
+                self.internal_progress = max(0.0, self.internal_progress - (base_step * 0.5))
 
-    def force_phase2(self) -> None:
-        if self.phase == 1:
-            self.phase = 2
-            self.p2_step = 0
+            # ---------------------------------------------------------
+            # PHASE 3: Polish & Dynamic Termination
+            # ---------------------------------------------------------
+            if self.internal_progress >= 1.0:
+                self.epochs_at_max += 1
+                
+                # Wait for at least two windows (6 epochs) of full pressure to settle
+                if self.epochs_at_max >= 6:
+                    recent_pw = sum(self.history_pw[-3:]) / 3
+                    prev_pw = sum(self.history_pw[-6:-3]) / 3
+                    
+                    pw_absolute_gain = recent_pw - prev_pw
+                    
+                    # If P_W fails to grow by at least 0.5% over the window, we are saturated.
+                    if pw_absolute_gain < 0.5:
+                        print(f"\n[✓] Topic Sharpness (P_W) saturated at {current_pw:.2f}%. Terminating gracefully.")
+                        return True
+                        
+        return False
