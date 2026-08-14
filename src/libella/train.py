@@ -184,7 +184,7 @@ def prefetch_batches(
             chunk = torch.load(b["chunk_file"], map_location="cpu", weights_only=False)
             chunks.append(chunk)
         yield meta_meta, chunks
-                 
+
 def _train_loop(
     model: LibellaGNN, 
     optimizer: torch.optim.Optimizer, 
@@ -425,12 +425,19 @@ def _train_loop(
                 "history": history
             }, out_dir / "resume_latest.pt")
 
-            if history["val_loss"][-1] < best_val_loss:
-                best_val_loss = history["val_loss"][-1]
+            # In train.py (_train_loop)
+            # Score balances low reconstruction loss with high topic sharpness
+            current_rec = epoch_telemetry.get('l_rec', float('inf'))
+            current_pw = epoch_telemetry.get('p_w', 0.0)
+            composite_score = current_rec / max(1.0, (current_pw / 100.0) ** 0.5)
+
+            if composite_score < best_composite_score:
+                best_composite_score = composite_score
                 torch.save({
-                    "epoch": epoch, 
+                    "epoch": epoch,
                     "model_state_dict": model.state_dict(),
-                    "best_val_loss": best_val_loss, 
+                    "best_score": best_composite_score,
+                    "metrics": epoch_metrics,
                     "history": history
                 }, checkpoint_path)
 
