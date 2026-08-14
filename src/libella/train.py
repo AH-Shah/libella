@@ -203,6 +203,7 @@ def _train_loop(
             optimizer.zero_grad(set_to_none=True)
             for chunk_idx, batch_ref in enumerate(meta_meta):
                 batch = loaded_chunks[chunk_idx]
+                loaded_chunks[chunk_idx] = None
                 
                 x_dense_np = batch["x"].toarray()
                 x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
