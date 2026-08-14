@@ -266,8 +266,8 @@ class LibellaGNN(nn.Module):
         
         if self.training:
             zero_mask = torch.rand_like(x_c) < 0.05 
-            masked_w_mat = is_non_zero.to(x_c.dtype) * current_dynamic_w
-            masked_w_mat.add_( (~is_non_zero & zero_mask).to(x_c.dtype) )
+            active_mask = (is_non_zero | zero_mask).to(x_c.dtype)
+            masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0) * active_mask
         else:
             masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0)
 
