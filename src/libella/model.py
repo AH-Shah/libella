@@ -186,7 +186,7 @@ class LibellaGNN(nn.Module):
         
         cross_scores = (q_dst * k_src).sum(dim=-1)
         cross_scores.div_(self.hidden_dim ** 0.5)
-        cross_att = scatter_softmax(cross_scores, dst_with_self, N).to(Q.dtype)
+        cross_att = scatter_softmax(cross_scores, dst_with_self, N)
         
 
         pulled_msg = (v_src * cross_att.unsqueeze(1)).contiguous()

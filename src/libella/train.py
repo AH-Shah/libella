@@ -168,15 +168,6 @@ def _train_loop(
 ) -> tuple[LibellaGNN, dict[str, list]]:
     print("\n-> Spatial Distillation...")
     device = get_device()
-    
-    amp_dtype = torch.bfloat16
-    if device.type == "cuda":
-        amp_enabled = torch.cuda.is_bf16_supported()  # Works for both NVIDIA and AMD ROCm
-    elif device.type == "mps":
-        amp_enabled = True  # Native Mac M-Series support
-    else:
-        amp_enabled = False # Fall back to FP32 for CPU/older hardware to prevent 1e-9 underflow
-        
     out_dirs = paths.make_dirs(cfg.suffix)
     out_dir = out_dirs["out"]
     checkpoint_path = out_dirs["checkpoint"]
@@ -210,7 +201,7 @@ def _train_loop(
                 batch = loaded_chunks[chunk_idx]
                 
                 x_dense_np = batch["x"].toarray()
-                x = torch.from_numpy(x_dense_np).to(dtype=amp_dtype if amp_enabled else torch.float32, device=device)
+                x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
                 
                 adj_coo = batch["adj"].tocoo()
                 src = torch.from_numpy(adj_coo.row).to(torch.int32)
@@ -243,12 +234,10 @@ def _train_loop(
                 model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)     
                 model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress)    
 
-                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                    fracs, pure_anchors = model(x, src, dst, weights)
+                fracs, pure_anchors = model(x, src, dst, weights)
                 
                 local_core = batch["local_core_idx"]
                 core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
-                
                 
                 t_mask_np = batch["train_mask"][local_core]
                 if t_mask_np.sum() > 0:
@@ -285,12 +274,11 @@ def _train_loop(
 
                     dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + (hub_multiplier) 
 
-                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        recon = f_train @ pure_anchors
-                        true_batch_loss, base_recon_val = model.calc_loss(
-                            recon, x_train.to(recon.dtype), pure_anchors, None, epoch, cfg.epochs, 
-                            f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
-                        )
+                    recon = f_train @ pure_anchors
+                    true_batch_loss, base_recon_val = model.calc_loss(
+                        recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
+                        f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
+                    )
 
                     if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
                         nan_detected = True
@@ -330,7 +318,7 @@ def _train_loop(
                     val_idx = core_gpu[v_mask_gpu]
 
                     model.eval() 
-                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    with torch.no_grad():
                         clean_fracs, clean_anchors = model(x, src, dst, weights)
 
                         f_val = fracs[val_idx]
