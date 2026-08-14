@@ -149,3 +149,4 @@ class PhaseTracker:
         if self.phase == 1:
             self.phase = 2
             self.p1_baseline_rec = current_ema
+            
