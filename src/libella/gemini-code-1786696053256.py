@@ -32,41 +32,40 @@ from libella.utils import PhaseTracker, get_device
 # Lock runtime flags and MPS watermark (Non-blocking async mode)
 init_env()
 
+# Global cached singletons to prevent mutex deadlocks
+PROCESS = psutil.Process(os.getpid())
+DEVICE = get_device()
+
 
 # =====================================================================
-# 1. ASYNC THREAD-SAFE MEMORY AUDITOR
+# 1. NON-BLOCKING ASYNC MEMORY AUDITOR (MAIN THREAD ONLY)
 # =====================================================================
 class MemoryAuditor:
-    """Tracks OS RSS and Device VRAM without blocking GPU pipelines."""
+    """Tracks OS RSS and Device VRAM asynchronously without GPU synchronization."""
     records: List[Dict[str, Any]] = []
     _lock = threading.Lock()
     
-    def __init__(self, step_name: str, meta_info: str = "", is_worker_thread: bool = False):
+    def __init__(self, step_name: str, meta_info: str = ""):
         self.step_name = step_name
         self.meta_info = meta_info
-        self.is_worker = is_worker_thread
-        self.process = psutil.Process(os.getpid())
-        self.device = get_device()
         
     def _get_vram(self) -> float:
-        # Never query MPS backend from background threads to avoid Metal lockups
-        if self.is_worker:
-            return 0.0
-        if self.device.type == "cuda" and torch.cuda.is_available():
+        if DEVICE.type == "cuda" and torch.cuda.is_available():
             return torch.cuda.memory_allocated() / (1024 ** 2)
-        elif self.device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+        elif DEVICE.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+            # Non-blocking query of PyTorch allocator's internal tracking counter
             return torch.mps.current_allocated_memory() / (1024 ** 2)
         return 0.0
 
     def __enter__(self):
-        self.start_rss = self.process.memory_info().rss / (1024 ** 2)
+        self.start_rss = PROCESS.memory_info().rss / (1024 ** 2)
         self.start_vram = self._get_vram()
         self.start_time = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.end_time = time.perf_counter()
-        self.end_rss = self.process.memory_info().rss / (1024 ** 2)
+        self.end_rss = PROCESS.memory_info().rss / (1024 ** 2)
         self.end_vram = self._get_vram()
         
         duration = (self.end_time - self.start_time) * 1000  # ms
@@ -88,13 +87,12 @@ class MemoryAuditor:
         with MemoryAuditor._lock:
             self.records.append(record)
         
-        # Report spikes > 50 MB
-        if abs(delta_rss) > 50 or (not self.is_worker and abs(delta_vram) > 50):
-            vram_str = f"VRAM: {self.end_vram:7.1f} MB (Δ {delta_vram:+6.1f} MB)" if not self.is_worker else "VRAM: [Worker CPU]"
+        # Report significant spikes > 50 MB
+        if abs(delta_rss) > 50 or abs(delta_vram) > 50:
             print(
                 f"  ⚠️ [SPIKE] {self.step_name:<32} | "
                 f"RAM: {self.end_rss:7.1f} MB (Δ {delta_rss:+6.1f} MB) | "
-                f"{vram_str} | "
+                f"VRAM: {self.end_vram:7.1f} MB (Δ {delta_vram:+6.1f} MB) | "
                 f"Time: {duration:6.1f}ms"
             )
 
@@ -202,12 +200,12 @@ def safe_load_priors(priors_path: Path) -> Tuple[np.ndarray | None, int]:
 
 
 # =====================================================================
-# 3. DEADLOCK-PROOF ASYNC PREFETCHER
+# 3. 100% NATIVE ASYNC PREFETCHER (ZERO PROFILER OVERHEAD IN WORKER)
 # =====================================================================
 def prefetch_batches_async(
     meta_batches: List[List[Dict[str, Any]]]
-) -> Iterator[Tuple[List[Dict[str, Any]], Iterator[Any]]]:
-    """Prefetches strictly 1 chunk asynchronously without locking Metal or queues."""
+) -> Iterator[Tuple[List[Dict[str, Any]], Iterator[Any], Event, Thread]]:
+    """Prefetches chunks asynchronously with robust thread lifecycle management."""
     if not meta_batches:
         return
 
@@ -229,8 +227,8 @@ def prefetch_batches_async(
                 for b in meta_meta:
                     if stop_event.is_set():
                         break
-                    with MemoryAuditor("0. SSD Chunk Read (Worker)", b['chunk_file'].name, is_worker_thread=True):
-                        chunk = torch.load(b['chunk_file'], map_location='cpu', weights_only=False)
+                    # Pure CPU IO: No profilers or GPU calls in worker thread
+                    chunk = torch.load(b['chunk_file'], map_location='cpu', weights_only=False)
                     if not safe_put(chunk):
                         break
             except Exception as e:
@@ -242,24 +240,15 @@ def prefetch_batches_async(
         t.start()
 
         def chunk_iterator():
-            try:
-                while True:
-                    chunk = chunk_queue.get()
-                    if chunk is None:
-                        break
-                    if isinstance(chunk, Exception):
-                        raise chunk
-                    yield chunk
-            finally:
-                stop_event.set()
-                # Drain any remaining queue items to release the worker
-                while not chunk_queue.empty():
-                    try:
-                        chunk_queue.get_nowait()
-                    except queue.Empty:
-                        break
+            while True:
+                chunk = chunk_queue.get()
+                if chunk is None:
+                    break
+                if isinstance(chunk, Exception):
+                    raise chunk
+                yield chunk
 
-        yield meta_meta, chunk_iterator()
+        yield meta_meta, chunk_iterator(), stop_event, t
 
 
 # =====================================================================
@@ -271,8 +260,7 @@ def run_single_epoch_diagnostic(
     chunks_dir: Path,
     epoch_idx: int = 0
 ):
-    device = get_device()
-    print(f"\n[i] Compute Device: {device}")
+    print(f"\n[i] Compute Device: {DEVICE}")
     
     # -------------------------------------------------------------
     # Step A: Load Genes & Priors
@@ -312,7 +300,7 @@ def run_single_epoch_diagnostic(
             in_channels=len(common_genes),
             n_metaprograms=optimal_k,
             init_components=init_components
-        ).to(device)
+        ).to(DEVICE)
 
     with MemoryAuditor("Initialize AdamW & Schedulers"):
         base_params = [p for n, p in model.named_parameters() if "topic_gene_logits" not in n]
@@ -353,7 +341,9 @@ def run_single_epoch_diagnostic(
     total_steps_per_epoch = len(meta_batches)
     alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
 
-    for step_idx, (meta_meta, chunk_iter) in enumerate(tqdm(prefetch_batches_async(meta_batches), total=total_steps_per_epoch, desc="Executing Simulator Epoch")):
+    for step_idx, (meta_meta, chunk_iter, stop_ev, worker_thread) in enumerate(
+        tqdm(prefetch_batches_async(meta_batches), total=total_steps_per_epoch, desc="Executing Simulator Epoch")
+    ):
         with MemoryAuditor("optimizer.zero_grad", f"Step {step_idx}"):
             optimizer.zero_grad(set_to_none=True)
 
@@ -366,7 +356,7 @@ def run_single_epoch_diagnostic(
 
             # 2. Dense Tensor Transfer to Device
             with MemoryAuditor("2. x.to(device)", tag):
-                x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=device)
+                x = torch.from_numpy(x_dense_np).to(dtype=torch.float32, device=DEVICE)
                 del x_dense_np
 
             # 3. COO Adjacency Unpacking & Edge Dropout
@@ -384,14 +374,14 @@ def run_single_epoch_diagnostic(
                     weights = weights[keep_mask]
                     del keep_mask
 
-                src = src.to(device)
-                dst = dst.to(device)
-                weights = weights.to(device)
+                src = src.to(DEVICE)
+                dst = dst.to(DEVICE)
+                weights = weights.to(DEVICE)
 
             # 4. MPS Bucket Padding & Index Type Conformance
             with MemoryAuditor("4. pad_mps_shapes", tag):
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
-                if device.type != "mps":
+                if DEVICE.type != "mps":
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
@@ -408,12 +398,12 @@ def run_single_epoch_diagnostic(
             # 6. Core Node Extraction & Target Math
             with MemoryAuditor("6. Calculate Targets & Dynamic KL", tag):
                 local_core = batch["local_core_idx"]
-                core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=device)
+                core_gpu = torch.from_numpy(local_core).to(dtype=torch.int64, device=DEVICE)
                 t_mask_np = batch["train_mask"][local_core]
 
             if t_mask_np.sum() > 0:
                 with MemoryAuditor("7. Train Slice & Reconstruction", tag):
-                    t_mask_gpu = torch.from_numpy(t_mask_np).to(dtype=torch.bool, device=device)
+                    t_mask_gpu = torch.from_numpy(t_mask_np).to(dtype=torch.bool, device=DEVICE)
                     train_idx = core_gpu[t_mask_gpu]
 
                     f_train = fracs[train_idx]
@@ -483,7 +473,7 @@ def run_single_epoch_diagnostic(
             v_mask_np = batch["val_mask"][local_core]
             if v_mask_np.sum() > 0:
                 with MemoryAuditor("10. Val Evaluation (no_grad)", tag):
-                    v_mask_gpu = torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=device)
+                    v_mask_gpu = torch.from_numpy(v_mask_np).to(dtype=torch.bool, device=DEVICE)
                     val_idx = core_gpu[v_mask_gpu]
 
                     with torch.no_grad():
@@ -501,7 +491,7 @@ def run_single_epoch_diagnostic(
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
 
                         val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
-                        N_cells_val = torch.clamp(torch.tensor(x_val.shape[0], dtype=torch.float32, device=device), min=1.0)
+                        N_cells_val = torch.clamp(torch.tensor(x_val.shape[0], dtype=torch.float32, device=DEVICE), min=1.0)
                         val_log_cosh = val_loss_sum / N_cells_val
 
                         val_loss += val_log_cosh.item()
@@ -512,6 +502,10 @@ def run_single_epoch_diagnostic(
             with MemoryAuditor("11. Subgraph Memory Cleanup", tag):
                 del batch, src, dst, weights, x, fracs, pure_anchors, core_gpu, local_core, t_mask_np, v_mask_np
                 model.current_f_prob = None
+
+        # Cleanly terminate worker thread for this step
+        stop_ev.set()
+        worker_thread.join(timeout=0.2)
 
         if nan_detected:
             optimizer.zero_grad(set_to_none=True)
