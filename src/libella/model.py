@@ -130,10 +130,9 @@ class LibellaGNN(nn.Module):
         if len(src) > 0:
             with torch.no_grad():
                 bio_h = torch.mm(x_dense, anchors_raw.detach().t())
-                diff = bio_h[src]
-                diff.sub_(bio_h[dst])
-                diff.pow_(2)
-                dist = diff.sum(dim=1)
+                # 🚨 MPS FIX: Use direct multiplication instead of .pow(2)
+                diff = bio_h[src] - bio_h[dst]
+                dist = (diff * diff).sum(dim=1)
             decay = torch.exp(-F.softplus(self.gamma) * dist)
         else:
             decay = torch.ones_like(edge_weights)
