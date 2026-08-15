@@ -87,7 +87,7 @@ class PhaseTracker:
         self.internal_progress: float = 0.0
         
         # Phase 2 Governor Dynamics
-        self.step_size: float = 0.07
+        self.step_size: float = 0.1
         
         # Termination Stability Counter
         self.termination_streak: int = 0
