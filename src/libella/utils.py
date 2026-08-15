@@ -65,53 +65,57 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
 
 
 
-class PhaseTracker:
-    """Fast, Variance-Aware Statistical Controller for Spatial GNN Distillation.
-    
-    Uses Online Ordinary Least Squares (OLS) Signal-to-Noise Ratio (SNR) and
-    dynamic variance bands (2*sigma) to detect convergence precisely amidst
-    multi-epoch loss oscillations.
-    """
+"""Adaptive Elastic Phase Controller with Dual-Horizon Oscillation Filtering."""
 
-    def __init__(self, window_size: int = 8) -> None:
+import math
+from typing import Dict, List, Optional, Tuple
+
+
+class PhaseTracker:
+    def __init__(
+        self,
+        cycle_window: int = 6,        # Cut window from 12 -> 6 (responds 2x faster)
+        target_pw: float = 70.0,
+        rel_tolerance: float = 0.06,  # 6% reconstruction budget ceiling
+        max_p1_epochs: int = 15,      # Hard limit: Phase 1 CANNOT exceed 15 epochs
+    ) -> None:
         self.phase: int = 1
-        self.window_size: int = window_size
+        self.cycle_window: int = cycle_window
+        self.target_pw: float = target_pw
+        self.rel_tolerance: float = rel_tolerance
+        self.max_p1_epochs: int = max_p1_epochs
         
-        # Raw historical telemetry buffers
-        self.raw_rec_history: List[float] = []
-        self.raw_pw_history: List[float] = []
+        self.rec_history: list[float] = []
+        self.pw_history: list[float] = []
         
-        # Historical baseline tracking
         self.best_rec_loss: float = float("inf")
-        self.p1_baseline_rec: Optional[float] = None
-        self.internal_progress: float = 0.0
+        self.p1_baseline_rec: float | None = None
         
-        # Phase 2 Governor Dynamics
-        self.step_size: float = 0.1
+        # Faster ramp dynamics
+        self.pressure: float = 0.0
+        self.squeeze_momentum: float = 0.05   # Step size 0.05 (ramps in ~20 epochs instead of 80)
+        self.breathing_cooldown: int = 0
         
-        # Termination Stability Counter
-        self.termination_streak: int = 0
-        self.required_term_streak: int = 2
+        self.saturation_streak: int = 0
+        self.required_saturation_streak: int = 4
 
     @staticmethod
-    def _compute_ols_stats(series: List[float]) -> Tuple[float, float, float]:
-        """Fits OLS linear regression y = m*t + c and computes residual variance."""
+    def _fit_ols(series: List[float]) -> Tuple[float, float, float]:
+        """Calculates slope, mean, and residual standard deviation."""
         n = len(series)
         if n < 3:
-            return 0.0, float(series[-1]) if series else 0.0, 1.0
+            return 0.0, float(series[-1]) if series else 0.0, 0.01
 
         t_mean = (n - 1) / 2.0
         y_mean = sum(series) / n
 
         num = sum((i - t_mean) * (series[i] - y_mean) for i in range(n))
         den = sum((i - t_mean) ** 2 for i in range(n))
-        
         slope = num / max(1e-9, den)
         intercept = y_mean - slope * t_mean
 
-        # Residual standard deviation (noise floor after trend removal)
-        res_sq_sum = sum((series[i] - (slope * i + intercept)) ** 2 for i in range(n))
-        residual_std = math.sqrt(res_sq_sum / max(1, n - 2))
+        res_sq = sum((series[i] - (slope * i + intercept)) ** 2 for i in range(n))
+        residual_std = math.sqrt(res_sq / max(1, n - 2))
 
         return slope, y_mean, residual_std
 
@@ -119,76 +123,94 @@ class PhaseTracker:
         """Returns smooth Cosine S-curve progress in [0.0, 1.0]."""
         if self.phase == 1:
             return 0.0
-        return 0.5 * (1.0 - math.cos(math.pi * self.internal_progress))
+        # S-curve smooths out micro-adjustments
+        return 0.5 * (1.0 - math.cos(math.pi * self.pressure))
 
     def step(self, epoch_telemetry: Dict[str, float], epoch: int) -> bool:
-        """Evaluates training telemetry each epoch with variance-adjusted statistics."""
+        """Evaluates epoch telemetry, adjusting squeeze pressure elastically."""
         current_rec = float(epoch_telemetry.get("l_rec", 0.0))
         current_pw = float(epoch_telemetry.get("p_w", 0.0))
 
-        self.raw_rec_history.append(current_rec)
-        self.raw_pw_history.append(current_pw)
+        self.rec_history.append(current_rec)
+        self.pw_history.append(current_pw)
 
-        if len(self.raw_rec_history) < self.window_size:
+        # Track absolute lowest reconstruction loss achieved
+        if current_rec < self.best_rec_loss:
+            self.best_rec_loss = current_rec
+
+        if len(self.rec_history) < self.cycle_window:
             return False
 
-        rec_window = self.raw_rec_history[-self.window_size:]
-        pw_window = self.raw_pw_history[-self.window_size:]
+        window_rec = self.rec_history[-self.cycle_window:]
+        window_pw = self.pw_history[-self.cycle_window:]
 
-        # Fit OLS trends
-        rec_slope, rec_mu, rec_noise_std = self._compute_ols_stats(rec_window)
-        pw_slope, pw_mu, _ = self._compute_ols_stats(pw_window)
-
-        # Anchor budget to statistical mean of the window (Trough-Lock Fix)
-        if rec_mu < self.best_rec_loss:
-            self.best_rec_loss = rec_mu
-
-        expected_drop = -rec_slope * self.window_size
-        descent_snr = expected_drop / max(1e-5, rec_noise_std)
+        rec_slope, rec_mu, rec_sigma = self._fit_ols(window_rec)
+        pw_slope, pw_mu, _ = self._fit_ols(window_pw)
 
         # -----------------------------------------------------------------
-        # PHASE 1: Variance-Adjusted Manifold Discovery
+        # PHASE 1: Manifold Discovery & Plateau Detection
         # -----------------------------------------------------------------
         if self.phase == 1:
-            relative_drop = expected_drop / max(1.0, rec_mu)
-            
-            # Transition when descent slope flattens into noise floor
-            # (guarding with rec_slope > -0.5 to prevent trigger on runaway divergence)
-            if (0.0 <= descent_snr < 0.40) or (abs(relative_drop) < 0.005 and rec_slope >= 0.0):
+            # 1. Hard cutoff: Force Phase 2 at max_p1_epochs regardless
+            if epoch >= self.max_p1_epochs:
+                self.force_phase2(epoch, rec_mu)
+                return False
+                
+            # 2. Faster slope trigger (transition when relative drop < 0.8% per epoch)
+            relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
+            if relative_drop_rate < 0.008:
                 self.force_phase2(epoch, rec_mu)
             return False
 
         # -----------------------------------------------------------------
-        # PHASE 2: Dynamic Variance-Gated Squeezing
+        # PHASE 2: Elastic Squeeze & Breathe Dynamic Governor
         # -----------------------------------------------------------------
         if self.phase == 2:
-            # Dynamic Ceiling: min 2.5% budget, expanding up to 2*sigma noise floor
-            dynamic_tolerance = max(self.best_rec_loss * 0.05, 2.5 * rec_noise_std)
-            loss_ceiling = self.best_rec_loss + dynamic_tolerance
+            # Dynamic Variance Ceiling: minimum 6% budget or 2.5x oscillation noise
+            dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.5 * rec_sigma)
+            loss_ceiling = self.best_rec_loss + dynamic_budget
 
-            # Smooth mean evaluated against ceiling prevents single-batch outlier braking
-            if rec_mu > loss_ceiling:
-                self.internal_progress = max(0.0, self.internal_progress - (self.step_size * 0.5))
-            else:
-                self.internal_progress = min(1.0, self.internal_progress + self.step_size)
+            overshoot = current_rec - loss_ceiling
 
-            # -------------------------------------------------------------
-            # TERMINATION AUDIT (Evaluated once at full pressure)
-            # -------------------------------------------------------------
-            if self.internal_progress >= 1.0:
-                # 1. P_W slope flattened (< +0.03% gain per epoch)
-                pw_saturated = (pw_slope < 0.1)
+            # SENSE FRAGILITY & BREATHE: Loss exceeded tolerance band
+            if overshoot > 0.0:
+                # Severity ratio of the loss spike
+                severity = min(2.0, overshoot / max(1e-5, dynamic_budget))
                 
-                # 2. Rec loss change is smaller than half a standard deviation of noise
-                rec_saturated = (abs(expected_drop) < max(1.0, rec_noise_std * 0.5))
-
-                if pw_saturated and rec_saturated:
-                    self.termination_streak += 1
+                # Proportional elastic release: drops pressure rapidly to relieve strain
+                release_amount = 0.04 * severity
+                self.pressure = max(0.10, self.pressure - release_amount)
+                self.squeeze_momentum = 0.008  # Reset momentum to cautious
+                self.breathing_cooldown = 2    # Hold pressure for 2 epochs to recover
+                self.saturation_streak = 0
+            
+            # SAFE TO SQUEEZE: Loss is healthy inside the manifold envelope
+            else:
+                if self.breathing_cooldown > 0:
+                    self.breathing_cooldown -= 1
                 else:
-                    self.termination_streak = max(0, self.termination_streak - 1)
+                    # Gradually accelerate squeeze momentum when stable
+                    self.squeeze_momentum = min(0.035, self.squeeze_momentum + 0.002)
+                    self.pressure = min(1.0, self.pressure + self.squeeze_momentum)
 
-                if self.termination_streak >= self.required_term_streak:
+            # -------------------------------------------------------------
+            # STRICT TERMINATION AUDIT (Prevents premature exit at < 70% P_W)
+            # -------------------------------------------------------------
+            # Only consider stopping if:
+            # 1. Full pressure is deployed (pressure >= 0.95)
+            # 2. P_W reached the target regime (>= 72.0%)
+            # 3. P_W slope is completely flat (< +0.05% / epoch over 12 epochs)
+            # 4. Sustained over a full 8-epoch oscillation streak
+            if self.pressure >= 0.95 and current_pw >= (self.target_pw - 3.0):
+                if pw_slope < 0.05:
+                    self.saturation_streak += 1
+                else:
+                    self.saturation_streak = max(0, self.saturation_streak - 1)
+
+                if self.saturation_streak >= self.required_saturation_streak:
                     return True
+            else:
+                self.saturation_streak = 0
 
         return False
 

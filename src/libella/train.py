@@ -264,13 +264,10 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                squeeze_progress = tracker.get_progress()
-
-                model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * squeeze_progress)  
-                model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * squeeze_progress) 
-
-                anchor_progress = epoch / max(1, cfg.epochs - 1)
-                model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * anchor_progress)
+                prog = tracker.get_progress()
+                model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * (prog ** 0.8))
+                model.current_temp = cfg.temp_end + ((cfg.temp_start - cfg.temp_end) * ((1.0 - prog) ** 1.5))
+                model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * prog)
 
                 fracs, pure_anchors = model(x, src, dst, weights)
                 
@@ -303,7 +300,8 @@ def _train_loop(
                 dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier 
 
                 recon = f_train @ pure_anchors
-                true_batch_loss, base_recon_val = model.calc_loss(
+                
+                true_batch_loss, base_recon_val, base_anc_val, base_ort_val = model.calc_loss(
                     recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
                     f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
                 )
@@ -317,15 +315,17 @@ def _train_loop(
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
 
-                # Pure GPU Telemetry Accumulation
+                # 3. Complete GPU Telemetry Accumulation
                 gpu_telemetry['g_w'] += pure_anchors.max(dim=1).values.mean().detach() * 100.0
                 gpu_telemetry['p_w'] += p_train.max(dim=1).values.mean().detach() * 100.0
                 gpu_telemetry['ent'] += ema_entropy.detach()
                 gpu_telemetry['col_r'] += collapse_ratio.detach()
                 gpu_telemetry['kl_w'] += dynamic_kl_w.detach()
                 
-                # Exact reconstruction loss from calc_loss return
+                # Accumulate all sub-losses cleanly
                 gpu_telemetry['l_rec'] += base_recon_val.detach()
+                gpu_telemetry['l_anc'] += base_anc_val.detach()
+                gpu_telemetry['l_ort'] += base_ort_val.detach()
                 
                 epoch_p_mean_sum += current_p_mean.detach()
                 train_chunk_count += 1
@@ -466,15 +466,15 @@ def _train_loop(
             }, out_dir / "resume_latest.pt")
 
             with torch.no_grad():
-                # Print beautiful, single-line telemetry every 5 epochs
                 tqdm.write(
                     f" [Ep {(epoch+1):03d}] Pure_Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
                     f"V_Loss:{history['val_loss'][-1]:<5.3f} (Tot_Loss:{history['train_loss'][-1]:<5.3f}) | "
                     f"G_W:{epoch_telemetry.get('g_w', 0.0):<4.1f}% P_W:{epoch_telemetry.get('p_w', 0.0):<4.1f}% "
                     f"TopT:{epoch_telemetry.get('top_t_id', 0)}({epoch_telemetry.get('top_t_pct', 0.0):<4.1f}%) "
                     f"Ent:{epoch_telemetry.get('ent', 0.0):<4.2f} | "
-                    f"KL_W:{epoch_telemetry.get('kl_w', 0.0):<4.2f} L_Anc:{epoch_telemetry.get('l_anc', 0.0):<4.2f} "
-                    f"L_Ort:{epoch_telemetry.get('l_ort', 0.0):<4.2f}"
+                    f"KL_W:{epoch_telemetry.get('kl_w', 0.0):<4.2f} "
+                    f"L_Anc:{epoch_telemetry.get('l_anc', 0.0):<5.3f} "
+                    f"L_Ort:{epoch_telemetry.get('l_ort', 0.0):<5.3f}"
                 )
 
         # -------------------------------------------------------------

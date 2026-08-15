@@ -290,27 +290,23 @@ class LibellaGNN(nn.Module):
         anc_norm = F.normalize(anchors, p=2, dim=1)
 
         with torch.no_grad():
-            raw_temp = getattr(self, 'dict_temp', torch.tensor(cfg.dict_temp, device=anchors.device))
-            safe_temp = torch.clamp(raw_temp, min=0.25, max=1.0)
-            ref_probs = F.softmax(self.anchor_logits / safe_temp, dim=-1)
+            ref_probs = F.softmax(self.anchor_logits, dim=-1)
             ref_norm = F.normalize(ref_probs, p=2, dim=1)
 
         l_anc = 1.0 - (anc_norm * ref_norm).sum(dim=1).mean()
 
-        peak_excess = F.relu(anchors - cfg.anchor_peak_threshold)
-        collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()
-        gene_entropy = -(anchors * torch.log(anchors + 1e-9)).sum(dim=1).mean()
-
-        raw_t_norm = F.normalize(anchors, p=2, dim=-1)
-        latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t())
+        latent_ortho = torch.mm(anc_norm, anc_norm.t())
         
         
         latent_ortho = latent_ortho * self.ortho_mask
 
         max_overlap = latent_ortho.max(dim=1)[0]
-        
 
         l_ortho = (F.relu(max_overlap - cfg.ortho_overlap_threshold) ** 2).mean()
+
+        peak_excess = F.relu(anchors - cfg.anchor_peak_threshold)
+        collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()
+        gene_entropy = -(anchors * torch.log(anchors + 1e-9)).sum(dim=1).mean()
         scaled_ortho = (l_ortho + collapse_penalty) * cfg.ortho_weight
         scaled_gene_ent = gene_entropy * 0.1
 
@@ -373,3 +369,4 @@ class LibellaGNN(nn.Module):
         }
 
         return (base_loss + im_loss, l_recon.detach(), l_anc.detach(), l_ortho.detach())
+        

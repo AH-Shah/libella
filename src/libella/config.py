@@ -51,17 +51,17 @@ class RunConfig:
     prior_cells_per_sample: int = 5_000_000
     
     # Model Physics & Schedules
-    dict_temp: float = 0.20
+    dict_temp: float = 0.30
     att_temp: float = -2.25
     gnn_shift_weight: float = 0.5
     train_noise: float = 0.05
     edge_dropout: float = 0.40
-    scale_start: float = 8.0
+    scale_start: float = 12.0
     scale_end: float = 16.0
-    alpha_start: float = 1.2
+    alpha_start: float = 1.4
     alpha_end: float = 1.65
-    temp_start: float = 1.5
-    temp_end: float = 0.3
+    temp_start: float = 2.0
+    temp_end: float = 0.5
 
     # Loss & Regularization
     kl_weight: float = 5.0
@@ -70,23 +70,22 @@ class RunConfig:
     hub_threshold: float = 0.2
     anchor_peak_threshold: float = 0.80
     ortho_overlap_threshold: float = 0.25
-    ortho_weight: float = 10.0
-    tsallis_alpha: float = 1.5
+    tsallis_alpha: float = 1.75
     delta_clamp: float = 30.0
     zero_mask_rate: float = 0.05
 
     # Optimizers
-    lr_base: float = 0.001
+    lr_base: float = 0.0001
     wd_base: float = 1e-4
-    lr_anchor: float = 0.005
-    wd_anchor: float = 0
+    lr_anchor: float = 0.001
+    wd_anchor: float = 1e-5
     grad_clip: float = 5.0
 
     # Inference & Topology
     entropy_pruning: bool = True
     inference_scale: float = 16.0
     inference_alpha: float = 1.65
-    inference_temp: float = 0.3
+    inference_temp: float = 0.5
     inf_batch_size: int = 5000
     panel_overlap_thresh: float = 0.80
     radius_multiplier: float = 3.33
