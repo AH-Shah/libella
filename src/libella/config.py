@@ -75,9 +75,9 @@ class RunConfig:
     zero_mask_rate: float = 0.05
 
     # Optimizers
-    lr_base: float = 0.0001
+    lr_base: float = 0.001
     wd_base: float = 1e-4
-    lr_anchor: float = 0.001
+    lr_anchor: float = 0.005
     wd_anchor: float = 1e-5
     grad_clip: float = 5.0
 
