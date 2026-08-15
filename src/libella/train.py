@@ -366,10 +366,22 @@ def _train_loop(
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            base_params = [p for n, p in model.named_parameters() if 'topic_gene_logits' not in n]
-            anchor_params = [p for n, p in model.named_parameters() if 'topic_gene_logits' in n]
+            # 1. Clip GNN backbone and projection heads
+            base_params = [
+                p for n, p in model.named_parameters() 
+                if "topic_gene_logits" not in n and p.grad is not None
+            ]
+            if base_params:
+                torch.nn.utils.clip_grad_norm_(base_params, max_norm=cfg.grad_clip)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
+            # 2. Clip anchor dictionary independently so it retains its full update budget
+            anchor_params = [
+                p for n, p in model.named_parameters() 
+                if "topic_gene_logits" in n and p.grad is not None
+            ]
+            if anchor_params:
+                torch.nn.utils.clip_grad_norm_(anchor_params, max_norm=cfg.grad_clip)
+
             optimizer.step()
 
         if nan_detected:
