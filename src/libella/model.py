@@ -371,5 +371,5 @@ class LibellaGNN(nn.Module):
             'dyn_w': current_dynamic_w.item(), 'kl_w': kl_weight, 
             'tsallis_val': tsallis_val
         }
-        
-        return base_loss + im_loss, l_recon.detach()
+
+        return (base_loss + im_loss, l_recon.detach(), l_anc.detach(), l_ortho.detach())
