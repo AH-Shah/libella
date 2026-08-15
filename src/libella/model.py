@@ -283,7 +283,8 @@ class LibellaGNN(nn.Module):
         l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6)))
         
         # Direct scalar division without creating GPU tensor objects
-        l_recon = l_recon_sum / max(1, x_c.shape[0])
+        total_elements = max(1, x_c.shape[0] * x_c.shape[1])
+        l_recon = l_recon_sum / total_elements
 
 
         anc_norm = F.normalize(anchors, p=2, dim=1)
