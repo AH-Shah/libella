@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Libella Comprehensive Micro-Telemetry & Autograd Forensic Audit.
+"""Libella High-Resolution Forensic Pilot (Gene-Normalized Engine).
 
-Instruments, profiles, and evaluates every tensor, normalization,
-attention mechanism, message-passing hop, and optimizer dynamic.
+Instruments all structural atoms with total-element normalized reconstruction loss:
+    total_elements = max(1, x_c.shape[0] * x_c.shape[1])
+    l_recon = l_recon_sum / total_elements
 """
 
 import argparse
@@ -26,42 +27,38 @@ from libella.utils import get_device, PhaseTracker, scatter_softmax
 
 
 # =============================================================================
-# 1. UNIVERSAL ARTIFACT LOADER
+# 1. ARTIFACT RESOLUTION & SERIALIZATION HANDLER
 # =============================================================================
 
 def robust_load_artifact(file_path: Path | str) -> Any:
-    """Universal loader supporting torch.save, pickle, joblib, and numpy formats."""
+    """Universal artifact loader supporting PyTorch, Pickle, Joblib, and NumPy."""
     p = Path(file_path)
     if not p.exists():
-        raise FileNotFoundError(f"File not found: {p}")
+        raise FileNotFoundError(f"Artifact not found at: {p}")
 
-    # 1. Try PyTorch loader (handles torch.save .pkl / .pt / .pth)
     try:
         return torch.load(p, map_location="cpu", weights_only=False)
     except Exception:
         pass
 
-    # 2. Try standard pickle
     try:
         with open(p, "rb") as f:
             return pickle.load(f)
     except Exception:
         pass
 
-    # 3. Try joblib
     try:
         import joblib
         return joblib.load(p)
     except Exception:
         pass
 
-    # 4. Try numpy
     try:
         return np.load(p, allow_pickle=True)
     except Exception:
         pass
 
-    raise RuntimeError(f"Failed to deserialize artifact at: {p}")
+    raise RuntimeError(f"Could not deserialize artifact at: {p}")
 
 
 def load_priors_and_genes(
@@ -106,14 +103,14 @@ def load_priors_and_genes(
 
 
 # =============================================================================
-# 2. STATISTICAL METRIC RECORDER
+# 2. HIGH-RESOLUTION STATISTICAL PROFILER
 # =============================================================================
 
-class AtomicTelemetryRecorder:
-    """Thread-safe, GPU-resident statistical aggregator for all model atoms."""
+class HighResTelemetryRecorder:
+    """Micro-scale statistical aggregator tracking distributions and autograd metrics."""
 
     def __init__(self):
-        self.stats: dict[str, list[float]] = {}
+        self.metrics: dict[str, list[float]] = {}
 
     def record(self, key: str, value: float | torch.Tensor | np.ndarray | None):
         if value is None:
@@ -126,50 +123,50 @@ class AtomicTelemetryRecorder:
             val = float(value)
 
         if not math.isnan(val) and not math.isinf(val):
-            if key not in self.stats:
-                self.stats[key] = []
-            self.stats[key].append(val)
+            if key not in self.metrics:
+                self.metrics[key] = []
+            self.metrics[key].append(val)
 
     def record_tensor(self, name: str, t: torch.Tensor | None, grad: torch.Tensor | None = None):
-        """Profile forward activation stats and backward gradient norms."""
+        """Profile forward activation statistics and backward gradient norms."""
         if t is None or not isinstance(t, torch.Tensor):
             return
         with torch.no_grad():
             t_det = t.detach().float()
             numel = max(1, t_det.numel())
-            l2_norm = t_det.norm(2).item()
+            l2 = t_det.norm(2).item()
             rms = math.sqrt((t_det ** 2).sum().item() / numel)
             mean = t_det.mean().item()
             std = t_det.std().item() if numel > 1 else 0.0
-            sparsity = ((t_det == 0).sum().item() / numel) * 100.0
+            zero_frac = ((t_det == 0).sum().item() / numel) * 100.0
 
-            self.record(f"fwd__{name}__l2", l2_norm)
+            self.record(f"fwd__{name}__l2", l2)
             self.record(f"fwd__{name}__rms", rms)
             self.record(f"fwd__{name}__mean", mean)
             self.record(f"fwd__{name}__std", std)
-            self.record(f"fwd__{name}__sparsity", sparsity)
+            self.record(f"fwd__{name}__zero_pct", zero_frac)
 
             if grad is not None and isinstance(grad, torch.Tensor):
                 g_det = grad.detach().float()
                 g_numel = max(1, g_det.numel())
                 g_l2 = g_det.norm(2).item()
                 g_rms = math.sqrt((g_det ** 2).sum().item() / g_numel)
-                g_to_act_ratio = g_l2 / (l2_norm + 1e-9)
+                ratio = g_l2 / (l2 + 1e-9)
 
                 self.record(f"bwd__{name}__l2", g_l2)
                 self.record(f"bwd__{name}__rms", g_rms)
-                self.record(f"bwd__{name}__grad_act_ratio", g_to_act_ratio)
+                self.record(f"bwd__{name}__grad_to_act", ratio)
 
     def mean(self, key: str, default: float = 0.0) -> float:
-        vals = self.stats.get(key, [])
+        vals = self.metrics.get(key, [])
         return float(np.mean(vals)) if vals else default
 
 
 # =============================================================================
-# 3. MASTER FORENSIC AUDIT ENGINE
+# 3. HIGH-RESOLUTION PILOT AUDIT ENGINE
 # =============================================================================
 
-def run_micro_telemetry_audit(
+def run_high_res_pilot(
     chunk_dir_path: str, common_genes_path: str, priors_path: str
 ):
     device = get_device()
@@ -184,11 +181,11 @@ def run_micro_telemetry_audit(
     )
     in_channels = len(common_genes)
 
-    print("=" * 100)
-    print("🔬 LIBELLA COMPLETE ATOMIC TELEMETRY & SUB-LAYER FORENSIC AUDIT")
-    print(f"   Target Device: {device} | Cache Chunks: {len(chunk_files)} | Common Genes: {in_channels}")
-    print(f"   Latent Topics (K): {optimal_k} | Priors: {'Loaded' if init_components is not None else 'None'}")
-    print("=" * 100)
+    print("=" * 118)
+    print("🔬 LIBELLA HIGH-RESOLUTION FORENSIC PILOT (GENE-NORMALIZED ENGINE)")
+    print(f"   Target Device: {device} | Cache Chunks: {len(chunk_files)} | Genes: {in_channels}")
+    print(f"   Latent Topics (K): {optimal_k} | Priors: {'Initialized' if init_components is not None else 'Random'}")
+    print("=" * 118)
 
     # 1. Model Initialization
     model = LibellaGNN(
@@ -221,9 +218,9 @@ def run_micro_telemetry_audit(
     alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
     ema_mean = None
 
-    rec = AtomicTelemetryRecorder()
+    rec = HighResTelemetryRecorder()
 
-    print("\n[➤] Simulating 1 Epoch with Full-Graph Atomic Hooks & Dynamic AdamW Tracing...\n")
+    print("\n[➤] Profiling Full 1-Epoch Sub-Graph Dynamics & Autograd Flow...\n")
 
     for step_idx, meta_meta in enumerate(meta_batches):
         optimizer.zero_grad(set_to_none=True)
@@ -256,16 +253,14 @@ def run_micro_telemetry_audit(
             # =========================================================
             # ATOM 1: ENCODERS & NORMALIZATION
             # =========================================================
-            # Identity Encoder
             h_id_lin = model.id_enc[0](x)
             h_id_glu = F.glu(h_id_lin, dim=-1)
-            h_id = model.id_enc[2](h_id_glu)  # LayerNorm
+            h_id = model.id_enc[2](h_id_glu)
             h_id.retain_grad()
 
-            # Context Encoder & APPNP Linear
             h_ctx_lin = model.ctx_enc[0](x)
             h_ctx_ln = model.ctx_enc[1](h_ctx_lin)
-            h_ctx_act = model.ctx_enc[2](h_ctx_ln)  # SiLU
+            h_ctx_act = model.ctx_enc[2](h_ctx_ln)
             h_0 = model.lin_appnp(h_ctx_act)
             h_0.retain_grad()
 
@@ -282,13 +277,11 @@ def run_micro_telemetry_audit(
             dynamic_logits = model.topic_gene_logits + dict_shift.view(model.n_metaprograms, -1)
             dynamic_logits.retain_grad()
 
-            # Temperature and Softmax
             raw_temp = getattr(model, "dict_temp", torch.tensor(cfg.dict_temp, device=device))
             safe_temp = torch.clamp(raw_temp, min=0.25, max=1.0)
             soft_anchors = F.softmax(dynamic_logits, dim=-1)
             sharp_anchors = F.softmax(dynamic_logits / safe_temp, dim=-1)
 
-            # STE Anchor Formulation
             anchors_raw = sharp_anchors.detach() + soft_anchors - soft_anchors.detach()
             anchors_raw.retain_grad()
 
@@ -305,7 +298,7 @@ def run_micro_telemetry_audit(
                 decay = torch.exp(-gamma_decay * dist)
                 rec.record("atom__gamma_val", gamma_decay.item())
                 rec.record("atom__bio_dist_mean", dist.mean().item())
-                rec.record("atom__decay_mean", decay.mean().item())
+                rec.record("atom__decay_scale", decay.mean().item())
             else:
                 decay = torch.ones_like(weights)
 
@@ -335,7 +328,6 @@ def run_micro_telemetry_audit(
                     msg = h_ctx[src] * alpha_att.unsqueeze(1)
                     out.index_add_(0, dst, msg)
 
-                    # Attention Entropy Profile
                     att_entropy = -(alpha_att * torch.log(alpha_att + 1e-12)).sum() / max(1, N)
                     rec.record(f"atom__hop_{hop}_att_entropy", att_entropy.item())
                     rec.record(f"atom__hop_{hop}_att_max", alpha_att.max().item())
@@ -346,7 +338,7 @@ def run_micro_telemetry_audit(
             h_ctx.retain_grad()
 
             # =========================================================
-            # ATOM 5: CROSS-ATTENTION TRANSFORMER CONTEXT GATE
+            # ATOM 5: CROSS-ATTENTION TRANSFORMER
             # =========================================================
             Q = model.q_proj(h_id)
             K = model.k_proj(h_ctx)
@@ -365,10 +357,17 @@ def run_micro_telemetry_audit(
             ctx_pulled.retain_grad()
 
             gate_out = model.context_gate(ctx_pulled)
+            gate_out.retain_grad()
+
             h_final = h_id + gate_out
             h_final.retain_grad()
 
-            # LayerNorm & Unit-Sphere Normalization
+            with torch.no_grad():
+                h_id_norms = h_id.norm(p=2, dim=-1)
+                gate_norms = gate_out.norm(p=2, dim=-1)
+                ctx_id_ratio = gate_norms / (h_id_norms + 1e-9)
+                rec.record("atom__ctx_to_id_ratio_mean", ctx_id_ratio.mean().item())
+
             h_sp = model.sp_norm(h_final)
             h_norm = F.normalize(h_sp, p=2, dim=-1)
             h_norm.retain_grad()
@@ -403,7 +402,12 @@ def run_micro_telemetry_audit(
             x_train = x[train_idx]
             f_train.retain_grad()
 
-            # Prior Target EMA
+            with torch.no_grad():
+                active_topics_per_cell = (f_train > 1e-4).float().sum(dim=1).mean().item()
+                exact_zero_pct = (sparse_prob == 0.0).float().mean().item() * 100.0
+                rec.record("atom__active_topics_per_cell", active_topics_per_cell)
+                rec.record("atom__entmax_zero_pct", exact_zero_pct)
+
             p_train = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
             current_p_mean = p_train.mean(dim=0)
             uniform_prior = torch.ones_like(current_p_mean) / optimal_k
@@ -423,11 +427,12 @@ def run_micro_telemetry_audit(
             dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier
 
             # =========================================================
-            # ATOM 7: RECONSTRUCTION & LOSS ENGINE
+            # ATOM 7: RECONSTRUCTION & LOSS ENGINE (UPDATED TOTAL_ELEMENTS)
             # =========================================================
             recon = f_train @ anchors_raw
             recon.retain_grad()
 
+            # Execute model loss computation with gene normalization
             loss, base_recon_val = model.calc_loss(
                 recon, x_train, anchors_raw, None,
                 ep=0, total_epochs=cfg.epochs,
@@ -438,7 +443,7 @@ def run_micro_telemetry_audit(
             scaled_loss = loss / n_chunks_in_batch
             scaled_loss.backward()
 
-            # Record Tensor Profiles
+            # Record Activations & Backward Gradients
             rec.record_tensor("x_dense", x)
             rec.record_tensor("h_id", h_id, h_id.grad)
             rec.record_tensor("h_0", h_0, h_0.grad)
@@ -452,6 +457,7 @@ def run_micro_telemetry_audit(
             rec.record_tensor("K", K, K.grad)
             rec.record_tensor("V", V, V.grad)
             rec.record_tensor("ctx_pulled", ctx_pulled, ctx_pulled.grad)
+            rec.record_tensor("gate_out", gate_out, gate_out.grad)
             rec.record_tensor("h_final", h_final, h_final.grad)
             rec.record_tensor("h_norm", h_norm, h_norm.grad)
             rec.record_tensor("bio_sim", bio_sim, bio_sim.grad)
@@ -467,11 +473,11 @@ def run_micro_telemetry_audit(
             rec.record("loss__anc", model._last_losses.get("anc", 0.0))
             rec.record("loss__ortho", model._last_losses.get("ort", 0.0))
             rec.record("loss__im", model._last_losses.get("im", 0.0))
-            rec.record("loss__dynamic_w", model._last_losses.get("dyn_w", 1.0))
-            rec.record("loss__tsallis_val", model._last_losses.get("tsallis_val", 0.0))
+            rec.record("loss__tsallis", model._last_losses.get("tsallis_val", 0.0))
+            rec.record("loss__dyn_w", model._last_losses.get("dyn_w", 1.0))
 
         # =============================================================
-        # ATOM 8: PARAMETER GRADIENTS & DECOUPLED CLIPPING
+        # ATOM 8: DECOUPLED CLIPPING BUDGET PROFILES
         # =============================================================
         base_named_params = [(n, p) for n, p in model.named_parameters() if "topic_gene_logits" not in n and p.grad is not None]
         anchor_named_params = [(n, p) for n, p in model.named_parameters() if "topic_gene_logits" in n and p.grad is not None]
@@ -490,24 +496,14 @@ def run_micro_telemetry_audit(
         rec.record("clip__base_grad_norm", base_grad_norm)
         rec.record("clip__anchor_grad_norm", anchor_grad_norm)
 
-        # Individual Parameter Stats
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                p_norm = param.detach().norm(2).item()
-                g_norm = param.grad.detach().norm(2).item()
-                g_rms = math.sqrt((param.grad.detach() ** 2).sum().item() / max(1, param.numel()))
-                rec.record(f"param__{name}__norm", p_norm)
-                rec.record(f"param__{name}__grad_l2", g_norm)
-                rec.record(f"param__{name}__grad_rms", g_rms)
-
-        # Perform Decoupled Clipping
+        # Apply Decoupled Clipping
         if base_named_params:
             torch.nn.utils.clip_grad_norm_([p for _, p in base_named_params], max_norm=cfg.grad_clip)
         if anchor_named_params:
             torch.nn.utils.clip_grad_norm_([p for _, p in anchor_named_params], max_norm=cfg.grad_clip)
 
         # =============================================================
-        # ATOM 9: EXACT ADAMW VECTOR DECOMPOSITION
+        # ATOM 9: TRUE ADAMW STEP DYNAMICS & VECTOR FORCE
         # =============================================================
         anchor_group = optimizer.param_groups[1]
         lr = anchor_group["lr"]
@@ -553,140 +549,130 @@ def run_micro_telemetry_audit(
         if (step_idx + 1) % max(1, len(meta_batches) // 5) == 0 or step_idx == len(meta_batches) - 1:
             print(
                 f"  [Meta-Batch {step_idx+1:02d}/{len(meta_batches):02d}] "
-                f"Loss: {rec.mean('loss__total'):.3f} (Rec: {rec.mean('loss__recon'):.3f}) | "
-                f"Clip Anchor: {clip_scale_anchor:.3f} | "
-                f"AdamW WD/Grad: {wd_to_grad_ratio:.2f}x"
+                f"Loss: {rec.mean('loss__total'):.4f} (Rec: {rec.mean('loss__recon'):.4f}) | "
+                f"Clip Scales: (Base={clip_scale_base:.3f}, Anchor={clip_scale_anchor:.3f}) | "
+                f"AdamW WD/Grad: {wd_to_grad_ratio:.3f}x"
             )
 
     # =========================================================================
-    # 4. COMPREHENSIVE STATISTICAL SYNTHESIS REPORT
+    # 4. STATISTICAL SYNTHESIS REPORT
     # =========================================================================
     delta_logits = (model.topic_gene_logits.detach() - initial_logits).norm().item()
     max_logit_delta = (model.topic_gene_logits.detach() - initial_logits).abs().max().item()
 
-    print("\n" + "=" * 115)
-    print("📋 ATOMIC TELEMETRY: COMPLETE SUB-LAYER HEALTH & MATHEMATICAL ROLE AUDIT")
-    print("=" * 115)
+    print("\n" + "=" * 118)
+    print("📊 HIGH-RESOLUTION PILOT AUDIT RESULTS (GENE-NORMALIZED ENGINE)")
+    print("=" * 118)
 
-    def print_section(title: str):
-        print(f"\n{'─' * 115}\n▶ {title}\n{'─' * 115}")
+    def print_hdr(title: str):
+        print(f"\n{'─' * 118}\n▶ {title}\n{'─' * 118}")
 
-    def eval_status(val: float, healthy_range: tuple[float, float], lower_is_better: bool = False) -> str:
-        low, high = healthy_range
+    def eval_flag(val: float, bounds: tuple[float, float], lower_is_better: bool = False) -> str:
+        low, high = bounds
         if low <= val <= high:
             return "🟢 HEALTHY"
         elif (val < low and not lower_is_better) or (val > high and lower_is_better):
-            return "🔴 SEVERE CHOKEPOINT"
+            return "🔴 CHOKEPOINT"
         return "🟡 CAUTION"
 
-    # SECTION A: FORWARD ACTIVATIONS & NORMALIZATIONS
-    print_section("A. FORWARD TENSOR ACTIVATION & NORMALIZATION ATOMS")
-    print(f"{'Sub-Layer Atom':<22} | {'Role & Operation':<30} | {'RMS Norm':<10} | {'Sparsity':<9} | {'Health Status':<18}")
-    print("─" * 115)
+    # SECTION A: FORWARD SPECTRAL & TOPOLOGY METRICS
+    print_hdr("A. FORWARD TENSOR ACTIVATION & STRUCTURAL TOPOLOGY")
+    print(f"{'Sub-Layer Atom':<20} | {'Role & Mechanism':<32} | {'RMS Norm':<10} | {'Zero %':<8} | {'Status':<14}")
+    print("─" * 118)
 
-    atoms_fwd = [
+    fwd_spec = [
         ("x_dense", "Raw Count Matrix X", (0.01, 10.0), False),
-        ("h_id", "id_enc (Linear+GLU+LN)", (0.1, 5.0), False),
+        ("h_id", "id_enc (Linear + GLU + LN)", (0.1, 5.0), False),
         ("h_0", "lin_appnp(ctx_enc(X))", (0.1, 5.0), False),
-        ("macro_ctx", "Mean Pooled Context", (0.01, 2.0), False),
-        ("dict_shift", "tanh(spatial_bridge)*2.0", (0.05, 2.0), False),
+        ("macro_ctx", "Graph Context Pooled Mean", (0.01, 2.0), False),
+        ("dict_shift", "Spatial Bridge Shift tanh*2.0", (0.05, 2.0), False),
         ("dynamic_logits", "topic_logits + dict_shift", (0.5, 10.0), False),
-        ("anchors_raw", "STE Sharp/Softmax Anchor", (0.001, 0.5), False),
+        ("anchors_raw", "STE Sharp/Softmax Anchor Matrix", (0.001, 0.5), False),
         ("W_bil", "Bilateral Edge Decay Weights", (0.01, 1.0), False),
-        ("h_ctx_final", "APPNP + GATv2 k-hop Msg", (0.1, 5.0), False),
-        ("ctx_pulled", "Cross-Attention Pulled V", (0.1, 5.0), False),
+        ("h_ctx_final", "APPNP + GATv2 k-hop Aggregation", (0.1, 5.0), False),
+        ("ctx_pulled", "Cross-Attention Pulled Context", (0.01, 5.0), False),
+        ("gate_out", "context_gate(ctx_pulled)", (0.01, 5.0), False),
+        ("h_final", "h_id + gate_out (Pure Residual)", (0.1, 5.0), False),
         ("h_norm", "sp_norm Unit-Sphere (L2)", (0.05, 1.5), False),
         ("bio_sim", "Cosine Sim(X_norm, T_norm)", (0.01, 1.0), False),
-        ("gnn_shift_norm", "Topic Projection Head (L2)", (0.05, 1.5), False),
-        ("logits", "Scaled Hybrid Shifted Logits", (0.5, 25.0), False),
+        ("gnn_shift_norm", "Topic Projection Vector (L2)", (0.05, 1.5), False),
+        ("logits", "Hybrid Scaled Shifted Logits", (0.5, 25.0), False),
         ("prob", "Entmax1.5 / Softmax Blend", (0.01, 0.5), False),
-        ("recon", "Reconstructed Counts (F @ A)", (0.01, 10.0), False),
+        ("recon", "Reconstructed Expression (F @ A)", (0.01, 10.0), False),
     ]
 
-    for name, desc, h_range, lib in atoms_fwd:
+    for name, desc, bounds, lib in fwd_spec:
         rms = rec.mean(f"fwd__{name}__rms")
-        sparsity = rec.mean(f"fwd__{name}__sparsity")
-        status = eval_status(rms, h_range, lib)
-        print(f"{name:<22} | {desc:<30} | {rms:<10.4e} | {sparsity:<8.1f}% | {status:<18}")
+        zp = rec.mean(f"fwd__{name}__zero_pct")
+        print(f"{name:<20} | {desc:<32} | {rms:<10.4e} | {zp:<7.1f}% | {eval_flag(rms, bounds, lib):<14}")
 
-    # SECTION B: AUTOGRAD BACKPROPAGATION CHAIN & JACOBIANS
-    print_section("B. BACKPROPAGATION GRADIENT CHAIN & JACOBIAN TRANSMISSION")
-    print(f"{'Tensor Gradient':<22} | {'Mathematical Flow':<30} | {'||∇L||_2':<11} | {'Grad/Act Ratio':<14} | {'Health Status':<18}")
-    print("─" * 115)
+    # SECTION B: SPATIAL VS IDENTITY RESOLUTION
+    print_hdr("B. SINGLE-CELL RESOLUTION & SPATIAL GATING DYNAMICS")
+    mean_ratio = rec.mean("atom__ctx_to_id_ratio_mean")
+    active_k = rec.mean("atom__active_topics_per_cell")
+    entmax_zeros = rec.mean("atom__entmax_zero_pct")
 
-    atoms_bwd = [
-        ("recon", "∂L / ∂(Reconstruction)", (1e-4, 5.0)),
-        ("f_train", "∂L / ∂(Topic Proportions F)", (1e-4, 5.0)),
-        ("prob", "∂L / ∂(Cell Topic Prob P)", (1e-4, 5.0)),
-        ("logits", "∂L / ∂(Logits via Entmax/SM)", (1e-5, 2.0)),
-        ("bio_sim", "∂L / ∂(Bio Cosine Similarity)", (1e-5, 2.0)),
-        ("gnn_shift_norm", "∂L / ∂(GNN Topic Shift)", (1e-5, 2.0)),
-        ("h_norm", "∂L / ∂(LayerNorm Feature H)", (1e-5, 2.0)),
-        ("ctx_pulled", "∂L / ∂(Cross-Attention Pulled)", (1e-5, 2.0)),
-        ("h_ctx_final", "∂L / ∂(GNN Aggregation)", (1e-5, 2.0)),
-        ("anchors_raw", "∂L / ∂(Raw Anchors Matrix)", (1e-4, 5.0)),
-        ("dynamic_logits", "∂L / ∂(Dynamic Logits)", (1e-5, 1.0)),
-        ("dict_shift", "∂L / ∂(Spatial Bridge Shift)", (1e-5, 1.0)),
-        ("macro_ctx", "∂L / ∂(Macro Graph Context)", (1e-5, 1.0)),
-        ("h_0", "∂L / ∂(Context Encoder Root)", (1e-5, 1.0)),
-        ("h_id", "∂L / ∂(Identity Encoder Root)", (1e-5, 1.0)),
+    print(f" • Context Gate to Identity Ratio (||gate(ctx_pulled)|| / ||h_id||): {mean_ratio:.4f}")
+    print(f" • Latent Topic Activation & Sparsity: Active Topics = {active_k:.2f} / {optimal_k} | Entmax Exact Zeros = {entmax_zeros:.1f}%")
+
+    # SECTION C: BACKPROPAGATION CHAIN & SCALED GRADIENTS
+    print_hdr("C. BACKPROPAGATION GRADIENT CHAIN (GENE-NORMALIZED)")
+    print(f"{'Tensor Gradient':<20} | {'Autograd Pathway':<32} | {'||∇L||_2':<11} | {'Grad/Act Ratio':<14} | {'Status':<14}")
+    print("─" * 118)
+
+    bwd_spec = [
+        ("recon", "∂L / ∂(Reconstruction)", (1e-7, 1.0)),
+        ("f_train", "∂L / ∂(Topic Proportions F)", (1e-4, 500.0)),
+        ("prob", "∂L / ∂(Cell Topic Prob P)", (1e-5, 50.0)),
+        ("logits", "∂L / ∂(Logits via Entmax/SM)", (1e-6, 10.0)),
+        ("bio_sim", "∂L / ∂(Bio Cosine Similarity)", (1e-6, 10.0)),
+        ("gnn_shift_norm", "∂L / ∂(GNN Topic Shift)", (1e-6, 10.0)),
+        ("h_norm", "∂L / ∂(LayerNorm Feature H)", (1e-6, 10.0)),
+        ("gate_out", "∂L / ∂(context_gate output)", (1e-6, 10.0)),
+        ("ctx_pulled", "∂L / ∂(Cross-Attention Pulled)", (1e-6, 10.0)),
+        ("h_ctx_final", "∂L / ∂(GNN Aggregation)", (1e-6, 10.0)),
+        ("anchors_raw", "∂L / ∂(Raw Anchors Matrix)", (1e-5, 100.0)),
+        ("dynamic_logits", "∂L / ∂(Dynamic Logits)", (1e-6, 10.0)),
+        ("dict_shift", "∂L / ∂(Spatial Bridge Shift)", (1e-6, 10.0)),
+        ("macro_ctx", "∂L / ∂(Macro Graph Context)", (1e-6, 10.0)),
+        ("h_0", "∂L / ∂(Context Encoder Root)", (1e-6, 10.0)),
+        ("h_id", "∂L / ∂(Identity Encoder Root)", (1e-6, 10.0)),
     ]
 
-    for name, desc, h_range in atoms_bwd:
+    for name, desc, bounds in bwd_spec:
         g_l2 = rec.mean(f"bwd__{name}__l2")
-        g_ratio = rec.mean(f"bwd__{name}__grad_act_ratio")
-        status = eval_status(g_l2, h_range, False)
-        print(f"{name:<22} | {desc:<30} | {g_l2:<11.4e} | {g_ratio:<14.4e} | {status:<18}")
+        g_ratio = rec.mean(f"bwd__{name}__grad_to_act")
+        print(f"{name:<20} | {desc:<32} | {g_l2:<11.4e} | {g_ratio:<14.4e} | {eval_flag(g_l2, bounds):<14}")
 
-    # SECTION C: ATTENTION ENTROPY & EDGE MECHANICS
-    print_section("C. ATTENTION ENTROPY, GNN HOPS & BILATERAL EDGE DECAY")
-    gamma_val = rec.mean("atom__gamma_val")
-    dist_val = rec.mean("atom__bio_dist_mean")
-    decay_val = rec.mean("atom__decay_mean")
-    print(f" • Bilateral Decay Kernel:  gamma = {gamma_val:.4f} | Mean Bio Distance = {dist_val:.4f} | Decay Scale W_bil = {decay_val:.4f}")
+    # SECTION D: DECOUPLED CLIPPING & ADAMW VECTOR DYNAMICS
+    print_hdr("D. DECOUPLED CLIPPING ISOLATION & TRUE ADAMW SECOND-MOMENT FORCE")
+    clip_b = rec.mean("clip__scale_base")
+    clip_a = rec.mean("clip__scale_anchor")
+    norm_b = rec.mean("clip__base_grad_norm")
+    norm_a = rec.mean("clip__anchor_grad_norm")
 
-    for hop in range(model.k_hops):
-        att_ent = rec.mean(f"atom__hop_{hop}_att_entropy")
-        att_max = rec.mean(f"atom__hop_{hop}_att_max")
-        ent_status = "🟢 HEALTHY DIVERSITY" if att_ent > 0.5 else "🔴 COLLAPSED ATTENTION"
-        print(f" • GATv2 Hop {hop}:            Attention Entropy = {att_ent:.4f} (Max Weight Peak = {att_max:.4f}) ➔ {ent_status}")
-
-    # SECTION D: DECOUPLED CLIPPING & ADAMW DYNAMICS
-    print_section("D. DECOUPLED GRADIENT CLIPPING & ADAMW FORCE DECOMPOSITION")
-    clip_base = rec.mean("clip__scale_base")
-    clip_anchor = rec.mean("clip__scale_anchor")
-    norm_base = rec.mean("clip__base_grad_norm")
-    norm_anchor = rec.mean("clip__anchor_grad_norm")
-
-    print(f" • Base Backbone Grad Norm:     ||g_base||   = {norm_base:.4e} (Clip Scale: {clip_base:.4f}) ➔ {eval_status(clip_base, (0.1, 1.0))}")
-    print(f" • Anchor Dictionary Grad Norm: ||g_anchor|| = {norm_anchor:.4e} (Clip Scale: {clip_anchor:.4f}) ➔ {eval_status(clip_anchor, (0.1, 1.0))}")
+    print(f" • Base Backbone Grad Norm:     ||g_base||   = {norm_b:.4e} (Clip Scale: {clip_b:.4f}) ➔ {eval_flag(clip_b, (0.5, 1.0))}")
+    print(f" • Anchor Dictionary Grad Norm: ||g_anchor|| = {norm_a:.4e} (Clip Scale: {clip_a:.4f}) ➔ {eval_flag(clip_a, (0.5, 1.0))}")
 
     f_grad = rec.mean("adamw__grad_force")
     f_wd = rec.mean("adamw__wd_force")
-    ratio_wd_grad = rec.mean("adamw__wd_grad_ratio")
+    ratio_wd = rec.mean("adamw__wd_grad_ratio")
     cos_sim = rec.mean("adamw__cos_sim")
 
-    print(f"\n • True AdamW Step Decomposition on 'topic_gene_logits':")
+    print(f"\n • Exact AdamW Step Decomposition on 'topic_gene_logits':")
     print(f"   ↳ Normalized Data Gradient Force:  ||-η · m̂/(√v̂ + ε)|| = {f_grad:.6e}")
     print(f"   ↳ Weight Decay Vector Force:        ||-η · λ · θ||     = {f_wd:.6e}")
-    print(f"   ↳ Force Ratio (WD / Data Grad):     {ratio_wd_grad:.3f}x (Directional Cosine Alignment = {cos_sim:+.3f})")
+    print(f"   ↳ True Force Ratio (WD / Data Grad): {ratio_wd:.3f}x (Cosine Alignment = {cos_sim:+.3f})")
 
-    if ratio_wd_grad > 1.0:
-        print("   ↳ 🔴 SEVERE: Weight decay is overpowering biological data updates and shrinking marker gene logits.")
-    elif ratio_wd_grad > 0.5:
-        print("   ↳ 🟡 CAUTION: Weight decay is strong relative to gradient updates.")
-    else:
-        print("   ↳ 🟢 HEALTHY: Data gradient force dominates weight decay by a healthy margin.")
-
-    # SECTION E: TOTAL DISPLACEMENT OVER FULL EPOCH
-    print_section("E. CUMULATIVE PARAMETER DISPLACEMENT OVER 1 FULL EPOCH")
-    print(f" • Total L2 Logit Displacement:  ||ΔW||_2 = {delta_logits:.6e}")
-    print(f" • Maximum Single Coordinate Δw: max|Δw|  = {max_logit_delta:.6e}")
-    print("=" * 115 + "\n")
+    # SECTION E: CUMULATIVE MATRIX DRIFT
+    print_hdr("E. TOTAL PARAMETER DISPLACEMENT OVER 1 FULL EPOCH")
+    print(f" • Cumulative Logit Matrix L2 Drift: ||ΔW||_2 = {delta_logits:.6e}")
+    print(f" • Maximum Single Coordinate Shift:  max|Δw|  = {max_logit_delta:.6e}")
+    print("=" * 118 + "\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Libella Atomic Telemetry & Forensic Micro-Audit Engine")
+    parser = argparse.ArgumentParser(description="Libella High-Resolution Forensic Pilot (Gene-Normalized)")
     parser.add_argument(
         "--chunk-dir",
         type=str,
@@ -707,4 +693,4 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    run_micro_telemetry_audit(args.chunk_dir, args.common_genes, args.priors)
+    run_high_res_pilot(args.chunk_dir, args.common_genes, args.priors)
