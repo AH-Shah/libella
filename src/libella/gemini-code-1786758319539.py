@@ -136,7 +136,7 @@ def run_diagnostic(chunk_dir_path: str):
         raw_delta = recon - x_train
         asymmetry_factor = 1.0 + (is_non_zero.to(x_train.dtype) * 2.0) * (raw_delta < 0).float()
         scaled_delta = torch.clamp(raw_delta * asymmetry_factor, min=-30.0, max=30.0)
-        l_recon = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_train.shape[0])
+        l_recon = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_train.shape[0] * x_train.shape[1])
 
         # 2. Anchor Lock Loss
         anc_norm = F.normalize(anchors_raw, p=2, dim=1)
