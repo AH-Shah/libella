@@ -21,7 +21,7 @@ h5ad_path = Path("/Users/Hemato/project_3/benchmark/benchmark_data.h5ad")
 
 # Locate signatures.csv (adjust if in a different subfolder)
 sig_csv_candidates = [
-    Path("/Users/Hemato/project_3/benchmark/signatures.csv"),
+    Path("/Users/Hemato/project_3/libella/src/libella/signatures.csv"),
     Path("/Users/Hemato/project_3/signatures.csv"),
     Path("/Users/Hemato/project_3/benchmark/benchmark_output/libella/run/signatures.csv"),
 ]
