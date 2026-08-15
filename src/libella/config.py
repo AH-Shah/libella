@@ -51,7 +51,7 @@ class RunConfig:
     prior_cells_per_sample: int = 5_000_000
     
     # Model Physics & Schedules
-    dict_temp: float = 0.30
+    dict_temp: float = 0.20
     att_temp: float = -2.25
     gnn_shift_weight: float = 0.5
     train_noise: float = 0.05
