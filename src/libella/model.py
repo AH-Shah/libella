@@ -191,8 +191,7 @@ class LibellaGNN(nn.Module):
         ctx_pulled = torch.zeros_like(Q)
         ctx_pulled.index_add_(0, dst_with_self, pulled_msg)
 
-        ctx_pulled_norm = F.layer_norm(ctx_pulled, (self.hidden_dim,))
-        h_final = h_id + self.context_gate(ctx_pulled_norm)
+        h_final = h_id + self.context_gate(ctx_pulled)
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
         
