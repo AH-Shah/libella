@@ -285,9 +285,15 @@ class LibellaGNN(nn.Module):
         # Direct scalar division without creating GPU tensor objects
         l_recon = l_recon_sum / max(1, x_c.shape[0])
 
+
         anc_norm = F.normalize(anchors, p=2, dim=1)
-        ref_probs = F.softmax(self.anchor_logits, dim=-1)
-        ref_norm = F.normalize(ref_probs, p=2, dim=1)
+
+        with torch.no_grad():
+            raw_temp = getattr(self, 'dict_temp', torch.tensor(cfg.dict_temp, device=anchors.device))
+            safe_temp = torch.clamp(raw_temp, min=0.25, max=1.0)
+            ref_probs = F.softmax(self.anchor_logits / safe_temp, dim=-1)
+            ref_norm = F.normalize(ref_probs, p=2, dim=1)
+
         l_anc = 1.0 - (anc_norm * ref_norm).sum(dim=1).mean()
 
         peak_excess = F.relu(anchors - cfg.anchor_peak_threshold)
