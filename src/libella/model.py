@@ -191,7 +191,8 @@ class LibellaGNN(nn.Module):
         ctx_pulled = torch.zeros_like(Q)
         ctx_pulled.index_add_(0, dst_with_self, pulled_msg)
 
-        h_final = h_id + self.context_gate(ctx_pulled)
+        ctx_pulled_norm = F.layer_norm(ctx_pulled, (self.hidden_dim,))
+        h_final = h_id + self.context_gate(ctx_pulled_norm)
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
         
@@ -317,13 +318,19 @@ class LibellaGNN(nn.Module):
         tsallis_val = 0.0
         
         if f_train is not None:
-            f_norm = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
+            f_sum = f_train.sum(dim=1, keepdim=True)
+            f_norm = f_train / torch.clamp(f_sum, min=1e-6)
             
-            alpha_ent = cfg.tsallis_alpha
-            tsallis_h = (1.0 - (f_norm ** alpha_ent).sum(dim=1).mean()) / (alpha_ent - 1.0)
+            alpha_ent = getattr(cfg, 'tsallis_alpha', 1.5)
+            f_safe = torch.clamp(f_norm, min=1e-5, max=1.0)
+            
+            if abs(alpha_ent - 1.0) > 1e-4:
+                tsallis_h = (1.0 - (f_safe ** alpha_ent).sum(dim=1).mean()) / (alpha_ent - 1.0)
+            else:
+                tsallis_h = -(f_safe * torch.log(f_safe)).sum(dim=1).mean()
+                
             tsallis_val = tsallis_h.item()
-            
-            p_mean = torch.clamp(f_norm.mean(dim=0), min=1e-7)
+            p_mean = torch.clamp(f_norm.mean(dim=0), min=1e-5, max=1.0)
             
             if target_f_dist is not None:
                 kl_marginal = (p_mean * (torch.log(p_mean) - torch.log(target_f_dist + 1e-9))).sum()
