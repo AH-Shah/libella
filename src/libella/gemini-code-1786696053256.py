@@ -10,7 +10,6 @@ import json
 import math
 from pathlib import Path
 import pickle
-import joblib
 from typing import Any
 
 import numpy as np
@@ -25,23 +24,56 @@ from libella.model import LibellaGNN
 from libella.utils import get_device, PhaseTracker, scatter_softmax
 
 
+def robust_load_artifact(file_path: Path | str) -> Any:
+    """Universal loader supporting torch.save, pickle, joblib, and numpy formats."""
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+
+    # 1. Try PyTorch loader (handles torch.save .pkl / .pt / .pth)
+    try:
+        return torch.load(p, map_location="cpu", weights_only=False)
+    except Exception:
+        pass
+
+    # 2. Try standard pickle
+    try:
+        with open(p, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        pass
+
+    # 3. Try joblib
+    try:
+        import joblib
+        return joblib.load(p)
+    except Exception:
+        pass
+
+    # 4. Try numpy
+    try:
+        return np.load(p, allow_pickle=True)
+    except Exception:
+        pass
+
+    raise RuntimeError(f"Failed to deserialize prior artifact at: {p}")
+
+
 def load_priors_and_genes(
     common_genes_path: str | Path, priors_path: str | Path
 ) -> tuple[list[str], np.ndarray | None, int]:
-    """Load gene list and cNMF spatial prior matrices."""
+    """Load gene dictionary and cNMF spatial prior matrices."""
     genes_p = Path(common_genes_path)
-    priors_p = Path(priors_path)
-
     if not genes_p.exists():
         raise FileNotFoundError(f"Common genes file missing at: {genes_p}")
-    if not priors_p.exists():
-        raise FileNotFoundError(f"Priors pickle file missing at: {priors_p}")
 
     with open(genes_p, "r", encoding="utf-8") as f:
         common_genes = json.load(f)
 
-    with open(priors_p, "rb") as f:
-        priors_data = joblib.load(f)
+    priors_data = robust_load_artifact(priors_path)
+
+    init_components = None
+    optimal_k = getattr(cfg, "k_components", 38)
 
     if isinstance(priors_data, dict):
         init_components = priors_data.get(
@@ -50,14 +82,14 @@ def load_priors_and_genes(
         )
         optimal_k = priors_data.get(
             "optimal_k",
-            init_components.shape[0] if init_components is not None else 38,
+            init_components.shape[0] if init_components is not None else optimal_k,
         )
     elif isinstance(priors_data, np.ndarray):
         init_components = priors_data
         optimal_k = init_components.shape[0]
-    else:
-        init_components = None
-        optimal_k = getattr(cfg, "k_components", 38)
+    elif isinstance(priors_data, torch.Tensor):
+        init_components = priors_data.detach().cpu().numpy()
+        optimal_k = init_components.shape[0]
 
     n_extra_slots = getattr(cfg, "extra_topics", 0)
     if n_extra_slots > 0 and init_components is not None:
@@ -89,7 +121,7 @@ def run_chokepoint_diagnostics(
     print(f"   Genes: {in_channels} | Metaprograms (K): {optimal_k} | Priors: {'Loaded' if init_components is not None else 'None'}")
     print("=" * 95)
 
-    # 1. Instantiate Model with True Priors
+    # 1. Instantiate Model with Validated Priors
     model = LibellaGNN(
         in_channels=in_channels,
         n_metaprograms=optimal_k,
@@ -110,13 +142,21 @@ def run_chokepoint_diagnostics(
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)
     max_entropy_scalar = float(np.log(optimal_k))
 
-    training_cache = [{"chunk_file": f} for f in chunk_files]
+    # 2. Build Structured Training Cache with Required Patient Metadata
+    training_cache = []
+    for f in chunk_files:
+        # Standard naming convention: {patient_name}_chunk_{idx}.pt
+        patient_name = f.stem.split("_chunk_")[0] if "_chunk_" in f.stem else f.stem
+        training_cache.append({
+            "patient_name": patient_name,
+            "chunk_file": f,
+        })
+
     meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
     total_steps_per_epoch = len(meta_batches)
     alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
     ema_mean = None
 
-    # Telemetry accumulators
     telemetry = {
         "l_rec": [], "l_anc": [], "l_ortho": [], "l_im": [],
         "g_anchors_raw": [], "g_dynamic_logits": [], "g_topic_gene_logits": [],
@@ -126,7 +166,7 @@ def run_chokepoint_diagnostics(
         "cos_sim_grad_vs_wd": [],
     }
 
-    print("\n[➤] Executing 1 Epoch Simulation with Meta-Batches and Exact AdamW Second-Moment Hooks...\n")
+    print("\n[➤] Simulating 1 Full Epoch with Meta-Batches and Exact AdamW Second-Moment Dynamics...\n")
 
     for step_idx, meta_meta in enumerate(meta_batches):
         optimizer.zero_grad(set_to_none=True)
@@ -155,14 +195,13 @@ def run_chokepoint_diagnostics(
                 src = src.to(torch.int64)
                 dst = dst.to(torch.int64)
 
-            # Squeeze and Alpha schedules
             squeeze_progress = tracker.get_progress()
             model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * squeeze_progress)
             model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * squeeze_progress)
             model.current_alpha = cfg.alpha_start
 
             # -------------------------------------------------------------
-            # FORWARD PASS WITH STRICT REPLICATION OF MODEL LOGIC
+            # FORWARD PASS
             # -------------------------------------------------------------
             h_id = model.id_enc(x)
             h_0 = model.lin_appnp(model.ctx_enc(x))
@@ -239,12 +278,10 @@ def run_chokepoint_diagnostics(
             gnn_shift_norm = F.normalize(gnn_shift_raw, p=2, dim=-1)
             base_logits = bio_sim + (cfg.gnn_shift_weight * gnn_shift_norm)
 
-            # Training noise injection
             noise = torch.randn_like(base_logits) * cfg.train_noise
             base_logits = base_logits + noise
             logits = base_logits * model.current_scale
 
-            # Dynamic Probability schedule
             sparse_prob = entmax_bisect(logits, alpha=model.current_alpha, dim=1)
             smooth_prob = F.softmax(logits / model.current_temp, dim=1)
             smooth_weight = 0.50 - (0.45 * squeeze_progress)
@@ -255,7 +292,6 @@ def run_chokepoint_diagnostics(
             f_train = fracs[train_idx]
             x_train = x[train_idx]
 
-            # Dynamic Prior EMA
             p_train = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
             current_p_mean = p_train.mean(dim=0)
             uniform_prior = torch.ones_like(current_p_mean) / optimal_k
@@ -276,7 +312,6 @@ def run_chokepoint_diagnostics(
 
             recon = f_train @ anchors_raw
 
-            # Complete loss via model calc_loss
             loss, _ = model.calc_loss(
                 recon, x_train, anchors_raw, None,
                 ep=0, total_epochs=cfg.epochs,
@@ -305,7 +340,6 @@ def run_chokepoint_diagnostics(
 
         g_anchor_param = model.topic_gene_logits.grad.norm().item() if model.topic_gene_logits.grad is not None else 0.0
 
-        # GNN Backbone Total Frobenius and RMS Norms
         gnn_grads = [
             p.grad for n, p in model.named_parameters()
             if p.grad is not None and any(k in n for k in ["gat_", "ctx_enc", "id_enc", "q_proj", "k_proj", "v_proj", "topic_proj", "spatial_bridge"])
@@ -317,10 +351,8 @@ def run_chokepoint_diagnostics(
         else:
             gnn_total_norm, gnn_rms_norm = 0.0, 0.0
 
-        # STE Jacobian Attenuation Ratio
         ste_ratio = mean_g_dyn / (mean_g_raw + 1e-9)
 
-        # Global Model Gradient Norm & Clip Factor
         all_grads = [p.grad for p in model.parameters() if p.grad is not None]
         total_model_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in all_grads]), 2).item()
         clip_scale = min(1.0, cfg.grad_clip / (total_model_norm + 1e-6))
@@ -329,22 +361,22 @@ def run_chokepoint_diagnostics(
         # -------------------------------------------------------------
         # EXACT ADAMW SECOND-MOMENT & WEIGHT DECAY FORCE DECOMPOSITION
         # -------------------------------------------------------------
-        # Apply gradient clipping in-place
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
 
-        # Retrieve anchor group hyperparameters
         anchor_group = optimizer.param_groups[1]
         lr = anchor_group["lr"]
         wd = anchor_group["weight_decay"]
-        beta1, beta2 = anchor_group["betas"]
-        eps = anchor_group["eps"]
+        beta1, beta2 = anchor_group.get("betas", (0.9, 0.999))
+        eps = anchor_group.get("eps", 1e-8)
 
         p_tensor = model.topic_gene_logits
         g_clipped = p_tensor.grad.detach()
         param_state = optimizer.state[p_tensor]
 
-        # Simulate / Read AdamW state step
-        current_step = param_state.get("step", 0) + 1
+        # Extract step counter safely
+        raw_step = param_state.get("step", 0)
+        current_step = (int(raw_step.item()) if isinstance(raw_step, torch.Tensor) else int(raw_step)) + 1
+
         if "exp_avg" in param_state:
             exp_avg = param_state["exp_avg"].clone()
             exp_avg_sq = param_state["exp_avg_sq"].clone()
@@ -354,8 +386,8 @@ def run_chokepoint_diagnostics(
             exp_avg = g_clipped * (1.0 - beta1)
             exp_avg_sq = (g_clipped * g_clipped) * (1.0 - beta2)
 
-        bias_correction1 = 1.0 - beta1 ** current_step
-        bias_correction2 = 1.0 - beta2 ** current_step
+        bias_correction1 = 1.0 - (beta1 ** current_step)
+        bias_correction2 = 1.0 - (beta2 ** current_step)
 
         denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
         adam_grad_step_vec = -lr * (exp_avg / bias_correction1) / denom
@@ -368,10 +400,8 @@ def run_chokepoint_diagnostics(
             adam_grad_step_vec.view(1, -1), adam_wd_step_vec.view(1, -1)
         ).item()
 
-        # Step Optimizer
         optimizer.step()
 
-        # Record metrics
         telemetry["g_anchors_raw"].append(mean_g_raw)
         telemetry["g_dynamic_logits"].append(mean_g_dyn)
         telemetry["g_topic_gene_logits"].append(g_anchor_param)
@@ -444,8 +474,6 @@ def run_chokepoint_diagnostics(
 
 
 if __name__ == "__main__":
-    import sys
-
     parser = argparse.ArgumentParser(description="Libella Exact Autograd & Optimizer Chokepoint Diagnostic")
     parser.add_argument(
         "--chunk-dir",
