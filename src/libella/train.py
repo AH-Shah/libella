@@ -264,15 +264,17 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                progress = tracker.get_progress()
+                squeeze_progress = tracker.get_progress()
 
-                model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * progress)    
-                model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * progress)     
-                model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * progress) 
+                model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * squeeze_progress)  
+                model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * squeeze_progress) 
+
+                anchor_progress = epoch / max(1, cfg.epochs - 1)
+                model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * anchor_progress)
 
                 fracs, pure_anchors = model(x, src, dst, weights)
                 
-                # Guaranteed >0 train nodes by SSD preparation; unconditional zero-sync execution
+                
                 train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
 
                 f_train = fracs[train_idx]
