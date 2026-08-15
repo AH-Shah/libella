@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Libella Forensic Autograd Diagnostic:
 Exact mathematical audit of gradient flow, Softmax Jacobian attenuation,
-gradient clipping starvation, and true AdamW second-moment weight decay force.
+decoupled gradient clipping isolation, and true AdamW second-moment weight decay force.
 """
 
 import argparse
@@ -116,7 +116,7 @@ def run_chokepoint_diagnostics(
     in_channels = len(common_genes)
 
     print("=" * 95)
-    print("🔬 LIBELLA MATHEMATICALLY EXACT AUTOGRAD & OPTIMIZER AUDIT")
+    print("🔬 LIBELLA FORENSIC AUTOGRAD & DECOUPLED CLIPPING AUDIT")
     print(f"   Target Device: {device} | Found {len(chunk_files)} Chunks")
     print(f"   Genes: {in_channels} | Metaprograms (K): {optimal_k} | Priors: {'Loaded' if init_components is not None else 'None'}")
     print("=" * 95)
@@ -145,7 +145,6 @@ def run_chokepoint_diagnostics(
     # 2. Build Structured Training Cache with Required Patient Metadata
     training_cache = []
     for f in chunk_files:
-        # Standard naming convention: {patient_name}_chunk_{idx}.pt
         patient_name = f.stem.split("_chunk_")[0] if "_chunk_" in f.stem else f.stem
         training_cache.append({
             "patient_name": patient_name,
@@ -161,12 +160,13 @@ def run_chokepoint_diagnostics(
         "l_rec": [], "l_anc": [], "l_ortho": [], "l_im": [],
         "g_anchors_raw": [], "g_dynamic_logits": [], "g_topic_gene_logits": [],
         "g_spatial_bridge": [], "g_gnn_total": [], "g_gnn_rms": [], "g_total_model": [],
-        "ste_jacobian_loss_ratio": [], "clip_scale_factor": [], "g_post_clip_anchor": [],
+        "ste_jacobian_loss_ratio": [],
+        "clip_scale_base": [], "clip_scale_anchor": [], "g_post_clip_anchor": [],
         "adamw_true_grad_force": [], "adamw_true_wd_force": [], "wd_to_grad_force_ratio": [],
         "cos_sim_grad_vs_wd": [],
     }
 
-    print("\n[➤] Simulating 1 Full Epoch with Meta-Batches and Exact AdamW Second-Moment Dynamics...\n")
+    print("\n[➤] Simulating 1 Full Epoch with Decoupled Gradient Clipping & Exact AdamW Dynamics...\n")
 
     for step_idx, meta_meta in enumerate(meta_batches):
         optimizer.zero_grad(set_to_none=True)
@@ -340,9 +340,32 @@ def run_chokepoint_diagnostics(
 
         g_anchor_param = model.topic_gene_logits.grad.norm().item() if model.topic_gene_logits.grad is not None else 0.0
 
+        # Parameter group segregation
+        base_named_params = [
+            (n, p) for n, p in model.named_parameters() 
+            if "topic_gene_logits" not in n and p.grad is not None
+        ]
+        anchor_named_params = [
+            (n, p) for n, p in model.named_parameters() 
+            if "topic_gene_logits" in n and p.grad is not None
+        ]
+
+        # Calculate Norms & Independent Clipping Scales
+        base_grad_list = [p.grad.detach() for _, p in base_named_params]
+        anchor_grad_list = [p.grad.detach() for _, p in anchor_named_params]
+
+        base_grad_norm = torch.norm(torch.stack([torch.norm(g, 2) for g in base_grad_list]), 2).item() if base_grad_list else 0.0
+        anchor_grad_norm = torch.norm(torch.stack([torch.norm(g, 2) for g in anchor_grad_list]), 2).item() if anchor_grad_list else 0.0
+        total_model_norm = math.sqrt(base_grad_norm**2 + anchor_grad_norm**2)
+
+        clip_scale_base = min(1.0, cfg.grad_clip / (base_grad_norm + 1e-6))
+        clip_scale_anchor = min(1.0, cfg.grad_clip / (anchor_grad_norm + 1e-6))
+        post_clip_anchor_grad = g_anchor_param * clip_scale_anchor
+
+        # GNN Backbone Component Breakdown
         gnn_grads = [
-            p.grad for n, p in model.named_parameters()
-            if p.grad is not None and any(k in n for k in ["gat_", "ctx_enc", "id_enc", "q_proj", "k_proj", "v_proj", "topic_proj", "spatial_bridge"])
+            p.grad for n, p in base_named_params
+            if any(k in n for k in ["gat_", "ctx_enc", "id_enc", "q_proj", "k_proj", "v_proj", "topic_proj", "spatial_bridge"])
         ]
         if gnn_grads:
             gnn_total_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in gnn_grads]), 2).item()
@@ -353,16 +376,22 @@ def run_chokepoint_diagnostics(
 
         ste_ratio = mean_g_dyn / (mean_g_raw + 1e-9)
 
-        all_grads = [p.grad for p in model.parameters() if p.grad is not None]
-        total_model_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in all_grads]), 2).item()
-        clip_scale = min(1.0, cfg.grad_clip / (total_model_norm + 1e-6))
-        post_clip_anchor_grad = g_anchor_param * clip_scale
+        # -------------------------------------------------------------
+        # INJECTED FIX: DECOUPLED INDEPENDENT GRADIENT CLIPPING
+        # -------------------------------------------------------------
+        # 1. Clip GNN backbone and projection heads
+        base_params = [p for _, p in base_named_params]
+        if base_params:
+            torch.nn.utils.clip_grad_norm_(base_params, max_norm=cfg.grad_clip)
+
+        # 2. Clip anchor dictionary independently so it retains its full update budget
+        anchor_params = [p for _, p in anchor_named_params]
+        if anchor_params:
+            torch.nn.utils.clip_grad_norm_(anchor_params, max_norm=cfg.grad_clip)
 
         # -------------------------------------------------------------
         # EXACT ADAMW SECOND-MOMENT & WEIGHT DECAY FORCE DECOMPOSITION
         # -------------------------------------------------------------
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
-
         anchor_group = optimizer.param_groups[1]
         lr = anchor_group["lr"]
         wd = anchor_group["weight_decay"]
@@ -373,7 +402,6 @@ def run_chokepoint_diagnostics(
         g_clipped = p_tensor.grad.detach()
         param_state = optimizer.state[p_tensor]
 
-        # Extract step counter safely
         raw_step = param_state.get("step", 0)
         current_step = (int(raw_step.item()) if isinstance(raw_step, torch.Tensor) else int(raw_step)) + 1
 
@@ -410,7 +438,8 @@ def run_chokepoint_diagnostics(
         telemetry["g_gnn_rms"].append(gnn_rms_norm)
         telemetry["g_total_model"].append(total_model_norm)
         telemetry["ste_jacobian_loss_ratio"].append(ste_ratio)
-        telemetry["clip_scale_factor"].append(clip_scale)
+        telemetry["clip_scale_base"].append(clip_scale_base)
+        telemetry["clip_scale_anchor"].append(clip_scale_anchor)
         telemetry["g_post_clip_anchor"].append(post_clip_anchor_grad)
         telemetry["adamw_true_grad_force"].append(norm_grad_force)
         telemetry["adamw_true_wd_force"].append(norm_wd_force)
@@ -421,8 +450,8 @@ def run_chokepoint_diagnostics(
             print(
                 f"  [Meta-Batch {step_idx+1:02d}/{len(meta_batches):02d}] "
                 f"||∇ Anchors||: {mean_g_raw:.2e} ➔ "
-                f"Clip Scale: {clip_scale:.4f} ➔ "
-                f"True AdamW Force: (Grad={norm_grad_force:.2e}, WD={norm_wd_force:.2e}, WD/Grad={wd_to_grad_ratio:.2f}x)"
+                f"Clip (Base: {clip_scale_base:.3f}, Anchor: {clip_scale_anchor:.3f}) ➔ "
+                f"AdamW Force: (Grad={norm_grad_force:.2e}, WD={norm_wd_force:.2e}, WD/Grad={wd_to_grad_ratio:.2f}x)"
             )
 
     # -------------------------------------------------------------
@@ -432,13 +461,14 @@ def run_chokepoint_diagnostics(
     max_logit_delta = (model.topic_gene_logits.detach() - initial_logits).abs().max().item()
 
     ste_loss_mean = float(np.mean(telemetry["ste_jacobian_loss_ratio"]))
-    clip_factor_mean = float(np.mean(telemetry["clip_scale_factor"]))
+    clip_base_mean = float(np.mean(telemetry["clip_scale_base"]))
+    clip_anchor_mean = float(np.mean(telemetry["clip_scale_anchor"]))
     total_model_norm_mean = float(np.mean(telemetry["g_total_model"]))
     wd_ratio_mean = float(np.mean(telemetry["wd_to_grad_force_ratio"]))
     cos_wd_mean = float(np.mean(telemetry["cos_sim_grad_vs_wd"]))
 
     print("\n" + "=" * 95)
-    print("📊 LIBELLA AUDIT RESULTS ACROSS 1 FULL EPOCH (EXACT SIMULATION)")
+    print("📊 LIBELLA AUDIT RESULTS (DECOUPLED CLIPPING VERIFIED)")
     print("=" * 95)
 
     print("\n1. BACKPROPAGATION CHAIN & GRADIENT SCALING:")
@@ -455,11 +485,13 @@ def run_chokepoint_diagnostics(
     else:
         print("     ↳ 🟢 HEALTHY: Jacobian transmission within expected operating bounds.")
 
-    print(f"   • Chokepoint B (Global Clipping Starvation): Mean Scale = {clip_factor_mean:.4f} (Model Norm = {total_model_norm_mean:.2f})")
-    if clip_factor_mean < 0.1:
-        print(f"     ↳ 🔴 SEVERE: Large backbone gradients trigger global clipping, scaling anchor updates to {clip_factor_mean*100:.2f}%.")
+    print(f"   • Chokepoint B (Decoupled Clipping Isolation):")
+    print(f"     - Base Backbone Clip Scale:   {clip_base_mean:.4f}")
+    print(f"     - Anchor Logits Clip Scale:  {clip_anchor_mean:.4f} (Budget Retention: {clip_anchor_mean*100:.1f}%)")
+    if clip_anchor_mean < 0.1:
+        print(f"     ↳ 🔴 SEVERE: Anchor parameter updates are being clipped heavily on their own.")
     else:
-        print("     ↳ 🟢 HEALTHY: Clipping threshold preserves update trajectory.")
+        print(f"     ↳ 🟢 HEALTHY: Anchor dictionary retains update capacity independent of backbone gradient spikes.")
 
     print(f"   • Chokepoint C (True AdamW Step Force Ratio): WD/Grad = {wd_ratio_mean:.3f}x (Cosine Similarity = {cos_wd_mean:+.3f})")
     if wd_ratio_mean > 1.0:
@@ -467,14 +499,14 @@ def run_chokepoint_diagnostics(
     else:
         print(f"     ↳ 🟢 HEALTHY: Gradient updates dominate weight decay ({1.0/max(1e-6, wd_ratio_mean):.1f}x gradient margin).")
 
-    print("\n3. TOTAL LOGIT DISPLACEMENT OVER 1 EPOCH:")
+    print("\n3. TOTAL LOGIT DISPLACEMENT OVER 1 FULL EPOCH:")
     print(f"   • Cumulative Matrix L2 Drift: ||ΔW||_2 = {delta_logits:.6e}")
     print(f"   • Max Single Logit Shift:     max|Δw|  = {max_logit_delta:.6e}")
     print("=" * 95 + "\n")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Libella Exact Autograd & Optimizer Chokepoint Diagnostic")
+    parser = argparse.ArgumentParser(description="Libella Exact Autograd & Decoupled Clipping Diagnostic")
     parser.add_argument(
         "--chunk-dir",
         type=str,
