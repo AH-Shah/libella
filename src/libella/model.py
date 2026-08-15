@@ -341,25 +341,18 @@ class LibellaGNN(nn.Module):
         
         with torch.no_grad():
             recon_mag = l_recon.item()
-            
-
-            lock_weight = max(0.05, 1.0 - (progress))
-        
+            lock_weight = max(0.05, 1.0 - progress)
             anc_scale = recon_mag * 0.1 * lock_weight 
-            
             kl_scale = recon_mag * 0.05
-            
             tsallis_weight = max(0.0, (progress - 0.5) * 2.0)
             tsallis_scale = recon_mag * 0.05 * tsallis_weight
 
         im_loss = (tsallis_h * tsallis_scale) + (kl_weight * kl_marginal * kl_scale)
-
         scaled_anc = l_anc * anc_scale        
-        scaled_ortho = l_ortho * (recon_mag * 0.05)
+        scaled_ortho = (l_ortho + collapse_penalty) * (recon_mag * 0.05)
         scaled_gene_ent = gene_entropy * (recon_mag * 0.01)
         
         base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent
-
 
         self._last_losses = {
             'rec': l_recon.item(), 'anc': l_anc.item(), 
