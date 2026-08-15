@@ -331,12 +331,14 @@ class LibellaGNN(nn.Module):
             tsallis_val = tsallis_h.item()
             p_mean = torch.clamp(f_norm.mean(dim=0), min=1e-5, max=1.0)
             
+            # Ensure KL divergence doesn't compute log(0.0)
             if target_f_dist is not None:
-                kl_marginal = (p_mean * (torch.log(p_mean) - torch.log(target_f_dist + 1e-9))).sum()
+                kl_target = torch.clamp(target_f_dist, min=1e-5)
+                kl_marginal = (p_mean * (torch.log(p_mean + 1e-9) - torch.log(kl_target + 1e-9))).sum()
             else:
                 K_topics = anchors.shape[0]
                 uniform_prior = torch.ones(K_topics, device=x_c.device) / K_topics
-                kl_marginal = (p_mean * (torch.log(p_mean) - torch.log(uniform_prior))).sum()
+                kl_marginal = (p_mean * (torch.log(p_mean + 1e-9) - torch.log(uniform_prior))).sum()
                 
         progress = ep / max(1, total_epochs - 1)
         
