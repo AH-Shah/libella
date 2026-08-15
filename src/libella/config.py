@@ -56,37 +56,37 @@ class RunConfig:
     gnn_shift_weight: float = 0.5
     train_noise: float = 0.05
     edge_dropout: float = 0.40
-    scale_start: float = 12.0
-    scale_end: float = 15.0
-    alpha_start: float = 1.4
-    alpha_end: float = 1.8
-    temp_start: float = 2.0
-    temp_end: float = 1.5
+    scale_start: float = 8.0
+    scale_end: float = 16.0
+    alpha_start: float = 1.2
+    alpha_end: float = 1.65
+    temp_start: float = 1.5
+    temp_end: float = 0.3
 
     # Loss & Regularization
     kl_weight: float = 5.0
     kl_base: float = 0.10
     kl_collapse_weight: float = 3.0
-    hub_threshold: float = 0.15
+    hub_threshold: float = 0.2
     anchor_peak_threshold: float = 0.80
     ortho_overlap_threshold: float = 0.25
     ortho_weight: float = 10.0
-    tsallis_alpha: float = 1.75
+    tsallis_alpha: float = 1.5
     delta_clamp: float = 30.0
     zero_mask_rate: float = 0.05
 
     # Optimizers
-    lr_base: float = 0.0001
+    lr_base: float = 0.001
     wd_base: float = 1e-4
-    lr_anchor: float = 0.001
-    wd_anchor: float = 1e-5
-    grad_clip: float = 100.0
+    lr_anchor: float = 0.005
+    wd_anchor: float = 0
+    grad_clip: float = 5.0
 
     # Inference & Topology
     entropy_pruning: bool = True
-    inference_scale: float = 15.0
-    inference_alpha: float = 1.5
-    inference_temp: float = 1.5
+    inference_scale: float = 16.0
+    inference_alpha: float = 1.65
+    inference_temp: float = 0.3
     inf_batch_size: int = 5000
     panel_overlap_thresh: float = 0.80
     radius_multiplier: float = 3.33
