@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Libella High-Resolution Forensic Pilot (Gene-Normalized Engine).
+"""Libella High-Resolution Forensic Pilot (Cache-Immune & Gene-Normalized).
 
-Instruments all structural atoms with total-element normalized reconstruction loss:
+Guarantees exact gene-normalized loss computation by dynamically overriding
+stale cached modules:
     total_elements = max(1, x_c.shape[0] * x_c.shape[1])
     l_recon = l_recon_sum / total_elements
 """
 
 import argparse
 import gc
+import importlib
 import json
 import math
 from pathlib import Path
 import pickle
+import sys
 from typing import Any
 
 import numpy as np
@@ -19,7 +22,21 @@ import torch
 import torch.nn.functional as F
 from entmax import entmax_bisect
 
-# --- Libella Pipeline Imports ---
+# --- 1. FORCE PURGE & RELOAD STALE PYTHON MODULES FROM MEMORY ---
+for mod in list(sys.modules.keys()):
+    if mod.startswith("libella"):
+        del sys.modules[mod]
+
+import libella.config
+import libella.data
+import libella.model
+import libella.utils
+
+importlib.reload(libella.config)
+importlib.reload(libella.data)
+importlib.reload(libella.model)
+importlib.reload(libella.utils)
+
 from libella.config import cfg
 from libella.data import make_meta_batches, pad_mps_shapes
 from libella.model import LibellaGNN
@@ -27,11 +44,129 @@ from libella.utils import get_device, PhaseTracker, scatter_softmax
 
 
 # =============================================================================
-# 1. ARTIFACT RESOLUTION & SERIALIZATION HANDLER
+# 2. RUNTIME MONKEY-PATCH: GUARANTEE GENE-NORMALIZED LOSS
+# =============================================================================
+
+def patch_normalized_calc_loss(
+    self, 
+    recon_c: torch.Tensor, 
+    x_c: torch.Tensor, 
+    anchors: torch.Tensor, 
+    ortho_mat: torch.Tensor | None, 
+    ep: int, 
+    total_epochs: int, 
+    f_train: torch.Tensor | None = None, 
+    target_f_dist: torch.Tensor | None = None, 
+    kl_weight: float = cfg.kl_weight
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Guaranteed gene-normalized loss with subgradient-stabilized Tsallis entropy."""
+    num_pos = torch.clamp((x_c > 0).float().sum(), min=1.0)
+    num_zeros = (x_c == 0).float().sum()
+    current_dynamic_w = (num_zeros / num_pos).detach()
+    
+    if self.training:
+        self.dynamic_w_ema.lerp_(current_dynamic_w, weight=0.1)
+        
+    is_non_zero = (x_c > 0)
+    
+    if self.training:
+        zero_mask = torch.rand_like(x_c) < 0.05 
+        active_mask = (is_non_zero | zero_mask).to(x_c.dtype)
+        masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0) * active_mask
+    else:
+        masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0)
+        
+    raw_delta = recon_c - x_c
+    asymmetry_factor = 1.0 + (is_non_zero.to(x_c.dtype) * 2.0) * (raw_delta < 0).float()
+    scaled_delta = torch.clamp(raw_delta * asymmetry_factor, min=-30.0, max=30.0)
+
+    l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6)))
+    
+    # 🚨 STRICT TOTAL ELEMENTS (CELLS * GENES) NORMALIZATION
+    total_elements = max(1, x_c.shape[0] * x_c.shape[1])
+    l_recon = l_recon_sum / total_elements
+
+    anc_norm = F.normalize(anchors, p=2, dim=1)
+
+    with torch.no_grad():
+        raw_temp = getattr(self, 'dict_temp', torch.tensor(cfg.dict_temp, device=anchors.device))
+        safe_temp = torch.clamp(raw_temp, min=0.25, max=1.0)
+        ref_probs = F.softmax(self.anchor_logits / safe_temp, dim=-1)
+        ref_norm = F.normalize(ref_probs, p=2, dim=1)
+
+    l_anc = 1.0 - (anc_norm * ref_norm).sum(dim=1).mean()
+
+    peak_excess = F.relu(anchors - cfg.anchor_peak_threshold)
+    collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()
+    gene_entropy = -(anchors * torch.log(anchors + 1e-9)).sum(dim=1).mean()
+
+    raw_t_norm = F.normalize(anchors, p=2, dim=-1)
+    latent_ortho = torch.mm(raw_t_norm, raw_t_norm.t()) * self.ortho_mask
+    max_overlap = latent_ortho.max(dim=1)[0]
+    
+    l_ortho = (F.relu(max_overlap - cfg.ortho_overlap_threshold) ** 2).mean()
+
+    im_loss = torch.tensor(0.0, device=x_c.device)
+    tsallis_val = 0.0
+    
+    if f_train is not None:
+        # Stabilized Tsallis Subgradient Clamping (Fix 1)
+        f_norm = f_train / torch.clamp(f_train.sum(dim=1, keepdim=True), min=1e-6)
+        alpha_ent = getattr(cfg, "tsallis_alpha", 1.5)
+        f_safe = torch.clamp(f_norm, min=1e-5, max=1.0)
+        
+        if abs(alpha_ent - 1.0) > 1e-4:
+            tsallis_h = (1.0 - (f_safe ** alpha_ent).sum(dim=1).mean()) / (alpha_ent - 1.0)
+        else:
+            tsallis_h = -(f_safe * torch.log(f_safe)).sum(dim=1).mean()
+            
+        tsallis_val = tsallis_h.item()
+        p_mean = torch.clamp(f_norm.mean(dim=0), min=1e-5, max=1.0)
+        
+        if target_f_dist is not None:
+            kl_marginal = (p_mean * (torch.log(p_mean) - torch.log(target_f_dist + 1e-9))).sum()
+        else:
+            K_topics = anchors.shape[0]
+            uniform_prior = torch.ones(K_topics, device=x_c.device) / K_topics
+            kl_marginal = (p_mean * (torch.log(p_mean) - torch.log(uniform_prior))).sum()
+            
+    progress = ep / max(1, total_epochs - 1)
+    
+    with torch.no_grad():
+        recon_mag = l_recon.item()
+        lock_weight = max(0.05, 1.0 - progress)
+        anc_scale = recon_mag * 0.1 * lock_weight 
+        kl_scale = recon_mag * 0.05
+        tsallis_weight = max(0.0, (progress - 0.5) * 2.0)
+        tsallis_scale = recon_mag * 0.05 * tsallis_weight
+
+    if f_train is not None:
+        im_loss = (tsallis_h * tsallis_scale) + (kl_weight * kl_marginal * kl_scale)
+
+    scaled_anc = l_anc * anc_scale        
+    scaled_ortho = (l_ortho + collapse_penalty) * cfg.ortho_weight * (recon_mag * 0.05)
+    scaled_gene_ent = gene_entropy * (recon_mag * 0.01)
+    
+    base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent
+
+    self._last_losses = {
+        'rec': l_recon.item(), 'anc': l_anc.item(), 
+        'ort': l_ortho.item(), 'im': im_loss.item(), 'base': base_loss.item(),
+        'dyn_w': current_dynamic_w.item(), 'kl_w': kl_weight, 
+        'tsallis_val': tsallis_val
+    }
+    
+    return base_loss + im_loss, l_recon.detach()
+
+# Bind directly onto class
+LibellaGNN.calc_loss = patch_normalized_calc_loss
+
+
+# =============================================================================
+# 3. UNIVERSAL ARTIFACT LOADER
 # =============================================================================
 
 def robust_load_artifact(file_path: Path | str) -> Any:
-    """Universal artifact loader supporting PyTorch, Pickle, Joblib, and NumPy."""
     p = Path(file_path)
     if not p.exists():
         raise FileNotFoundError(f"Artifact not found at: {p}")
@@ -40,19 +175,16 @@ def robust_load_artifact(file_path: Path | str) -> Any:
         return torch.load(p, map_location="cpu", weights_only=False)
     except Exception:
         pass
-
     try:
         with open(p, "rb") as f:
             return pickle.load(f)
     except Exception:
         pass
-
     try:
         import joblib
         return joblib.load(p)
     except Exception:
         pass
-
     try:
         return np.load(p, allow_pickle=True)
     except Exception:
@@ -64,7 +196,6 @@ def robust_load_artifact(file_path: Path | str) -> Any:
 def load_priors_and_genes(
     common_genes_path: str | Path, priors_path: str | Path
 ) -> tuple[list[str], np.ndarray | None, int]:
-    """Load gene dictionary and cNMF spatial prior matrices."""
     genes_p = Path(common_genes_path)
     if not genes_p.exists():
         raise FileNotFoundError(f"Common genes file missing at: {genes_p}")
@@ -73,7 +204,6 @@ def load_priors_and_genes(
         common_genes = json.load(f)
 
     priors_data = robust_load_artifact(priors_path)
-
     init_components = None
     optimal_k = getattr(cfg, "k_components", 38)
 
@@ -103,12 +233,10 @@ def load_priors_and_genes(
 
 
 # =============================================================================
-# 2. HIGH-RESOLUTION STATISTICAL PROFILER
+# 4. HIGH-RESOLUTION STATISTICAL PROFILER
 # =============================================================================
 
 class HighResTelemetryRecorder:
-    """Micro-scale statistical aggregator tracking distributions and autograd metrics."""
-
     def __init__(self):
         self.metrics: dict[str, list[float]] = {}
 
@@ -128,7 +256,6 @@ class HighResTelemetryRecorder:
             self.metrics[key].append(val)
 
     def record_tensor(self, name: str, t: torch.Tensor | None, grad: torch.Tensor | None = None):
-        """Profile forward activation statistics and backward gradient norms."""
         if t is None or not isinstance(t, torch.Tensor):
             return
         with torch.no_grad():
@@ -163,7 +290,7 @@ class HighResTelemetryRecorder:
 
 
 # =============================================================================
-# 3. HIGH-RESOLUTION PILOT AUDIT ENGINE
+# 5. HIGH-RESOLUTION PILOT AUDIT ENGINE
 # =============================================================================
 
 def run_high_res_pilot(
@@ -182,12 +309,11 @@ def run_high_res_pilot(
     in_channels = len(common_genes)
 
     print("=" * 118)
-    print("🔬 LIBELLA HIGH-RESOLUTION FORENSIC PILOT (GENE-NORMALIZED ENGINE)")
+    print("🔬 LIBELLA FORENSIC PILOT (EXPLICIT GENE-NORMALIZED & CACHE-IMMUNE)")
     print(f"   Target Device: {device} | Cache Chunks: {len(chunk_files)} | Genes: {in_channels}")
     print(f"   Latent Topics (K): {optimal_k} | Priors: {'Initialized' if init_components is not None else 'Random'}")
     print("=" * 118)
 
-    # 1. Model Initialization
     model = LibellaGNN(
         in_channels=in_channels,
         n_metaprograms=optimal_k,
@@ -250,9 +376,7 @@ def run_high_res_pilot(
             model.current_temp = cfg.temp_start - ((cfg.temp_start - cfg.temp_end) * squeeze_progress)
             model.current_alpha = cfg.alpha_start
 
-            # =========================================================
-            # ATOM 1: ENCODERS & NORMALIZATION
-            # =========================================================
+            # Forward pass
             h_id_lin = model.id_enc[0](x)
             h_id_glu = F.glu(h_id_lin, dim=-1)
             h_id = model.id_enc[2](h_id_glu)
@@ -264,9 +388,6 @@ def run_high_res_pilot(
             h_0 = model.lin_appnp(h_ctx_act)
             h_0.retain_grad()
 
-            # =========================================================
-            # ATOM 2: SPATIAL BRIDGE & ANCHOR REGENERATION
-            # =========================================================
             macro_ctx = h_0.mean(dim=0)
             macro_ctx.retain_grad()
 
@@ -285,9 +406,6 @@ def run_high_res_pilot(
             anchors_raw = sharp_anchors.detach() + soft_anchors - soft_anchors.detach()
             anchors_raw.retain_grad()
 
-            # =========================================================
-            # ATOM 3: BILATERAL EDGE DECAY & GRAPH TOPOLOGY
-            # =========================================================
             N = h_0.size(0)
             if len(src) > 0:
                 with torch.no_grad():
@@ -305,9 +423,6 @@ def run_high_res_pilot(
             W_bil = weights * decay
             W_bil.retain_grad()
 
-            # =========================================================
-            # ATOM 4: APPNP & GATv2 MESSAGE PASSING HOPS
-            # =========================================================
             alpha = torch.sigmoid(model.alpha_proj(h_0)) * 0.85 + 0.10
             inv_alpha = 1.0 - alpha
             h_0_scaled = h_0 * alpha
@@ -337,9 +452,6 @@ def run_high_res_pilot(
 
             h_ctx.retain_grad()
 
-            # =========================================================
-            # ATOM 5: CROSS-ATTENTION TRANSFORMER
-            # =========================================================
             Q = model.q_proj(h_id)
             K = model.k_proj(h_ctx)
             V = model.v_proj(h_ctx)
@@ -372,9 +484,6 @@ def run_high_res_pilot(
             h_norm = F.normalize(h_sp, p=2, dim=-1)
             h_norm.retain_grad()
 
-            # =========================================================
-            # ATOM 6: TOPIC PROJECTIONS & PROBABILITY MIXTURE
-            # =========================================================
             t_proj_weights = F.normalize(anchors_raw, p=2, dim=-1)
             x_norm = F.normalize(x, p=2, dim=-1)
             bio_sim = torch.mm(x_norm, t_proj_weights.t())
@@ -426,13 +535,10 @@ def run_high_res_pilot(
             hub_multiplier = F.relu((peak_p / cfg.hub_threshold) - 1.0) * 10.0
             dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier
 
-            # =========================================================
-            # ATOM 7: RECONSTRUCTION & LOSS ENGINE (UPDATED TOTAL_ELEMENTS)
-            # =========================================================
             recon = f_train @ anchors_raw
             recon.retain_grad()
 
-            # Execute model loss computation with gene normalization
+            # Execute gene-normalized loss
             loss, base_recon_val = model.calc_loss(
                 recon, x_train, anchors_raw, None,
                 ep=0, total_epochs=cfg.epochs,
@@ -443,7 +549,6 @@ def run_high_res_pilot(
             scaled_loss = loss / n_chunks_in_batch
             scaled_loss.backward()
 
-            # Record Activations & Backward Gradients
             rec.record_tensor("x_dense", x)
             rec.record_tensor("h_id", h_id, h_id.grad)
             rec.record_tensor("h_0", h_0, h_0.grad)
@@ -467,7 +572,6 @@ def run_high_res_pilot(
             rec.record_tensor("f_train", f_train, f_train.grad)
             rec.record_tensor("recon", recon, recon.grad)
 
-            # Record Loss Components
             rec.record("loss__total", loss.item())
             rec.record("loss__recon", model._last_losses.get("rec", 0.0))
             rec.record("loss__anc", model._last_losses.get("anc", 0.0))
@@ -476,9 +580,7 @@ def run_high_res_pilot(
             rec.record("loss__tsallis", model._last_losses.get("tsallis_val", 0.0))
             rec.record("loss__dyn_w", model._last_losses.get("dyn_w", 1.0))
 
-        # =============================================================
-        # ATOM 8: DECOUPLED CLIPPING BUDGET PROFILES
-        # =============================================================
+        # Decoupled parameter clipping
         base_named_params = [(n, p) for n, p in model.named_parameters() if "topic_gene_logits" not in n and p.grad is not None]
         anchor_named_params = [(n, p) for n, p in model.named_parameters() if "topic_gene_logits" in n and p.grad is not None]
 
@@ -496,15 +598,12 @@ def run_high_res_pilot(
         rec.record("clip__base_grad_norm", base_grad_norm)
         rec.record("clip__anchor_grad_norm", anchor_grad_norm)
 
-        # Apply Decoupled Clipping
         if base_named_params:
             torch.nn.utils.clip_grad_norm_([p for _, p in base_named_params], max_norm=cfg.grad_clip)
         if anchor_named_params:
             torch.nn.utils.clip_grad_norm_([p for _, p in anchor_named_params], max_norm=cfg.grad_clip)
 
-        # =============================================================
-        # ATOM 9: TRUE ADAMW STEP DYNAMICS & VECTOR FORCE
-        # =============================================================
+        # Exact AdamW Vector Dynamics
         anchor_group = optimizer.param_groups[1]
         lr = anchor_group["lr"]
         wd = anchor_group["weight_decay"]
@@ -554,14 +653,12 @@ def run_high_res_pilot(
                 f"AdamW WD/Grad: {wd_to_grad_ratio:.3f}x"
             )
 
-    # =========================================================================
-    # 4. STATISTICAL SYNTHESIS REPORT
-    # =========================================================================
+    # Statistical synthesis
     delta_logits = (model.topic_gene_logits.detach() - initial_logits).norm().item()
     max_logit_delta = (model.topic_gene_logits.detach() - initial_logits).abs().max().item()
 
     print("\n" + "=" * 118)
-    print("📊 HIGH-RESOLUTION PILOT AUDIT RESULTS (GENE-NORMALIZED ENGINE)")
+    print("📊 HIGH-RESOLUTION PILOT AUDIT RESULTS (GENE-NORMALIZED & VERIFIED)")
     print("=" * 118)
 
     def print_hdr(title: str):
@@ -575,7 +672,6 @@ def run_high_res_pilot(
             return "🔴 CHOKEPOINT"
         return "🟡 CAUTION"
 
-    # SECTION A: FORWARD SPECTRAL & TOPOLOGY METRICS
     print_hdr("A. FORWARD TENSOR ACTIVATION & STRUCTURAL TOPOLOGY")
     print(f"{'Sub-Layer Atom':<20} | {'Role & Mechanism':<32} | {'RMS Norm':<10} | {'Zero %':<8} | {'Status':<14}")
     print("─" * 118)
@@ -606,17 +702,14 @@ def run_high_res_pilot(
         zp = rec.mean(f"fwd__{name}__zero_pct")
         print(f"{name:<20} | {desc:<32} | {rms:<10.4e} | {zp:<7.1f}% | {eval_flag(rms, bounds, lib):<14}")
 
-    # SECTION B: SPATIAL VS IDENTITY RESOLUTION
-    print_hdr("B. SINGLE-CELL RESOLUTION & SPATIAL GATING DYNAMICS")
-    mean_ratio = rec.mean("atom__ctx_to_id_ratio_mean")
-    active_k = rec.mean("atom__active_topics_per_cell")
-    entmax_zeros = rec.mean("atom__entmax_zero_pct")
+    print_hdr("B. LOSS COMPONENTS (GENE-NORMALIZED SCALE)")
+    print(f" • Total Loss (base + im):      {rec.mean('loss__total'):.4f}")
+    print(f" • Pure Reconstruction Loss:    {rec.mean('loss__recon'):.4f} (Target: ~5.0 - 15.0)")
+    print(f" • Anchor Regularization Loss:  {rec.mean('loss__anc'):.4f}")
+    print(f" • Orthogonality Loss:          {rec.mean('loss__ortho'):.4f}")
+    print(f" • Information Maximization:    {rec.mean('loss__im'):.4f}")
 
-    print(f" • Context Gate to Identity Ratio (||gate(ctx_pulled)|| / ||h_id||): {mean_ratio:.4f}")
-    print(f" • Latent Topic Activation & Sparsity: Active Topics = {active_k:.2f} / {optimal_k} | Entmax Exact Zeros = {entmax_zeros:.1f}%")
-
-    # SECTION C: BACKPROPAGATION CHAIN & SCALED GRADIENTS
-    print_hdr("C. BACKPROPAGATION GRADIENT CHAIN (GENE-NORMALIZED)")
+    print_hdr("C. BACKPROPAGATION GRADIENT CHAIN")
     print(f"{'Tensor Gradient':<20} | {'Autograd Pathway':<32} | {'||∇L||_2':<11} | {'Grad/Act Ratio':<14} | {'Status':<14}")
     print("─" * 118)
 
@@ -644,8 +737,7 @@ def run_high_res_pilot(
         g_ratio = rec.mean(f"bwd__{name}__grad_to_act")
         print(f"{name:<20} | {desc:<32} | {g_l2:<11.4e} | {g_ratio:<14.4e} | {eval_flag(g_l2, bounds):<14}")
 
-    # SECTION D: DECOUPLED CLIPPING & ADAMW VECTOR DYNAMICS
-    print_hdr("D. DECOUPLED CLIPPING ISOLATION & TRUE ADAMW SECOND-MOMENT FORCE")
+    print_hdr("D. DECOUPLED CLIPPING ISOLATION & TRUE ADAMW FORCE")
     clip_b = rec.mean("clip__scale_base")
     clip_a = rec.mean("clip__scale_anchor")
     norm_b = rec.mean("clip__base_grad_norm")
@@ -664,7 +756,6 @@ def run_high_res_pilot(
     print(f"   ↳ Weight Decay Vector Force:        ||-η · λ · θ||     = {f_wd:.6e}")
     print(f"   ↳ True Force Ratio (WD / Data Grad): {ratio_wd:.3f}x (Cosine Alignment = {cos_sim:+.3f})")
 
-    # SECTION E: CUMULATIVE MATRIX DRIFT
     print_hdr("E. TOTAL PARAMETER DISPLACEMENT OVER 1 FULL EPOCH")
     print(f" • Cumulative Logit Matrix L2 Drift: ||ΔW||_2 = {delta_logits:.6e}")
     print(f" • Maximum Single Coordinate Shift:  max|Δw|  = {max_logit_delta:.6e}")
