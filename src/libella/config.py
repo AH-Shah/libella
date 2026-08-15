@@ -78,8 +78,8 @@ class RunConfig:
     # Optimizers
     lr_base: float = 0.001
     wd_base: float = 1e-4
-    lr_anchor: float = 0.005
-    wd_anchor: float = 1e-5
+    lr_anchor: float = 0.001
+    wd_anchor: float = 1e-4
     grad_clip: float = 5.0
 
     # Inference & Topology
