@@ -59,7 +59,7 @@ class RunConfig:
     scale_start: float = 12.0
     scale_end: float = 15.0
     alpha_start: float = 1.4
-    alpha_end: float = 1.7
+    alpha_end: float = 1.6
     temp_start: float = 2.0
     temp_end: float = 1.5
 
