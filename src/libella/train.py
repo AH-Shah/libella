@@ -502,21 +502,10 @@ def train_gnn(
 ) -> tuple[LibellaGNN, dict[str, list], int]:
     """Master orchestrator for GNN training phase."""
     out_dirs = paths.make_dirs(cfg.suffix)
-    final_path = out_dirs["checkpoint"]
+    checkpoint_path = out_dirs["checkpoint"]
 
-    if final_path.exists():
-        print(f"-> Completed model checkpoint found at {final_path}. Loading final state...")
-        checkpoint = torch.load(final_path, map_location=get_device(), weights_only=False)
-        
-        _, optimal_k, _ = get_priors(graph_paths)
-        
-
-        model, optimizer, scheduler, _, _, history, _ = _init_model(
-            common_genes, optimal_k, None, checkpoint
-        )
-        return model, history, optimal_k
-
-    init_components, optimal_k, checkpoint = get_priors(graph_paths)
+    # 1. Get priors/slots as normal
+    init_components, optimal_k, _ = get_priors(graph_paths)
     
     if cfg.phase == "EXTRACT_PRIORS":
         print("\n[✓] Phase 'EXTRACT_PRIORS' complete. Exiting before training.")
@@ -532,12 +521,14 @@ def train_gnn(
         optimal_k += n_extra_slots
     gc.collect()
 
+    # 2. _init_model will automatically check resume_latest.pt or checkpoint_path
     model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
-        common_genes, optimal_k, init_components, checkpoint
+        common_genes, optimal_k, init_components, checkpoint_path
     )
-    del checkpoint, init_components
+    del init_components
     gc.collect()
 
+    # 3. Only skip if all epochs were actually completed
     if start_epoch >= cfg.epochs:
         print(f"-> Training already reached target epoch ({start_epoch}/{cfg.epochs}). Skipping loop.")
         return model, history, optimal_k
@@ -545,10 +536,10 @@ def train_gnn(
     training_cache = _prep_ssd_chunks(graph_paths)
     gc.collect()  
 
+    # 4. Resume training loop from start_epoch
     model, history = _train_loop(
         model, optimizer, scheduler, training_cache, start_epoch, best_composite_score, tracker_state, history
     )
     gc.collect()
     
     return model, history, optimal_k
-    
