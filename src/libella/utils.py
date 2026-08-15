@@ -163,7 +163,7 @@ class PhaseTracker:
         # -----------------------------------------------------------------
         if self.phase == 2:
             # Dynamic Ceiling: min 2.5% budget, expanding up to 2*sigma noise floor
-            dynamic_tolerance = max(self.best_rec_loss * 0.025, 2.0 * rec_noise_std)
+            dynamic_tolerance = max(self.best_rec_loss * 0.05, 2.5 * rec_noise_std)
             loss_ceiling = self.best_rec_loss + dynamic_tolerance
 
             # Smooth mean evaluated against ceiling prevents single-batch outlier braking
