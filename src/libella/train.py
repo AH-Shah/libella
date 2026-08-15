@@ -352,7 +352,7 @@ def _train_loop(
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
                         val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
-                        val_log_cosh = val_loss_sum / max(1, x_val.shape[0])
+                        val_log_cosh = val_loss_sum / max(1, x_val.numel())
                     
                         val_loss_acc += val_log_cosh.detach()
                         val_steps += 1
