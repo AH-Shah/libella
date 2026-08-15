@@ -177,7 +177,7 @@ class PhaseTracker:
             # -------------------------------------------------------------
             if self.internal_progress >= 1.0:
                 # 1. P_W slope flattened (< +0.03% gain per epoch)
-                pw_saturated = (pw_slope < 0.03)
+                pw_saturated = (pw_slope < 0.1)
                 
                 # 2. Rec loss change is smaller than half a standard deviation of noise
                 rec_saturated = (abs(expected_drop) < max(1.0, rec_noise_std * 0.5))
