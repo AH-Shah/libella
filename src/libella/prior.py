@@ -1,9 +1,6 @@
-"""Biological prior extraction and dictionary learning for spatial metaprograms."""
-
 import ast
-import gc
 import json
-from concurrent.futures import ThreadPoolExecutor
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,384 +8,293 @@ import joblib
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-import torch
+import scanpy as sc
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.decomposition import MiniBatchDictionaryLearning
 from sklearn.feature_extraction.text import TfidfTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
 
-from .config import NOISE_REGEX, cfg, paths
-from .data import pt_to_scipy_csr
-from .utils import get_device
+# ==============================================================================
+# 1. Configuration & Paths (Adjust if needed)
+# ==============================================================================
+genes_path = Path("/Users/Hemato/project_3/benchmark/benchmark_output/libella/run/common_genes.json")
+h5ad_path = Path("/Users/Hemato/project_3/benchmark/benchmark_data.h5ad")
 
+# Locate signatures.csv (adjust if in a different subfolder)
+sig_csv_candidates = [
+    Path("/Users/Hemato/project_3/benchmark/signatures.csv"),
+    Path("/Users/Hemato/project_3/signatures.csv"),
+    Path("/Users/Hemato/project_3/benchmark/benchmark_output/libella/run/signatures.csv"),
+]
+sig_csv_path = next((p for p in sig_csv_candidates if p.exists()), sig_csv_candidates[0])
 
-def _parse_nouns(
-    genes_path: Path, sig_csv_path: Path
-) -> tuple[np.ndarray, list[str], list[str]]:
-    """Parse and prune biological signature CSV into a clean matrix."""
-    with open(genes_path, "r") as f:
-        target_genes: list[str] = json.load(f)
+# Parameters
+N_PRIOR_LINEAGES = 25
+MIN_GENES_NOUN = 15
+MAX_GENES_NOUN = 100
+CONSENSUS_FREQ = 0.30  # Gene must appear in >= 30% of merged child lineages
+TOP_K_ADJECTIVES = 35
+MAX_JACCARD_TO_NOUN = 0.25
+MAX_JACCARD_INTERNAL = 0.35
+N_DICT_COMPONENTS = 30
 
-    gene2idx = {g: i for i, g in enumerate(target_genes)}
-    n_target_genes = len(target_genes)
+NOISE_REGEX = re.compile(r"^(MT-|RPS|RPL|HSP|MALAT1|NEAT1)", re.IGNORECASE)
 
+# ==============================================================================
+# 2. Step 1: Parse Raw Signatures
+# ==============================================================================
+print("=" * 110)
+print("STEP 1: PARSING RAW SIGNATURES")
+print("=" * 110)
+
+with open(genes_path, "r") as f:
+    genes_data = json.load(f)
+target_genes = [str(g) for g in (genes_data if isinstance(genes_data, list) else genes_data.get("genes", list(genes_data.values())))]
+gene2idx = {g: i for i, g in enumerate(target_genes)}
+n_target_genes = len(target_genes)
+
+if not sig_csv_path.exists():
+    print(f"[!] Warning: Signature CSV not found at {sig_csv_path}. Please check the path.")
+    sig_df = pd.DataFrame(columns=["Cell_type", "Genes"])
+else:
     sig_df = pd.read_csv(sig_csv_path)
-    n_lineages = len(sig_df)
-    lineage_names = sig_df["Cell_type"].tolist() if "Cell_type" in sig_df.columns else [f"Lineage_{i}" for i in range(n_lineages)]
 
-    atlas_matrix = np.zeros((n_lineages, n_target_genes), dtype=np.float32)
+n_lineages = len(sig_df)
+lineage_names = (
+    sig_df["Cell_type"].tolist()
+    if "Cell_type" in sig_df.columns
+    else [f"Lineage_{i}" for i in range(n_lineages)]
+)
 
-    for i, (_, row) in enumerate(sig_df.iterrows()):
-        raw_genes_str = row["Genes"]
-        if pd.isna(raw_genes_str):
+atlas_matrix = np.zeros((n_lineages, n_target_genes), dtype=np.float32)
+
+for i, (_, row) in enumerate(sig_df.iterrows()):
+    raw_genes_str = row.get("Genes", "")
+    if pd.isna(raw_genes_str) or not raw_genes_str:
+        continue
+    try:
+        genes_list = ast.literal_eval(str(raw_genes_str))
+    except (ValueError, SyntaxError):
+        genes_list = [g.strip() for g in str(raw_genes_str).split(",")]
+
+    for g in genes_list:
+        g_clean = str(g).strip()
+        if NOISE_REGEX.match(g_clean):
             continue
+        if g_clean in gene2idx:
+            atlas_matrix[i, gene2idx[g_clean]] = 1.0
 
-        try:
-            genes_list = ast.literal_eval(raw_genes_str)
-        except (ValueError, SyntaxError):
-            genes_list = [g.strip() for g in str(raw_genes_str).split(",")]
+print(f"Loaded {n_lineages} raw lineages across {n_target_genes} target genes.")
 
-        for g in genes_list:
-            g_clean = str(g).strip()
-            if NOISE_REGEX.match(g_clean):
-                continue
-            if g_clean in gene2idx:
-                atlas_matrix[i, gene2idx[g_clean]] = 1.0
+# ==============================================================================
+# 3. Step 2: Consensus Compression of Nouns (Logging Merges & Trims)
+# ==============================================================================
+print("\n" + "=" * 110)
+print(f"STEP 2: NOUN COMPRESSION AUDIT (Target Clusters: {N_PRIOR_LINEAGES})")
+print("=" * 110)
 
-    return atlas_matrix, target_genes, lineage_names
+clusterer = AgglomerativeClustering(
+    n_clusters=min(N_PRIOR_LINEAGES, n_lineages), metric="jaccard", linkage="average"
+)
+cluster_labels = clusterer.fit_predict(atlas_matrix)
 
+noun_records = []
+valid_nouns = []
 
-def _compress_nouns(
-    atlas_matrix: np.ndarray, 
-    lineage_names: list[str], 
-    target_genes: list[str], 
-    n_clusters: int = 30
-) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Compress signature hierarchy using Agglomerative Clustering."""
-    clusterer = AgglomerativeClustering(
-        n_clusters=n_clusters, metric="jaccard", linkage="average"
-    )
-    cluster_labels = clusterer.fit_predict(atlas_matrix)
+for cluster_id in range(clusterer.n_clusters):
+    child_indices = np.where(cluster_labels == cluster_id)[0]
+    child_matrix = atlas_matrix[child_indices]
+    n_children = len(child_indices)
+    child_names = [lineage_names[i] for i in child_indices]
 
-    n_genes = atlas_matrix.shape[1]
-    nouns = np.zeros((n_clusters, n_genes), dtype=np.float32)
-    noun_reports = []
+    # Raw union count vs Consensus count
+    union_indices = np.where(np.max(child_matrix, axis=0) > 0)[0]
+    raw_union_count = len(union_indices)
+    
+    gene_frequencies = np.sum(child_matrix, axis=0)
 
-    for cluster_id in range(n_clusters):
-        child_indices = np.where(cluster_labels == cluster_id)[0]
-        child_matrix = atlas_matrix[child_indices]
-        nouns[cluster_id] = np.max(child_matrix, axis=0)
+    if n_children > 1:
+        # Consensus: >= 30% recurrence
+        consensus_mask = (gene_frequencies / n_children) >= CONSENSUS_FREQ
+        active_indices = np.where(consensus_mask)[0]
+    else:
+        active_indices = np.where(gene_frequencies > 0)[0]
 
-        gene_freqs = np.sum(child_matrix, axis=0)
-        top5_gene_idx = np.argsort(-gene_freqs)[:5]
-        top5_genes = [target_genes[idx] for idx in top5_gene_idx if gene_freqs[idx] > 0]
+    # Size clamping
+    status = "Merged & Trimmed" if n_children > 1 else "Single Lineage"
+    trimmed_fringe = raw_union_count - len(active_indices)
 
-        if len(top5_genes) < 5:
-            noun_nonzero = np.where(nouns[cluster_id] > 0)[0]
-            for idx in noun_nonzero:
-                g = target_genes[idx]
-                if g not in top5_genes:
-                    top5_genes.append(g)
-                if len(top5_genes) == 5:
-                    break
-
-        child_state_names = [lineage_names[i] for i in child_indices]
-        noun_reports.append({
-            "cluster_id": cluster_id,
-            "n_child_states": len(child_indices),
-            "child_states": child_state_names,
-            "top_5_genes": top5_genes
-        })
-
-    return nouns, noun_reports
-
-
-def _get_raw_adjs(graph_paths: list[Path]) -> np.ndarray:
-    """Extract raw spatial adjacency dictionaries via MiniBatchDictionaryLearning."""
-    def process_graph(path: Path) -> sp.csr_matrix:
-        data = torch.load(path, map_location="cpu", weights_only=False)
-
-        if hasattr(data, "y_raw") and getattr(data.y_raw, "is_sparse", False):
-            y_local = pt_to_scipy_csr(data, "y_raw")
+    if len(active_indices) > MAX_GENES_NOUN:
+        top_k_idx = np.argsort(-gene_frequencies[active_indices])[:MAX_GENES_NOUN]
+        active_indices = active_indices[top_k_idx]
+        status += f" (Capped at {MAX_GENES_NOUN})"
+    elif len(active_indices) < MIN_GENES_NOUN:
+        if raw_union_count >= MIN_GENES_NOUN:
+            active_indices = np.argsort(-gene_frequencies)[:MIN_GENES_NOUN]
+            status += f" (Expanded to min {MIN_GENES_NOUN})"
         else:
-            y_local = data.y_raw.copy()
-        del data
-
-        n_cells = y_local.shape[0]
-        if y_local.nnz > 0:
-            cap = np.percentile(y_local.data, 95)
-            np.clip(y_local.data, 0, cap, out=y_local.data)
-
-        tfidf = TfidfTransformer(norm="l2", sublinear_tf=True)
-        y_processed = tfidf.fit_transform(y_local).astype(np.float32, copy=False)
-
-        max_priors_cells = cfg.prior_cells_per_sample
-
-        if n_cells > max_priors_cells:
-            idx = np.random.RandomState(42).choice(
-                n_cells, max_priors_cells, replace=False
-            )
-            y_processed = y_processed[idx]
-
-        return sp.csr_matrix(y_processed)
-
-    reservoir_list = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        for res in tqdm(
-            executor.map(process_graph, graph_paths),
-            total=len(graph_paths),
-            desc="Extracting Spatial Cohort Matrices",
-            leave=False,
-        ):
-            reservoir_list.append(res)
-
-    union_matrix_scaled = sp.vstack(reservoir_list)
-    del reservoir_list
-    gc.collect()
-
-    n_total_cells = union_matrix_scaled.shape[0]
-    if n_total_cells > 200000:
-        X_csc = union_matrix_scaled.tocsc()
-        top_indices = set()
-        cells_per_gene = 2000
-
-        for i in range(X_csc.shape[1]):
-            start_idx, end_idx = X_csc.indptr[i], X_csc.indptr[i + 1]
-            data = X_csc.data[start_idx:end_idx]
-            cell_indices = X_csc.indices[start_idx:end_idx]
-
-            if len(data) > cells_per_gene:
-                top_idx = np.argpartition(data, -cells_per_gene)[-cells_per_gene:]
-                top_indices.update(cell_indices[top_idx])
-            else:
-                top_indices.update(cell_indices)
-
-        selected_cells = np.array(list(top_indices))
-        union_matrix_scaled = union_matrix_scaled[selected_cells]
-        del X_csc, selected_cells, top_indices
-        gc.collect()
-
-    X_dense = union_matrix_scaled.toarray()
-    del union_matrix_scaled
-    gc.collect()
-
-    dict_learner = MiniBatchDictionaryLearning(
-        n_components=cfg.n_dict_components, alpha=2.0, random_state=42, max_iter=100
-    )
-    dict_learner.fit(X_dense)
-
-    raw_spatial_topics = np.abs(dict_learner.components_)
-    del X_dense
-    gc.collect()
-
-    return raw_spatial_topics
-
-
-def _apply_sieve(
-    raw_spatial_topics: np.ndarray, nouns: np.ndarray, target_genes: list[str]
-) -> tuple[np.ndarray, dict[str, int], list[dict[str, Any]]]:
-    """Sieve raw topics to extract orthogonal spatial adjectives."""
-    sim_matrix = cosine_similarity(raw_spatial_topics, nouns)
-    candidate_adjectives = []
-    candidate_reports = []
-
-    n_mapped = 0
-    n_chimeras = 0
-    n_other_discarded = 0
-
-    for i in range(raw_spatial_topics.shape[0]):
-        topic_sims = sim_matrix[i]
-        max_sim = np.max(topic_sims)
-        num_sim_above_15 = np.sum(topic_sims > 0.15)
-
-        if max_sim > 0.10:
-            n_mapped += 1
+            status = f"PRUNED: Micro-cluster (< {MIN_GENES_NOUN} total genes)"
+            noun_records.append({
+                "Cluster": cluster_id,
+                "N_Children": n_children,
+                "Child_Lineages": ", ".join(child_names[:3]) + (f" (+{n_children-3})" if n_children > 3 else ""),
+                "Raw_Union": raw_union_count,
+                "Consensus_N": 0,
+                "Trimmed_Fringe": raw_union_count,
+                "Status": status,
+                "Top_5_Genes": "None"
+            })
             continue
 
-        if num_sim_above_15 >= 2:
-            n_chimeras += 1
-            continue
+    noun_vec = np.zeros(n_target_genes, dtype=np.float32)
+    noun_vec[active_indices] = 1.0
+    valid_nouns.append(noun_vec)
 
-        if max_sim < 0.10:
-            topic_weights = raw_spatial_topics[i]
-            bin_topic = np.zeros_like(topic_weights, dtype=np.float32)
+    top5_idx = np.argsort(-gene_frequencies[active_indices])[:5]
+    top5_genes = [target_genes[active_indices[idx]] for idx in top5_idx]
 
-            top35_idx = np.argpartition(topic_weights, -35)[-35:]
-            bin_topic[top35_idx] = 1.0
+    noun_records.append({
+        "Cluster": cluster_id,
+        "N_Children": n_children,
+        "Child_Lineages": ", ".join(child_names[:2]) + (f" (+{n_children-2})" if n_children > 2 else ""),
+        "Raw_Union": raw_union_count,
+        "Consensus_N": len(active_indices),
+        "Trimmed_Fringe": trimmed_fringe,
+        "Status": status,
+        "Top_5_Genes": ", ".join(top5_genes)
+    })
 
-            candidate_adjectives.append(bin_topic)
+nouns_matrix = np.array(valid_nouns, dtype=np.float32)
+df_nouns = pd.DataFrame(noun_records)
 
-            top10_idx = np.argsort(-topic_weights)[:10]
-            top10_genes = [target_genes[idx] for idx in top10_idx]
-            candidate_reports.append({
-                "topic_id": i,
-                "top_10_genes": top10_genes,
-                "top10_set": set(top10_genes)
+print(df_nouns[["Cluster", "N_Children", "Raw_Union", "Consensus_N", "Trimmed_Fringe", "Status", "Top_5_Genes"]].to_string(index=False))
+print(f"\nRetained Nouns: {nouns_matrix.shape[0]} / {clusterer.n_clusters} clusters (Mean genes/noun: {nouns_matrix.sum(axis=1).mean():.1f})")
+
+# ==============================================================================
+# 4. Step 3: Spatial Dictionary Learning & Orthogonal Sieve
+# ==============================================================================
+print("\n" + "=" * 110)
+print(f"STEP 3: SPATIAL DICTIONARY LEARNING & ORTHOGONAL SIEVE")
+print("=" * 110)
+
+# Extract spatial topics from AnnData expression background
+print("Extracting spatial dictionary components from dataset background...")
+adata = sc.read_h5ad(h5ad_path, backed="r")
+valid_h5_genes = [g for g in target_genes if g in adata.var_names]
+sub_X = adata[:, valid_h5_genes].to_memory().X
+
+if sp.issparse(sub_X):
+    X_sample = sub_X[:50000].tocsr().astype(np.float32)
+else:
+    X_sample = sp.csr_matrix(sub_X[:50000], dtype=np.float32)
+
+tfidf = TfidfTransformer(norm="l2", sublinear_tf=True)
+X_tfidf = tfidf.fit_transform(X_sample)
+
+dict_learner = MiniBatchDictionaryLearning(
+    n_components=N_DICT_COMPONENTS, alpha=2.0, random_state=42, max_iter=100
+)
+dict_learner.fit(X_tfidf.toarray())
+raw_spatial_topics = np.abs(dict_learner.components_)
+
+# Align raw dictionary topics to target_genes index space
+h5_to_target = [gene2idx[g] for g in valid_h5_genes]
+aligned_topics = np.zeros((raw_spatial_topics.shape[0], n_target_genes), dtype=np.float32)
+for local_idx, global_idx in enumerate(h5_to_target):
+    aligned_topics[:, global_idx] = raw_spatial_topics[:, local_idx]
+
+# Sieve execution
+noun_sets = [set(np.where(nouns_matrix[i] > 0)[0]) for i in range(nouns_matrix.shape[0])]
+candidate_adjectives = []
+
+sieve_records = []
+
+for i in range(aligned_topics.shape[0]):
+    weights = aligned_topics[i]
+    top_indices = set(np.argpartition(weights, -TOP_K_ADJECTIVES)[-TOP_K_ADJECTIVES:])
+    
+    top10_idx = np.argsort(-weights)[:5]
+    top5_genes = [target_genes[idx] for idx in top10_idx]
+
+    # 1. Jaccard against all Nouns
+    jaccards_to_nouns = [
+        (len(top_indices.intersection(n_s)) / len(top_indices.union(n_s)), n_idx)
+        for n_idx, n_s in enumerate(noun_sets)
+    ]
+    max_noun_jaccard, matched_noun = max(jaccards_to_nouns, key=lambda x: x[0])
+
+    if max_noun_jaccard >= MAX_JACCARD_TO_NOUN:
+        sieve_records.append({
+            "Topic": f"Topic_{i:02d}",
+            "Max_Noun_Jaccard": f"{max_noun_jaccard:.2f} (Noun_{matched_noun:02d})",
+            "Internal_Jaccard": "-",
+            "Decision": f"DISCARDED: Redundant with Noun {matched_noun:02d}",
+            "Top_5_Genes": ", ".join(top5_genes)
+        })
+        continue
+
+    bin_topic = np.zeros(n_target_genes, dtype=np.float32)
+    bin_topic[list(top_indices)] = 1.0
+    candidate_adjectives.append((bin_topic, top_indices, i, top5_genes, max_noun_jaccard, matched_noun))
+
+# 2. Internal Orthogonal Sieve among candidate adjectives
+accepted_adjectives = []
+accepted_sets = []
+
+for bin_vec, gene_set, topic_id, top5_genes, max_n_jac, matched_n in candidate_adjectives:
+    if not accepted_sets:
+        accepted_adjectives.append(bin_vec)
+        accepted_sets.append(gene_set)
+        sieve_records.append({
+            "Topic": f"Topic_{topic_id:02d}",
+            "Max_Noun_Jaccard": f"{max_n_jac:.2f} (Noun_{matched_n:02d})",
+            "Internal_Jaccard": "0.00 (First)",
+            "Decision": "KEPT: Orthogonal Spatial Adjective",
+            "Top_5_Genes": ", ".join(top5_genes)
+        })
+    else:
+        internal_jaccards = [
+            (len(gene_set.intersection(s)) / len(gene_set.union(s)), idx)
+            for idx, s in enumerate(accepted_sets)
+        ]
+        max_internal_jaccard, matched_adj = max(internal_jaccards, key=lambda x: x[0])
+
+        if max_internal_jaccard >= MAX_JACCARD_INTERNAL:
+            sieve_records.append({
+                "Topic": f"Topic_{topic_id:02d}",
+                "Max_Noun_Jaccard": f"{max_n_jac:.2f} (Noun_{matched_n:02d})",
+                "Internal_Jaccard": f"{max_internal_jaccard:.2f} (Adj_{matched_adj:02d})",
+                "Decision": f"DISCARDED: Internal Duplicate of Adj_{matched_adj:02d}",
+                "Top_5_Genes": ", ".join(top5_genes)
             })
         else:
-            n_other_discarded += 1
+            accepted_adjectives.append(bin_vec)
+            accepted_sets.append(gene_set)
+            sieve_records.append({
+                "Topic": f"Topic_{topic_id:02d}",
+                "Max_Noun_Jaccard": f"{max_n_jac:.2f} (Noun_{matched_n:02d})",
+                "Internal_Jaccard": f"{max_internal_jaccard:.2f}",
+                "Decision": "KEPT: Orthogonal Spatial Adjective",
+                "Top_5_Genes": ", ".join(top5_genes)
+            })
 
-    if len(candidate_adjectives) > 0:
-        adj_matrix = np.array(candidate_adjectives, dtype=np.float32)
-        n_candidates = adj_matrix.shape[0]
-        keep_mask = np.ones(n_candidates, dtype=bool)
+df_sieve = pd.DataFrame(sieve_records)
+print(df_sieve.to_string(index=False))
 
-        for i in range(n_candidates):
-            if not keep_mask[i]:
-                continue
-            for j in range(i + 1, n_candidates):
-                if not keep_mask[j]:
-                    continue
+# ==============================================================================
+# 5. Final Assembly Inspection
+# ==============================================================================
+if accepted_adjectives:
+    adjectives_matrix = np.array(accepted_adjectives, dtype=np.float32)
+    final_priors = np.vstack([nouns_matrix, adjectives_matrix])
+else:
+    final_priors = nouns_matrix
 
-                # 1. Check overlap on top 35 binarized genes
-                overlap_35 = np.dot(adj_matrix[i], adj_matrix[j])  # Number of shared genes out of 35
-
-                # 2. Check overlap on top 10 marker genes
-                overlap_10 = len(candidate_reports[i]["top10_set"].intersection(candidate_reports[j]["top10_set"]))
-
-                # Purge if >= 50% top-35 overlap (>=18 genes) OR >= 4 top-10 genes overlap
-                if overlap_35 >= 10 or overlap_10 >= 2:
-                    keep_mask[j] = False
-
-        final_adjectives = adj_matrix[keep_mask]
-        final_reports = [rep for rep, keep in zip(candidate_reports, keep_mask) if keep]
-        n_redundant = int(np.sum(~keep_mask))
-    else:
-        final_adjectives = np.empty((0, nouns.shape[1]), dtype=np.float32)
-        final_reports = []
-        n_redundant = 0
-
-    sieve_stats = {
-        "n_mapped": n_mapped,
-        "n_chimeras": n_chimeras,
-        "n_other_discarded": n_other_discarded,
-        "n_redundant": n_redundant,
-        "n_kept": final_adjectives.shape[0]
-    }
-
-    return final_adjectives, sieve_stats, final_reports
-
-
-def _write_report(
-    noun_reports: list[dict[str, Any]], 
-    sieve_stats: dict[str, int], 
-    adjective_reports: list[dict[str, Any]], 
-    report_path: Path
-) -> None:
-    """Write extraction logs and statistics to a report text file."""
-    lines = ["[NOUNS]"]
-    for nr in noun_reports:
-        top_g = ",".join(nr["top_5_genes"])
-        states = ",".join(nr["child_states"])
-        lines.append(f"N{nr['cluster_id']:02d}|n={nr['n_child_states']:02d}|top=[{top_g}]|states=[{states}]")
-
-    lines.append("\n[SIEVE_STATS]")
-    lines.append(
-        f"mapped={sieve_stats['n_mapped']}|chimera={sieve_stats['n_chimeras']}|"
-        f"redundant={sieve_stats['n_redundant']}|intermediate={sieve_stats['n_other_discarded']}|"
-        f"kept={sieve_stats['n_kept']}"
-    )
-
-    lines.append("\n[ADJECTIVES]")
-    for idx, ar in enumerate(adjective_reports):
-        top_g = ",".join(ar["top_10_genes"])
-        lines.append(f"A{idx:02d}|raw_topic={ar['topic_id']:02d}|top10=[{top_g}]")
-
-    report_path.write_text("\n".join(lines))
-
-
-def get_priors(
-    graph_paths: list[Path]
-) -> tuple[np.ndarray | None, int | None, dict[str, Any] | None]:
-    """Load or extract biological priors for the Libella model."""
-    checkpoint = None
-    optimal_k = None
-    init_components = None
-    
-    out_dirs = paths.make_dirs(cfg.suffix)
-    checkpoint_path = out_dirs["checkpoint"]
-    cnmf_priors_path = out_dirs["cnmf_priors"]
-    genes_path = out_dirs["genes"]
-    out_dir = out_dirs["out"]
-
-    if checkpoint_path.exists() and not cfg.force_retrain:
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=get_device(), weights_only=False)
-            optimal_k = checkpoint["model_state_dict"]["topic_gene_logits"].shape[0]
-        except Exception:
-            checkpoint = None
-
-    if cnmf_priors_path.exists():
-        try:
-            init_components = joblib.load(cnmf_priors_path)
-            optimal_k = init_components.shape[0]
-            print(f"[✓] Loaded Priors (K={optimal_k})")
-        except Exception:
-            init_components = None
-
-    if init_components is None:
-        print("  ↳ Extracting Biological Priors...")
-
-        raw_spatial_topics = _get_raw_adjs(graph_paths)
-
-        if cfg.unsupervised:
-            print("  ↳ [!] UNSUPERVISED MODE: Bypassing signatures.csv.")
-            # Rely entirely on the spatial dictionary components as the base K
-            init_components = raw_spatial_topics
-            optimal_k = init_components.shape[0]
-            print(f"  ↳ Extracted {optimal_k} unsupervised spatial dictionary components.")
-        else:
-            atlas_matrix, target_genes, lineage_names = _parse_nouns(
-                genes_path, paths.sig_csv
-            )
-            # Plug in the configurable lineage limit
-            nouns, noun_reports = _compress_nouns(
-                atlas_matrix, lineage_names, target_genes, n_clusters=cfg.n_prior_lineages
-            )
-
-            orthogonal_adjectives, sieve_stats, adjective_reports = _apply_sieve(
-                raw_spatial_topics, nouns, target_genes
-            )
-
-            if len(orthogonal_adjectives) > 0:
-                init_components = np.vstack([nouns, orthogonal_adjectives])
-            else:
-                init_components = nouns
-
-            optimal_k = init_components.shape[0]
-
-            x_pelka = nouns.shape[0]
-            y_dict = orthogonal_adjectives.shape[0]
-            print(f"  ↳ {x_pelka} compressed lineages + {y_dict} dict addition prior is sealed (Base K={optimal_k}).")
-
-            report_path = out_dir / "prior.txt"
-            _write_report(noun_reports, sieve_stats, adjective_reports, report_path)
-
-        try:
-            if init_components is not None:
-                joblib.dump(init_components, cnmf_priors_path)
-        except Exception:
-            pass
-
-        if len(orthogonal_adjectives) > 0:
-            init_components = np.vstack([nouns, orthogonal_adjectives])
-        else:
-            init_components = nouns
-
-        optimal_k = init_components.shape[0]
-
-        x_pelka = nouns.shape[0]
-        y_dict = orthogonal_adjectives.shape[0]
-        print(f"  ↳ {x_pelka} pelka lineages + {y_dict} dict addition prior is sealed.")
-
-        report_path = out_dir / "prior.txt"
-        _write_report(noun_reports, sieve_stats, adjective_reports, report_path)
-
-        try:
-            joblib.dump(init_components, cnmf_priors_path)
-        except Exception:
-            pass
-
-    return init_components, optimal_k, checkpoint
-    
+print("\n" + "=" * 110)
+print(f"FINAL GNN PRIOR ASSEMBLY SUMMARY (Total K = {final_priors.shape[0]})")
+print("=" * 110)
+print(f"• Bounded Nouns:       {nouns_matrix.shape[0]} modules (Gene sizes: min={nouns_matrix.sum(axis=1).min():.0f}, max={nouns_matrix.sum(axis=1).max():.0f})")
+print(f"• Spatial Adjectives:  {len(accepted_adjectives)} modules (Fixed size: {TOP_K_ADJECTIVES})")
+print(f"• Mega-Blobs (> 100):  {np.sum(final_priors.sum(axis=1) > 100)} (Target: 0)")
+print(f"• Micro-Sets (< 15):   {np.sum(final_priors.sum(axis=1) < 15)} (Target: 0)")
+print(f"• Prior Matrix Shape:  {final_priors.shape[0]} Topics x {final_priors.shape[1]} Target Genes")
+print("=" * 110)
