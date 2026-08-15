@@ -59,7 +59,7 @@ class RunConfig:
     scale_start: float = 8.0
     scale_end: float = 16.0
     alpha_start: float = 1.2
-    alpha_end: float = 1.65
+    alpha_end: float = 1.7
     temp_start: float = 1.5
     temp_end: float = 0.3
 
@@ -86,7 +86,7 @@ class RunConfig:
     entropy_pruning: bool = True
     inference_scale: float = 16.0
     inference_alpha: float = 1.65
-    inference_temp: float = 0.5
+    inference_temp: float = 0.3
     inf_batch_size: int = 5000
     panel_overlap_thresh: float = 0.80
     radius_multiplier: float = 3.33
