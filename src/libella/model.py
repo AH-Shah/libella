@@ -353,13 +353,18 @@ class LibellaGNN(nn.Module):
         scaled_ortho = (l_ortho + collapse_penalty) * (recon_mag * 0.05)
         scaled_gene_ent = gene_entropy * (recon_mag * 0.01)
         
-        base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent
+        l_aux_highway = torch.tensor(0.0, device=x_c.device)
+        if self.training and getattr(self, '_smooth_frac', None) is not None and train_idx is not None:
+            smooth_recon = self._smooth_frac[train_idx] @ anchors
+            l_aux_highway = F.mse_loss(smooth_recon, x_c) * 0.15
+
+        base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent + l_aux_highway
 
         self._last_losses = {
             'rec': l_recon.item(), 'anc': l_anc.item(), 
             'ort': l_ortho.item(), 'im': im_loss.item(), 'base': base_loss.item(),
             'dyn_w': current_dynamic_w.item(), 'kl_w': kl_weight, 
-            'tsallis_val': tsallis_val
+            'tsallis_val': tsallis_val, 'aux_hwy': l_aux_highway.item()
         }
 
         return (base_loss + im_loss, l_recon.detach(), l_anc.detach(), l_ortho.detach())

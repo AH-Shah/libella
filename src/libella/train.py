@@ -303,7 +303,8 @@ def _train_loop(
                 
                 true_batch_loss, base_recon_val, base_anc_val, base_ort_val = model.calc_loss(
                     recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
-                    f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w
+                    f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w,
+                    train_idx=train_idx
                 )
 
                 if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
