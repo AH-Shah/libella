@@ -228,20 +228,20 @@ class LibellaGNN(nn.Module):
         progress = getattr(self, 'current_progress', 1.0)
         
         sparse_prob = entmax_bisect(logits, alpha=current_alpha, dim=1)
+        mag = x_dense.sum(dim=1, keepdim=True) 
         
         if self.training:
             smooth_prob = F.softmax(logits / current_temp, dim=1)
-            
             smooth_weight = 0.50 - (0.45 * progress)
             sparse_weight = 1.0 - smooth_weight
-            
             prob = (sparse_weight * sparse_prob) + (smooth_weight * smooth_prob)
+            # Alt 4: Cache dense attribution stream for auxiliary gradient highway
+            self._smooth_frac = F.softmax(logits / 1.5, dim=1) * mag
         else:
             prob = sparse_prob 
+            self._smooth_frac = None
         
-        mag = x_dense.sum(dim=1, keepdim=True) 
         frac = prob * mag
-        
         return frac, anchors_raw
 
     def calc_loss(
@@ -254,7 +254,8 @@ class LibellaGNN(nn.Module):
         total_epochs: int, 
         f_train: torch.Tensor | None = None, 
         target_f_dist: torch.Tensor | None = None, 
-        kl_weight: float = cfg.kl_weight
+        kl_weight: float = cfg.kl_weight,
+        train_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate regularized reconstruction loss."""
         num_pos = torch.clamp((x_c > 0).float().sum(), min=1.0)
