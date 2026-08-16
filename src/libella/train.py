@@ -296,7 +296,7 @@ def _train_loop(
                 collapse_ratio = torch.clamp(1.0 - (ema_entropy / max_entropy_scalar), min=0.0, max=1.0)
 
                 peak_p = ema_mean.max()
-                hub_multiplier = F.relu((peak_p / cfg.hub_threshold) - 1.0) * 10.0 
+                hub_multiplier = F.relu((peak_p / cfg.hub_threshold) - 1.0) * 50.0 
 
                 dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier 
 

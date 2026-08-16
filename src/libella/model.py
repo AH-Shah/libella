@@ -294,14 +294,16 @@ class LibellaGNN(nn.Module):
 
         l_anc = 1.0 - (anc_norm * ref_norm).sum(dim=1).mean()
 
-        latent_ortho = torch.mm(anc_norm, anc_norm.t())
-        
-        
-        latent_ortho = latent_ortho * self.ortho_mask
+        latent_ortho = torch.mm(anc_norm, anc_norm.t()) * self.ortho_mask
 
-        max_overlap = latent_ortho.max(dim=1)[0]
+        l_pairwise = (
+            F.relu(latent_ortho - cfg.ortho_overlap_threshold) ** 2
+        ).sum() / anchors.size(0)
 
-        l_ortho = (F.relu(max_overlap - cfg.ortho_overlap_threshold) ** 2).mean()
+        l_frobenius = (latent_ortho**2).sum() / (anchors.size(0) * (anchors.size(0)-1))
+
+
+        l_ortho = l_pairwise + 0.10 * l_frobenius
 
         peak_excess = F.relu(anchors - cfg.anchor_peak_threshold)
         collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()

@@ -81,29 +81,61 @@ def _compress_nouns(
     atlas_matrix: np.ndarray,
     lineage_names: list[str],
     target_genes: list[str],
-    n_clusters: int = 25,
+    n_clusters: int | None = 25,
+    distance_threshold: float | None = 0.60,
     min_genes: int = 10,
     max_genes: int = 100,
     consensus_freq: float = 0.30,
+    **kwargs: Any,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Compress signature hierarchy using Agglomerative Clustering with consensus trimming."""
+    """
+    Compresses single-cell lineage signatures into distinct, non-redundant
+    biological priors using Jaccard distance agglomerative clustering.
+    
+    Supports both dynamic distance thresholding (default 0.60) and fixed n_clusters.
+    """
     n_lineages, n_genes = atlas_matrix.shape
     if n_lineages == 0:
         return np.empty((0, n_genes), dtype=np.float32), []
 
-    actual_k = min(n_clusters, n_lineages)
-    if actual_k <= 1:
-        cluster_labels = np.zeros(n_lineages, dtype=int)
-    else:
+    # Handle singleton lineage
+    if n_lineages == 1:
+        active_indices = np.where(atlas_matrix[0] > 0)[0]
+        noun_vec = np.zeros(n_genes, dtype=np.float32)
+        noun_vec[active_indices] = 1.0
+        report = [{
+            "cluster_id": 0,
+            "n_child_states": 1,
+            "child_states": lineage_names,
+            "top_5_genes": [target_genes[i] for i in active_indices[:5]],
+            "n_genes": len(active_indices),
+        }]
+        return np.array([noun_vec], dtype=np.float32), report
+
+    # Hierarchical clustering on Jaccard distances
+    # Prefers distance_threshold for natural lineage splitting (CD4/CD8/NK separation)
+    if distance_threshold is not None:
         clusterer = AgglomerativeClustering(
-            n_clusters=actual_k, metric="jaccard", linkage="average"
+            n_clusters=None,
+            distance_threshold=distance_threshold,
+            metric="jaccard",
+            linkage="average",
         )
-        cluster_labels = clusterer.fit_predict(atlas_matrix)
+    else:
+        k_target = min(n_clusters if n_clusters is not None else 25, n_lineages)
+        clusterer = AgglomerativeClustering(
+            n_clusters=k_target,
+            metric="jaccard",
+            linkage="average",
+        )
+
+    cluster_labels = clusterer.fit_predict(atlas_matrix)
+    unique_clusters = np.unique(cluster_labels)
 
     valid_nouns = []
     noun_reports = []
 
-    for cluster_id in range(actual_k):
+    for cluster_id in unique_clusters:
         child_indices = np.where(cluster_labels == cluster_id)[0]
         if len(child_indices) == 0:
             continue
@@ -113,7 +145,7 @@ def _compress_nouns(
         gene_frequencies = np.sum(child_matrix, axis=0)
         raw_union_count = int(np.sum(gene_frequencies > 0))
 
-        # 1. Consensus selection
+        # 1. Consensus selection across sub-lineages
         if n_children > 1:
             consensus_mask = (gene_frequencies / n_children) >= consensus_freq
             active_indices = np.where(consensus_mask)[0]
@@ -126,9 +158,10 @@ def _compress_nouns(
             active_indices = active_indices[top_k_idx]
         elif len(active_indices) < min_genes:
             if raw_union_count >= min_genes:
+                # Fallback to top most frequent genes across union
                 active_indices = np.argsort(-gene_frequencies)[:min_genes]
             else:
-                # Prune fragile micro-clusters (< min_genes total)
+                # Prune noisy micro-clusters with insufficient marker depth
                 continue
 
         noun_vec = np.zeros(n_genes, dtype=np.float32)
@@ -137,23 +170,17 @@ def _compress_nouns(
 
         top5_gene_idx = np.argsort(-gene_frequencies[active_indices])[:5]
         top5_genes = [target_genes[active_indices[idx]] for idx in top5_gene_idx]
-
         child_state_names = [lineage_names[i] for i in child_indices]
-        noun_reports.append(
-            {
-                "cluster_id": len(valid_nouns) - 1,
-                "n_child_states": n_children,
-                "child_states": child_state_names,
-                "top_5_genes": top5_genes,
-                "n_genes": len(active_indices),
-            }
-        )
 
-    if valid_nouns:
-        nouns = np.array(valid_nouns, dtype=np.float32)
-    else:
-        nouns = np.empty((0, n_genes), dtype=np.float32)
+        noun_reports.append({
+            "cluster_id": len(valid_nouns) - 1,
+            "n_child_states": n_children,
+            "child_states": child_state_names,
+            "top_5_genes": top5_genes,
+            "n_genes": len(active_indices),
+        })
 
+    nouns = np.array(valid_nouns, dtype=np.float32) if valid_nouns else np.empty((0, n_genes), dtype=np.float32)
     return nouns, noun_reports
 
 
@@ -254,8 +281,8 @@ def _apply_sieve(
     nouns: np.ndarray,
     target_genes: list[str],
     top_k_genes: int = 35,
-    max_noun_overlap: float = 0.35,
-    max_internal_overlap: float = 0.30,
+    max_noun_overlap: float = 0.20,
+    max_internal_overlap: float = 0.25,
     max_total_adjectives: int = 8,
 ) -> tuple[np.ndarray, dict[str, int], list[dict[str, Any]]]:
     """Sieve raw topics to extract orthogonal spatial adjectives using overlap metrics."""

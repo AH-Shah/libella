@@ -64,13 +64,13 @@ class RunConfig:
     temp_end: float = 0.3
 
     # Loss & Regularization
-    kl_weight: float = 2.5
-    kl_base: float = 0.10
+    kl_weight: float = 5
+    kl_base: float = 0.25
     kl_collapse_weight: float = 3.0
-    hub_threshold: float = 0.4
+    hub_threshold: float = 0.2
     anchor_peak_threshold: float = 0.50
     ortho_weight: float = 10.0
-    ortho_overlap_threshold: float = 0.25
+    ortho_overlap_threshold: float = 0.15
     tsallis_alpha: float = 1.5
     delta_clamp: float = 30.0
     zero_mask_rate: float = 0.05

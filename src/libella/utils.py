@@ -74,9 +74,9 @@ from typing import Dict, List, Optional, Tuple
 class PhaseTracker:
     def __init__(
         self,
-        cycle_window: int = 6,        # Cut window from 12 -> 6 (responds 2x faster)
+        cycle_window: int = 8,        # Cut window from 12 -> 6 (responds 2x faster)
         target_pw: float = 70.0,
-        rel_tolerance: float = 0.06,  # 6% reconstruction budget ceiling
+        rel_tolerance: float = 0.1,  # 6% reconstruction budget ceiling
         max_p1_epochs: int = 20,      
     ) -> None:
         self.phase: int = 1
@@ -93,7 +93,7 @@ class PhaseTracker:
         
         # Faster ramp dynamics
         self.pressure: float = 0.0
-        self.squeeze_momentum: float = 0.05   # Step size 0.05 (ramps in ~20 epochs instead of 80)
+        self.squeeze_momentum: float = 0.04   # Step size 0.05 (ramps in ~20 epochs instead of 80)
         self.breathing_cooldown: int = 0
         
         self.saturation_streak: int = 0
@@ -181,7 +181,7 @@ class PhaseTracker:
                 release_amount = 0.04 * severity
                 self.pressure = max(0.10, self.pressure - release_amount)
                 self.squeeze_momentum = 0.008  # Reset momentum to cautious
-                self.breathing_cooldown = 2    # Hold pressure for 2 epochs to recover
+                self.breathing_cooldown = 3    # Hold pressure for 2 epochs to recover
                 self.saturation_streak = 0
             
             # SAFE TO SQUEEZE: Loss is healthy inside the manifold envelope
