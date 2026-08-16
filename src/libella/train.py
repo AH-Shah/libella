@@ -209,7 +209,7 @@ def _train_loop(
     tracker = PhaseTracker()
     if tracker_state is not None:
         tracker.__dict__.update(tracker_state)
-        print(f"  ↳ Restored PhaseTracker state (Phase {tracker.phase}, Progress: {tracker.internal_progress:.2f})")
+        print(f"  ↳ Restored PhaseTracker state (Phase {tracker.phase}, Pressure: {tracker.pressure:.2f}, Progress: {tracker.get_progress():.2f})")
         
     tqdm.write("\n[*] Adaptive Scheduler Initialized...")
     
@@ -265,6 +265,7 @@ def _train_loop(
                     dst = dst.to(torch.int64)
 
                 prog = tracker.get_progress()
+                model.current_progress = prog
                 model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * (prog ** 0.8))
                 model.current_temp = cfg.temp_end + ((cfg.temp_start - cfg.temp_end) * ((1.0 - prog) ** 1.5))
                 model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * prog)
@@ -304,7 +305,7 @@ def _train_loop(
                 true_batch_loss, base_recon_val, base_anc_val, base_ort_val = model.calc_loss(
                     recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
                     f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w,
-                    train_idx=train_idx
+                    progress=prog
                 )
 
                 if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
@@ -352,10 +353,8 @@ def _train_loop(
                         asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * 2.0) * (raw_delta_val < 0).to(x_val.dtype)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
-                        val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
-                        val_log_cosh = val_loss_sum / max(1, x_val.numel())
-                    
-                        val_loss_acc += val_log_cosh.detach()
+                        val_loss_sum = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
+                        val_loss_acc += (val_loss_sum / max(1, x_val.numel())).detach()
                         val_steps += 1
                         
                     del val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
@@ -433,11 +432,12 @@ def _train_loop(
         # 1. Pareto Composite Quality Checkpointing (Strict Score Trigger)
         # -------------------------------------------------------------
         current_rec = epoch_telemetry.get("l_rec", float("inf"))
-        current_pw = epoch_telemetry.get("p_w", 0.0)
-        composite_score = current_rec / max(1.0, math.sqrt(current_pw / 100.0))
+        current_pw = max(1e-3, epoch_telemetry.get("p_w", 0.0))
+        pw_fraction = current_pw / 100.0
+        composite_score = current_rec / math.sqrt(pw_fraction)
 
-        # Saves checkpoint ONLY when a new true Pareto peak is achieved
-        if composite_score < best_composite_score and not nan_detected:
+        is_in_phase2 = (tracker.phase == 2 or current_pw >= 40.0)
+        if is_in_phase2 and composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
             torch.save({
                 "epoch": epoch,
@@ -503,10 +503,12 @@ def _train_loop(
                 tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
                 break
 
-    if checkpoint_path.exists():
-        print(f"  ↳ Restoring in-memory model to best Pareto checkpoint ({checkpoint_path.name})...")
+    if checkpoint_path.exists() and best_composite_score < float("inf"):
+        print(f"  ↳ Restoring in-memory model to best Pareto Phase 2 checkpoint ({checkpoint_path.name})...")
         best_ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(best_ckpt["model_state_dict"])
+    else:
+        print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
     return model, history
 

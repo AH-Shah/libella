@@ -121,7 +121,7 @@ class LibellaGNN(nn.Module):
         soft_anchors = F.softmax(dynamic_logits, dim=-1)
         
 
-        safe_temp = torch.clamp(getattr(self, 'dict_temp', torch.tensor(0.30)), min=0.25, max=1.0)
+        safe_temp = torch.clamp(self.dict_temp, min=0.25, max=1.0)
         sharp_anchors = F.softmax(dynamic_logits / safe_temp, dim=-1)
         
         anchors_raw = sharp_anchors.detach() + soft_anchors - soft_anchors.detach()
@@ -251,8 +251,10 @@ class LibellaGNN(nn.Module):
         total_epochs: int, 
         f_train: torch.Tensor | None = None, 
         target_f_dist: torch.Tensor | None = None, 
-        kl_weight: float = cfg.kl_weight
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kl_weight: float = cfg.kl_weight,
+        progress: float | None = None,
+        **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Calculate regularized reconstruction loss."""
         num_pos = torch.clamp((x_c > 0).float().sum(), min=1.0)
         num_zeros = (x_c == 0).float().sum()
@@ -304,8 +306,7 @@ class LibellaGNN(nn.Module):
         peak_excess = F.relu(anchors - cfg.anchor_peak_threshold)
         collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()
         gene_entropy = -(anchors * torch.log(anchors + 1e-9)).sum(dim=1).mean()
-        scaled_ortho = (l_ortho + collapse_penalty) * cfg.ortho_weight
-        scaled_gene_ent = gene_entropy * 0.1
+        
 
         im_loss = torch.tensor(0.0, device=x_c.device)
         tsallis_val = 0.0
@@ -334,7 +335,9 @@ class LibellaGNN(nn.Module):
                 uniform_prior = torch.ones(K_topics, device=x_c.device) / K_topics
                 kl_marginal = (p_mean * (torch.log(p_mean + 1e-9) - torch.log(uniform_prior))).sum()
                 
-        progress = ep / max(1, total_epochs - 1)
+        if progress is None:
+            progress = ep / max(1, total_epochs - 1)        
+        
         
         with torch.no_grad():
             recon_mag = l_recon.item()
@@ -345,8 +348,10 @@ class LibellaGNN(nn.Module):
             tsallis_scale = recon_mag * 0.05 * tsallis_weight
 
         im_loss = (tsallis_h * tsallis_scale) + (kl_weight * kl_marginal * kl_scale)
-        scaled_anc = l_anc * anc_scale        
-        scaled_ortho = (l_ortho + collapse_penalty) * (recon_mag * 0.05)
+        scaled_anc = l_anc * anc_scale
+                
+        ortho_multiplier = recon_mag * (0.05 + 0.10 * progress)
+        scaled_ortho = (l_ortho + collapse_penalty) * ortho_multiplier * cfg.ortho_weight
         scaled_gene_ent = gene_entropy * (recon_mag * 0.01)
         
         base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent

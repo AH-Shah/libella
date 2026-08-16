@@ -51,7 +51,7 @@ class RunConfig:
     prior_cells_per_sample: int = 5_000_000
     
     # Model Physics & Schedules
-    dict_temp: float = 0.20
+    dict_temp: float = 0.25
     att_temp: float = -2.25
     gnn_shift_weight: float = 0.5
     train_noise: float = 0.05
@@ -64,11 +64,11 @@ class RunConfig:
     temp_end: float = 0.3
 
     # Loss & Regularization
-    kl_weight: float = 5.0
+    kl_weight: float = 2.5
     kl_base: float = 0.10
     kl_collapse_weight: float = 3.0
-    hub_threshold: float = 0.2
-    anchor_peak_threshold: float = 0.80
+    hub_threshold: float = 0.4
+    anchor_peak_threshold: float = 0.50
     ortho_weight: float = 10.0
     ortho_overlap_threshold: float = 0.25
     tsallis_alpha: float = 1.5
@@ -79,7 +79,7 @@ class RunConfig:
     lr_base: float = 0.001
     wd_base: float = 1e-4
     lr_anchor: float = 0.001
-    wd_anchor: float = 1e-4
+    wd_anchor: float = 0
     grad_clip: float = 5.0
 
     # Inference & Topology
