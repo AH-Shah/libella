@@ -235,11 +235,8 @@ class LibellaGNN(nn.Module):
             smooth_weight = 0.50 - (0.45 * progress)
             sparse_weight = 1.0 - smooth_weight
             prob = (sparse_weight * sparse_prob) + (smooth_weight * smooth_prob)
-            # Alt 4: Cache dense attribution stream for auxiliary gradient highway
-            self._smooth_frac = F.softmax(logits / 1.5, dim=1) * mag
         else:
             prob = sparse_prob 
-            self._smooth_frac = None
         
         frac = prob * mag
         return frac, anchors_raw
@@ -254,8 +251,7 @@ class LibellaGNN(nn.Module):
         total_epochs: int, 
         f_train: torch.Tensor | None = None, 
         target_f_dist: torch.Tensor | None = None, 
-        kl_weight: float = cfg.kl_weight,
-        train_idx: torch.Tensor | None = None
+        kl_weight: float = cfg.kl_weight
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate regularized reconstruction loss."""
         num_pos = torch.clamp((x_c > 0).float().sum(), min=1.0)
@@ -353,18 +349,13 @@ class LibellaGNN(nn.Module):
         scaled_ortho = (l_ortho + collapse_penalty) * (recon_mag * 0.05)
         scaled_gene_ent = gene_entropy * (recon_mag * 0.01)
         
-        l_aux_highway = torch.tensor(0.0, device=x_c.device)
-        if self.training and getattr(self, '_smooth_frac', None) is not None and train_idx is not None:
-            smooth_recon = self._smooth_frac[train_idx] @ anchors
-            l_aux_highway = F.mse_loss(smooth_recon, x_c) * 0.15
-
-        base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent + l_aux_highway
+        base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent
 
         self._last_losses = {
             'rec': l_recon.item(), 'anc': l_anc.item(), 
             'ort': l_ortho.item(), 'im': im_loss.item(), 'base': base_loss.item(),
             'dyn_w': current_dynamic_w.item(), 'kl_w': kl_weight, 
-            'tsallis_val': tsallis_val, 'aux_hwy': l_aux_highway.item()
+            'tsallis_val': tsallis_val
         }
 
         return (base_loss + im_loss, l_recon.detach(), l_anc.detach(), l_ortho.detach())
