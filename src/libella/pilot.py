@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Libella Master Evolutionary Pilot Engine (Unstripped Full-Core Architecture).
+"""Libella Full-Epoch Master Evolutionary Pilot Engine.
 
-Executes parallel forensic training across:
-1. Ground Truth Baseline Libella (Exact unstripped GNN + GATv2 + Cross-Attn + STE)
-2. Alt 1: Jacobian-Matched Sharp STE + Logit Margin Prior Loss (Problem 1 Fix)
-3. Alt 2: Low-Rank Factored Bridge + Bounded Shift Dynamics (Problem 2 Fix)
-4. Alt 3: Sparse Simplex Entmax Anchors + Learnable Topic Plasticity Gates (Problem 1 & 2 Fix)
-5. Alt 4: Dual-Stream Flow: Sparse Attribution + Dense Gradient Highway (Problem 1 & 2 Fix)
-6. Alt 5: Continuous q-Deformed Simplex + Latent-Space Microenvironment Conditioning (Problem 1 & 2 Fix)
-
-Exports step-by-step telemetry and high-resolution dictionary health scorecards to CSV.
+Runs Baseline and 5 evolved architectures across full epochs with:
+1. Complete OLS PhaseTracker elastic governor (Phase 1 discovery + Phase 2 squeeze/breathe).
+2. Full synchronized 4-way sharpening schedules (Alpha, Scale, Temp, Dynamic Prob Blend).
+3. Decoupled CosineAnnealingLR scheduling and Pareto composite score checkpointing.
+4. Comprehensive trajectory telemetry export (CSV) and final comparative health scorecard.
 """
 
 import argparse
@@ -31,7 +27,7 @@ import torch.nn.functional as F
 
 
 # =============================================================================
-# 1. OPTIMIZED NUMERICAL FUNCTIONS & OPERATORS
+# 1. OPTIMIZED NUMERICAL OPERATORS & UTILITIES
 # =============================================================================
 
 def entmax_bisect_fn(X: torch.Tensor, alpha: float = 1.5, dim: int = -1, n_iter: int = 25) -> torch.Tensor:
@@ -116,7 +112,7 @@ def pad_mps_shapes(
 
 
 # =============================================================================
-# 2. HIGH-RESOLUTION DICTIONARY HEALTH & SVD TELEMETRY
+# 2. HIGH-RESOLUTION DICTIONARY HEALTH TELEMETRY
 # =============================================================================
 
 def compute_svd_effective_rank(mat: torch.Tensor) -> float:
@@ -158,51 +154,107 @@ def compute_gene_entropy(anchors: torch.Tensor) -> float:
 
 
 # =============================================================================
-# 3. PHASE TRACKER (DYNAMIC GOVERNOR)
+# 3. COMPLETE OLS PHASE TRACKER (DYNAMIC GOVERNOR)
 # =============================================================================
 
 class PhaseTracker:
-    def __init__(self, cycle_window: int = 6, target_pw: float = 70.0, rel_tolerance: float = 0.06, max_p1_epochs: int = 20):
+    """Adaptive Elastic Phase Controller with Dual-Horizon OLS Oscillation Filtering."""
+    def __init__(
+        self,
+        cycle_window: int = 6,
+        target_pw: float = 70.0,
+        rel_tolerance: float = 0.06,
+        max_p1_epochs: int = 20,
+    ) -> None:
         self.phase: int = 1
         self.cycle_window: int = cycle_window
         self.target_pw: float = target_pw
         self.rel_tolerance: float = rel_tolerance
         self.max_p1_epochs: int = max_p1_epochs
+
         self.rec_history: List[float] = []
         self.pw_history: List[float] = []
+
         self.best_rec_loss: float = float("inf")
+        self.p1_baseline_rec: Optional[float] = None
+
         self.pressure: float = 0.0
         self.squeeze_momentum: float = 0.05
         self.breathing_cooldown: int = 0
+
         self.saturation_streak: int = 0
+        self.required_saturation_streak: int = 4
+
+    @staticmethod
+    def _fit_ols(series: List[float]) -> Tuple[float, float, float]:
+        n = len(series)
+        if n < 3:
+            return 0.0, float(series[-1]) if series else 0.0, 0.01
+
+        t_mean = (n - 1) / 2.0
+        y_mean = sum(series) / n
+
+        num = sum((i - t_mean) * (series[i] - y_mean) for i in range(n))
+        den = sum((i - t_mean) ** 2 for i in range(n))
+        slope = num / max(1e-9, den)
+        intercept = y_mean - slope * t_mean
+
+        res_sq = sum((series[i] - (slope * i + intercept)) ** 2 for i in range(n))
+        residual_std = math.sqrt(res_sq / max(1, n - 2))
+
+        return slope, y_mean, residual_std
 
     def get_progress(self) -> float:
+        """Returns smooth Cosine S-curve progress in [0.0, 1.0]."""
         if self.phase == 1:
             return 0.0
         return 0.5 * (1.0 - math.cos(math.pi * self.pressure))
 
     def step(self, rec_loss: float, pw: float, epoch: int) -> bool:
+        """Evaluates epoch telemetry, adjusting squeeze pressure elastically."""
         self.rec_history.append(rec_loss)
         self.pw_history.append(pw)
+
         if rec_loss < self.best_rec_loss:
             self.best_rec_loss = rec_loss
 
-        if self.phase == 1:
-            if epoch >= self.max_p1_epochs:
-                self.phase = 2
-            elif len(self.rec_history) >= self.cycle_window:
-                window = self.rec_history[-self.cycle_window:]
-                drop_rate = (window[0] - window[-1]) / max(1e-5, window[0])
-                if drop_rate < 0.008:
-                    self.phase = 2
+        if len(self.rec_history) < self.cycle_window:
             return False
 
+        window_rec = self.rec_history[-self.cycle_window:]
+        window_pw = self.pw_history[-self.cycle_window:]
+
+        rec_slope, rec_mu, rec_sigma = self._fit_ols(window_rec)
+        pw_slope, pw_mu, _ = self._fit_ols(window_pw)
+
+        # -------------------------------------------------------------
+        # PHASE 1: Manifold Discovery & Plateau Detection
+        # -------------------------------------------------------------
+        if self.phase == 1:
+            if epoch >= self.max_p1_epochs:
+                self.force_phase2(epoch, rec_mu)
+                return False
+
+            relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
+            if relative_drop_rate < 0.008:
+                self.force_phase2(epoch, rec_mu)
+            return False
+
+        # -------------------------------------------------------------
+        # PHASE 2: Elastic Squeeze & Breathe Dynamic Governor
+        # -------------------------------------------------------------
         if self.phase == 2:
-            loss_ceiling = self.best_rec_loss * (1.0 + self.rel_tolerance)
-            if rec_loss > loss_ceiling:
-                self.pressure = max(0.10, self.pressure - 0.05)
+            dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.5 * rec_sigma)
+            loss_ceiling = self.best_rec_loss + dynamic_budget
+            overshoot = rec_loss - loss_ceiling
+
+            if overshoot > 0.0:
+                severity = min(2.0, overshoot / max(1e-5, dynamic_budget))
+                release_amount = 0.04 * severity
+                self.pressure = max(0.10, self.pressure - release_amount)
                 self.squeeze_momentum = 0.008
                 self.breathing_cooldown = 2
+                self.saturation_streak = 0
             else:
                 if self.breathing_cooldown > 0:
                     self.breathing_cooldown -= 1
@@ -211,12 +263,25 @@ class PhaseTracker:
                     self.pressure = min(1.0, self.pressure + self.squeeze_momentum)
 
             if self.pressure >= 0.95 and pw >= (self.target_pw - 3.0):
-                self.saturation_streak += 1
-                if self.saturation_streak >= 4:
+                if pw_slope < 0.05:
+                    self.saturation_streak += 1
+                else:
+                    self.saturation_streak = max(0, self.saturation_streak - 1)
+
+                if self.saturation_streak >= self.required_saturation_streak:
                     return True
             else:
                 self.saturation_streak = 0
+
         return False
+
+    def force_phase2(self, epoch: int, current_baseline: float) -> None:
+        """Transitions tracker directly to Phase 2."""
+        if self.phase == 1:
+            self.phase = 2
+            self.p1_baseline_rec = current_baseline
+            if self.best_rec_loss == float("inf") or current_baseline < self.best_rec_loss:
+                self.best_rec_loss = current_baseline
 
 
 # =============================================================================
@@ -224,8 +289,15 @@ class PhaseTracker:
 # =============================================================================
 
 class FullLibellaCore(nn.Module):
-    """Ground Truth Complete Libella Neural Architecture with all graph & physics heads."""
-    def __init__(self, in_channels: int, n_metaprograms: int, init_components: Optional[np.ndarray] = None, hidden_dim: int = 128, k_hops: int = 2):
+    """Ground Truth Complete Libella Neural Architecture."""
+    def __init__(
+        self,
+        in_channels: int,
+        n_metaprograms: int,
+        init_components: Optional[np.ndarray] = None,
+        hidden_dim: int = 128,
+        k_hops: int = 2
+    ):
         super().__init__()
         self.in_channels = in_channels
         self.n_metaprograms = n_metaprograms
@@ -437,7 +509,7 @@ class FullLibellaCore(nn.Module):
 
         l_recon = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_c.numel())
 
-        # Prior Anchor Regularization Loss (Matched Temperature scaling)
+        # Prior Anchor Regularization Loss (Matched Temperature Scaling)
         safe_temp = torch.clamp(self.dict_temp, min=0.25, max=1.0)
         anc_norm = F.normalize(anchors, p=2, dim=1)
         ref_norm = F.normalize(F.softmax(self.anchor_logits / safe_temp, dim=-1), p=2, dim=1)
@@ -504,14 +576,12 @@ class Alt1_JacobianMatchedSTE(FullLibellaCore):
         dynamic_logits = self.topic_gene_logits + dict_shift.view(self.n_metaprograms, -1)
         safe_temp = torch.clamp(self.dict_temp, min=0.25, max=1.0)
         sharp_anchors = F.softmax(dynamic_logits / safe_temp, dim=-1)
-        # Direct autograd flow through sharp softmax (Jacobian-matched)
         anchors_raw = sharp_anchors
         return anchors_raw, dynamic_logits
 
     def calc_loss(self, recon_c, x_c, anchors, epoch, total_epochs, f_train=None, target_f_dist=None, kl_weight=5.0, dynamic_logits=None, train_idx=None):
         total_loss, loss_dict = super().calc_loss(recon_c, x_c, anchors, epoch, total_epochs, f_train, target_f_dist, kl_weight, dynamic_logits, train_idx)
         if dynamic_logits is not None:
-            # dynamic_logits has shape (K, G), matching anchor_logits (K, G)
             is_pos_marker = (self.anchor_logits > 0)
             pos_loss = F.relu(2.0 - dynamic_logits[is_pos_marker]) ** 2
             neg_loss = F.relu(dynamic_logits[~is_pos_marker] - (-2.0)) ** 2
@@ -586,7 +656,6 @@ class Alt4_DualStreamGradHighway(FullLibellaCore):
     def calc_loss(self, recon_c, x_c, anchors, epoch, total_epochs, f_train=None, target_f_dist=None, kl_weight=5.0, dynamic_logits=None, train_idx=None):
         total_loss, loss_dict = super().calc_loss(recon_c, x_c, anchors, epoch, total_epochs, f_train, target_f_dist, kl_weight, dynamic_logits, train_idx)
         if self.training and hasattr(self, "_smooth_frac") and self._smooth_frac is not None and train_idx is not None:
-            # Correct core-cell indexing: slice by train_idx!
             smooth_recon = self._smooth_frac[train_idx] @ anchors
             l_aux = F.mse_loss(smooth_recon, x_c) * 0.15
             total_loss = total_loss + l_aux
@@ -639,7 +708,7 @@ class Alt5_ContinuousQDeformed(FullLibellaCore):
             h_ctx = F.silu(self.mp_update(out)) * (1.0 - alpha) + (h_0 * alpha)
 
         Q, K, V = self.q_proj(h_id), self.k_proj(h_ctx), self.v_proj(h_ctx)
-        idx_dtype = src.dtype if len(src) > 0 else (torch.int32 if x_dense.device.type == "mps" else torch.int64)
+        idx_dtype = src.dtype if len(src) > 0 else torch.int64
         self_loops = torch.arange(N, dtype=idx_dtype, device=x_dense.device)
         src_all = torch.cat([src, self_loops]) if len(src) > 0 else self_loops
         dst_all = torch.cat([dst, self_loops]) if len(src) > 0 else self_loops
@@ -704,7 +773,7 @@ def load_pilot_artifacts(
 
 
 # =============================================================================
-# 7. MASTER COMPARATIVE BENCHMARK RUNNER
+# 7. FULL-EPOCH MASTER COMPARATIVE BENCHMARK RUNNER
 # =============================================================================
 
 def run_pilot_suite(
@@ -712,16 +781,18 @@ def run_pilot_suite(
     priors_path: str,
     chunks_dir: str,
     out_dir: str,
-    n_epochs: int = 5,
+    n_epochs: int = 300,
 ):
     device = get_device()
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = out_path / "model_checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 118)
-    print("🔬 LIBELLA FULL-CORE ARCHITECTURAL PILOT (BASELINE vs 5 EVOLVED VARIANTS)")
-    print(f"   Compute Device: {device} | Output Directory: {out_path.resolve()}")
-    print("=" * 118)
+    print("=" * 122)
+    print("🔬 LIBELLA FULL-EPOCH EVOLUTIONARY ENGINE (PHASETRACKER & SHARPENING ACTIVE)")
+    print(f"   Compute Device: {device} | Total Epoch Budget: {n_epochs} | Output Dir: {out_path.resolve()}")
+    print("=" * 122)
 
     common_genes, init_components, optimal_k, chunk_files = load_pilot_artifacts(
         common_genes_path, priors_path, chunks_dir, n_chunks=10
@@ -729,7 +800,7 @@ def run_pilot_suite(
     in_channels = len(common_genes)
     print(f"[✓] Successfully loaded {len(chunk_files)} spatial chunks ({in_channels} genes, Base K={optimal_k}).")
 
-    # Load and cache pre-tensorized graph chunks in RAM
+    # Cache pre-tensorized graph chunks in RAM
     cached_graph_chunks = []
     for cf in chunk_files:
         data = torch.load(cf, map_location="cpu", weights_only=False)
@@ -753,36 +824,62 @@ def run_pilot_suite(
         "5. Alt 5 (Continuous q-Deformed Simplex)": Alt5_ContinuousQDeformed(in_channels, optimal_k, init_components).to(device),
     }
 
-    # Setup decoupled optimizers (Separate AdamW learning rate for topic gene dictionary)
+    # Setup decoupled optimizers & Cosine Annealing Schedulers
     optimizers: Dict[str, torch.optim.Optimizer] = {}
+    schedulers: Dict[str, torch.optim.lr_scheduler.LRScheduler] = {}
+    best_composite_scores: Dict[str, float] = {name: float("inf") for name in models}
+    early_stopped_models: set = set()
+
     for name, m in models.items():
         base_params = [p for n, p in m.named_parameters() if "topic_gene_logits" not in n and "global_basis" not in n]
         dict_params = [p for n, p in m.named_parameters() if "topic_gene_logits" in n or "global_basis" in n]
-        optimizers[name] = torch.optim.AdamW([
+        opt = torch.optim.AdamW([
             {"params": base_params, "lr": 1e-3, "weight_decay": 1e-4},
             {"params": dict_params, "lr": 1e-3, "weight_decay": 1e-4}
         ])
+        optimizers[name] = opt
+        schedulers[name] = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs, eta_min=1e-6)
 
-    trackers: Dict[str, PhaseTracker] = {name: PhaseTracker() for name in models}
+    trackers: Dict[str, PhaseTracker] = {name: PhaseTracker(max_p1_epochs=20) for name in models}
     step_records: List[Dict[str, Any]] = []
 
-    print("\n[➤] Initiating 5-Epoch Forensic Trajectory Benchmark...\n")
+    print("\n[➤] Starting Full-Epoch Training Loops...\n")
 
     for epoch in range(1, n_epochs + 1):
-        print(f"--- Epoch {epoch}/{n_epochs} ---")
-        for model_name, model in models.items():
-            model.train()
+        active_models = [m for m in models.keys() if m not in early_stopped_models]
+        if not active_models:
+            print(f"\n[✓] All architectures saturated and completed training by Epoch {epoch-1}.")
+            break
+
+        print(f"\n▶ Epoch {epoch:03d}/{n_epochs:03d} (Active Models: {len(active_models)}/6)")
+
+        for model_name in active_models:
+            model = models[model_name]
             optimizer = optimizers[model_name]
+            scheduler = schedulers[model_name]
             tracker = trackers[model_name]
 
+            # 1. Failsafe Transition Check: Force Phase 2 if nearing epoch budget
+            epochs_remaining = n_epochs - epoch
+            if tracker.phase == 1 and epochs_remaining <= 20:
+                tracker.force_phase2(epoch, tracker.best_rec_loss)
+
+            # 2. Update Model Physics Schedules from PhaseTracker
             prog = tracker.get_progress()
             model.current_progress = prog
-            model.current_scale = 8.0 + (8.0 * (prog ** 0.8))
-            model.current_temp = 0.3 + (1.2 * ((1.0 - prog) ** 1.5))
-            model.current_alpha = 1.2 + (0.5 * prog)
+            model.current_scale = 8.0 + ((16.0 - 8.0) * (prog ** 0.8))
+            model.current_temp = 0.3 + ((1.5 - 0.3) * ((1.0 - prog) ** 1.5))
+            model.current_alpha = 1.2 + ((1.7 - 1.2) * prog)
 
+            model.train()
             ema_mean = None
             alpha_ema = 0.01
+
+            epoch_rec_loss_sum = 0.0
+            epoch_pw_sum = 0.0
+            epoch_gw_sum = 0.0
+            epoch_dict_grad_sum = 0.0
+            n_chunks = len(cached_graph_chunks)
 
             for chunk_idx, chunk in enumerate(cached_graph_chunks):
                 x = chunk["x"].to(device, non_blocking=True)
@@ -830,7 +927,7 @@ def run_pilot_suite(
                 )
                 loss.backward()
 
-                # Decoupled Gradient Clipping & Force Vector Profiling
+                # Decoupled Gradient Clipping & Force Vector Decomposition
                 base_params = [p for n, p in model.named_parameters() if "topic_gene_logits" not in n and "global_basis" not in n and p.grad is not None]
                 dict_params = [p for n, p in model.named_parameters() if ("topic_gene_logits" in n or "global_basis" in n) and p.grad is not None]
 
@@ -859,10 +956,21 @@ def run_pilot_suite(
                     init_norm = F.normalize(F.softmax(model.anchor_logits / safe_temp, dim=-1), p=2, dim=1)
                     t0_drift = 1.0 - (anc_norm * init_norm).sum(dim=1).mean().item()
 
+                epoch_rec_loss_sum += loss_dict["loss_recon"]
+                epoch_pw_sum += pw
+                epoch_gw_sum += gw
+                epoch_dict_grad_sum += dict_grad_norm
+
                 step_records.append({
                     "epoch": epoch,
                     "chunk": chunk_idx + 1,
                     "model": model_name,
+                    "phase": tracker.phase,
+                    "pressure": tracker.pressure,
+                    "progress": prog,
+                    "scale": model.current_scale,
+                    "temp": model.current_temp,
+                    "alpha": model.current_alpha,
                     "loss_total": loss_dict["loss_total"],
                     "loss_recon": loss_dict["loss_recon"],
                     "loss_anc": loss_dict["loss_anc"],
@@ -881,68 +989,110 @@ def run_pilot_suite(
                     "gene_entropy_mean": gene_ent,
                 })
 
-            tracker.step(loss_dict["loss_recon"], pw, epoch)
+            scheduler.step()
+
+            # 3. Epoch Boundary Tracker Step & Pareto Evaluation
+            avg_rec = epoch_rec_loss_sum / n_chunks
+            avg_pw = epoch_pw_sum / n_chunks
+            avg_gw = epoch_gw_sum / n_chunks
+            avg_grad = epoch_dict_grad_sum / n_chunks
+
+            is_saturated = tracker.step(avg_rec, avg_pw, epoch)
+
+            # Pareto Composite Score Checkpointing
+            composite_score = avg_rec / max(1.0, math.sqrt(avg_pw / 100.0))
+            if composite_score < best_composite_scores[model_name]:
+                best_composite_scores[model_name] = composite_score
+                clean_name = model_name.split()[1].lower()
+                torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "composite_score": composite_score,
+                    "rec_loss": avg_rec,
+                    "pw": avg_pw,
+                    "gw": avg_gw,
+                }, ckpt_dir / f"{clean_name}_best_pareto.pt")
+
+            status_tag = f"P{tracker.phase} [Prog: {prog*100:4.1f}% | Press: {tracker.pressure:.2f}]"
             print(
-                f"  [{model_name:<38}] Rec: {loss_dict['loss_recon']:.4f} | "
-                f"||g_dict||: {dict_grad_norm:.4e} | P_W: {pw:4.1f}% | G_W: {gw:4.1f}% | "
-                f"Dead: {dead_pct:4.1f}% | Rank: {eff_rank:4.1f}/{optimal_k}"
+                f"  {model_name:<38} | {status_tag} | "
+                f"Rec: {avg_rec:<6.4f} | ||g||: {avg_grad:<8.2e} | "
+                f"P_W: {avg_pw:<4.1f}% | G_W: {avg_gw:<4.1f}% | SVD: {eff_rank:<4.1f}/{optimal_k}"
             )
 
-    # Export Step-by-Step Trajectory CSV
-    df_steps = pd.DataFrame(step_records)
-    traj_csv = out_path / "trajectory_comparison.csv"
-    df_steps.to_csv(traj_csv, index=False)
-    print(f"\n[✓] Detailed trajectory written to: {traj_csv}")
+            if is_saturated:
+                print(f"  ↳ [✓] Model '{model_name}' saturated at P_W={avg_pw:.1f}% (Phase 2 complete). Terminating gracefully.")
+                early_stopped_models.add(model_name)
 
-    # Build Final Aggregate Health Scorecard
-    final_epoch = df_steps[df_steps["epoch"] == n_epochs]
+        # Periodic interim flush of trajectory CSV every 10 epochs
+        if epoch % 10 == 0 or epoch == n_epochs:
+            df_interim = pd.DataFrame(step_records)
+            df_interim.to_csv(out_path / "trajectory_comparison.csv", index=False)
+
+    # 4. Final Comprehensive Output Export
+    df_final_steps = pd.DataFrame(step_records)
+    final_csv = out_path / "trajectory_comparison.csv"
+    df_final_steps.to_csv(final_csv, index=False)
+    print(f"\n[✓] Complete full-epoch trajectory saved to: {final_csv}")
+
+    # Build Final Scorecard from Best Pareto Epochs
     summary_rows = []
     for model_name in models.keys():
-        m_df = final_epoch[final_epoch["model"] == model_name]
+        m_df = df_final_steps[df_final_steps["model"] == model_name]
+        last_epoch_num = m_df["epoch"].max()
+        last_epoch_df = m_df[m_df["epoch"] == last_epoch_num]
+
         summary_rows.append({
             "Model Architecture": model_name,
-            "Recon Loss": m_df["loss_recon"].mean(),
-            "Dict Grad Norm (Plasticity)": m_df["dict_grad_norm"].mean(),
-            "Cell Sharpness (P_W %)": m_df["p_w"].mean(),
-            "Gene Sharpness (G_W %)": m_df["g_w"].mean(),
-            "Dead Topic % (Atrophy)": m_df["dead_topics_pct"].mean(),
-            "SVD Effective Rank": m_df["svd_effective_rank"].mean(),
-            "Max Topic Overlap": m_df["gram_max_overlap"].mean(),
-            "Anchor Drift (T0 Adaptation)": m_df["anchor_drift_t0"].mean(),
-            "Gene Entropy (Nats)": m_df["gene_entropy_mean"].mean(),
+            "Total Epochs Run": int(last_epoch_num),
+            "Best Composite Score": best_composite_scores[model_name],
+            "Final Recon Loss": last_epoch_df["loss_recon"].mean(),
+            "Dict Grad Norm (Plasticity)": last_epoch_df["dict_grad_norm"].mean(),
+            "Cell Sharpness (P_W %)": last_epoch_df["p_w"].mean(),
+            "Gene Sharpness (G_W %)": last_epoch_df["g_w"].mean(),
+            "Dead Topic % (Atrophy)": last_epoch_df["dead_topics_pct"].mean(),
+            "SVD Effective Rank": last_epoch_df["svd_effective_rank"].mean(),
+            "Max Topic Overlap": last_epoch_df["gram_max_overlap"].mean(),
+            "Anchor Drift (T0 Adaptation)": last_epoch_df["anchor_drift_t0"].mean(),
+            "Gene Entropy (Nats)": last_epoch_df["gene_entropy_mean"].mean(),
         })
 
-    df_summary = pd.DataFrame(summary_rows).sort_values("Recon Loss")
+    df_summary = pd.DataFrame(summary_rows).sort_values("Best Composite Score")
     summary_csv = out_path / "final_benchmark_summary.csv"
     df_summary.to_csv(summary_csv, index=False)
-    print(f"[✓] Final aggregate scorecard written to: {summary_csv}")
+    print(f"[✓] Final comparative evaluation scorecard saved to: {summary_csv}")
 
-    # Terminal Formatted Scorecard Display
-    print("\n" + "=" * 122)
-    print("🏆 FINAL ARCHITECTURAL BENCHMARK SCORECARD")
-    print("=" * 122)
+    # Display Terminal Summary Table
+    print("\n" + "=" * 130)
+    print("🏆 FINAL ARCHITECTURAL BENCHMARK SCORECARD (FULL-EPOCH OPTIMIZATION)")
+    print("=" * 130)
     print(
-        f"{'Model Architecture':<38} | {'Recon':<8} | {'||g_dict||':<11} | {'P_W %':<7} | "
-        f"{'G_W %':<7} | {'Dead %':<7} | {'SVD Rank':<9} | {'Overlap':<8} | {'T0 Drift'}"
+        f"{'Model Architecture':<38} | {'Epochs':<6} | {'Pareto':<7} | {'Recon':<7} | "
+        f"{'||g_dict||':<10} | {'P_W %':<6} | {'G_W %':<6} | {'Dead %':<6} | {'SVD Rank':<8} | {'T0 Drift'}"
     )
-    print("-" * 122)
+    print("-" * 130)
     for _, row in df_summary.iterrows():
         print(
             f"{row['Model Architecture']:<38} | "
-            f"{row['Recon Loss']:<8.4f} | "
-            f"{row['Dict Grad Norm (Plasticity)']:<11.4e} | "
-            f"{row['Cell Sharpness (P_W %)']:<7.1f} | "
-            f"{row['Gene Sharpness (G_W %)']:<7.1f} | "
-            f"{row['Dead Topic % (Atrophy)']:<7.1f} | "
-            f"{row['SVD Effective Rank']:<9.2f} | "
-            f"{row['Max Topic Overlap']:<8.3f} | "
+            f"{row['Total Epochs Run']:<6d} | "
+            f"{row['Best Composite Score']:<7.3f} | "
+            f"{row['Final Recon Loss']:<7.4f} | "
+            f"{row['Dict Grad Norm (Plasticity)']:<10.2e} | "
+            f"{row['Cell Sharpness (P_W %)']:<6.1f} | "
+            f"{row['Gene Sharpness (G_W %)']:<6.1f} | "
+            f"{row['Dead Topic % (Atrophy)']:<6.1f} | "
+            f"{row['SVD Effective Rank']:<8.2f} | "
             f"{row['Anchor Drift (T0 Adaptation)']:.4f}"
         )
-    print("=" * 122 + "\n")
+    print("=" * 130 + "\n")
 
+
+# =============================================================================
+# 8. MAIN CLI ENTRYPOINT
+# =============================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Libella Evolutionary Pilot Engine")
+    parser = argparse.ArgumentParser(description="Libella Full-Epoch Evolutionary Pilot Engine")
     parser.add_argument(
         "--genes",
         type=str,
@@ -964,10 +1114,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--out-dir",
         type=str,
-        default="/Users/Hemato/project_3/benchmark/benchmark_output/libella/run/pilot_results",
-        help="Output directory for generated logs and CSVs",
+        default="/Users/Hemato/project_3/benchmark/benchmark_output/libella/run/full_pilot_results",
+        help="Output directory for generated logs, checkpoints, and CSVs",
     )
-    parser.add_argument("--epochs", type=int, default=5, help="Number of benchmark epochs")
+    parser.add_argument("--epochs", type=int, default=300, help="Total epochs for training")
     args = parser.parse_args()
 
     run_pilot_suite(
