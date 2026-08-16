@@ -82,7 +82,7 @@ def _compress_nouns(
     lineage_names: list[str],
     target_genes: list[str],
     n_clusters: int = 25,
-    min_genes: int = 15,
+    min_genes: int = 10,
     max_genes: int = 100,
     consensus_freq: float = 0.30,
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
@@ -438,7 +438,7 @@ def get_priors(
                 lineage_names,
                 target_genes,
                 n_clusters=getattr(cfg, "n_prior_lineages", 25),
-                min_genes=getattr(cfg, "min_genes_noun", 15),
+                min_genes=getattr(cfg, "min_genes_noun", 10),
                 max_genes=getattr(cfg, "max_genes_noun", 100),
                 consensus_freq=getattr(cfg, "consensus_freq", 0.30),
             )
