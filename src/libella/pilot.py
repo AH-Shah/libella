@@ -905,7 +905,7 @@ def run_comparative_benchmark(
     # Head-to-Head Architectural Candidates
     models: Dict[str, ProductionLibellaBaseline] = {
         "0. Baseline (Control)": ProductionLibellaBaseline(in_channels, optimal_k, init_components).to(device),
-        "1. Reliable Decoupled Engine": ReliableDecoupledLibella(in_channels, optimal_k, init_components, empirical_baseline).to(device),
+        # "1. Reliable Decoupled Engine": ReliableDecoupledLibella(in_channels, optimal_k, init_components, empirical_baseline).to(device),
     }
 
     DICT_KEYS = ["topic_gene_logits"]
