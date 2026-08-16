@@ -77,7 +77,7 @@ class PhaseTracker:
         cycle_window: int = 6,        # Cut window from 12 -> 6 (responds 2x faster)
         target_pw: float = 70.0,
         rel_tolerance: float = 0.06,  # 6% reconstruction budget ceiling
-        max_p1_epochs: int = 15,      # Hard limit: Phase 1 CANNOT exceed 15 epochs
+        max_p1_epochs: int = 20,      
     ) -> None:
         self.phase: int = 1
         self.cycle_window: int = cycle_window
