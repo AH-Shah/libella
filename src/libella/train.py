@@ -353,8 +353,10 @@ def _train_loop(
                         asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * 2.0) * (raw_delta_val < 0).to(x_val.dtype)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
-                        val_loss_sum = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
-                        val_loss_acc += (val_loss_sum / max(1, x_val.numel())).detach()
+                        val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
+                        val_log_cosh = val_loss_sum / max(1, x_val.numel())
+                    
+                        val_loss_acc += val_log_cosh.detach()
                         val_steps += 1
                         
                     del val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
