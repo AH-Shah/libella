@@ -50,9 +50,9 @@ class LibellaGNN(nn.Module):
         )
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
 
-        # 1. Pure Intensity Stream (Unconstrained Magnitude Scaling)
+        # 1. Spatially Enriched Intensity Stream (Imputes dropouts via graph context)
         self.mag_enc = nn.Sequential(
-            nn.Linear(in_channels, self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents),
@@ -177,7 +177,7 @@ class LibellaGNN(nn.Module):
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
         # 5. Decoupled Dual-Stream Projections with Dictionary-Coupled Gating
-        z_mag = self.mag_enc(x_norm)
+        z_mag = self.mag_enc(h_norm)
         
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
         bio_sim = torch.mm(x_norm, w_dec_norm.t())
@@ -216,8 +216,9 @@ class LibellaGNN(nn.Module):
         # 3. Bio-SAE Activation: Independent magnitude per gene program
         z = gate_probs * z_mag
 
-        # 4. Reconstruct via direct matrix multiplication with normalized dictionary
-        x_recon = torch.mm(z, w_dec_norm) * cell_mass + self.decoder_bias.unsqueeze(0)
+        # 4. Depth-scaled reconstruction: latents model cell-type programs; bias models ambient baseline
+        baseline_gene_rate = F.softmax(self.decoder_bias, dim=-1).unsqueeze(0)
+        x_recon = (torch.mm(z, w_dec_norm) + baseline_gene_rate) * cell_mass
 
         # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
         aux_recon = None
