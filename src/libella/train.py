@@ -500,10 +500,11 @@ def _train_loop(
         print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
     # -------------------------------------------------------------
-    # Post-Training: Export Master & Sample-Specific Latents
+    # Post-Training: Export Master & Batch/Sample Latents (BANKSY / EcoTyper style)
     # -------------------------------------------------------------
     print("\n-> Extracting & Exporting Libella Latent Representations...")
     import pandas as pd
+    from pathlib import Path
     
     model.eval()
     latent_records = []
@@ -513,7 +514,6 @@ def _train_loop(
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
         for meta_meta, chunk_iter in prefetch_batches(meta_batches):
             for batch_ref, batch in zip(meta_meta, chunk_iter):
-                # 1. Non-blocking tensor transfer from chunk loader
                 x = batch["x"].to(device=device, non_blocking=True)
                 src = batch["src"].to(device=device, non_blocking=True)
                 dst = batch["dst"].to(device=device, non_blocking=True)
@@ -526,46 +526,76 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                # 2. Forward inference for sparse latent activations (z)
+                # 1. Forward inference for sparse latent activations (z)
                 _, z, _, _, _ = model(x, src, dst, weights)
                 z_np = z[:n_cells].detach().cpu().numpy()
                 
-                # 3. Fetch Cell Barcodes / IDs
-                cell_ids = batch.get("barcodes") or batch_ref.get("barcodes") or \
-                           batch.get("cell_ids") or batch_ref.get("cell_ids")
-                if cell_ids is None:
-                    cell_ids = [f"cell_{i}" for i in range(n_cells)]
+                # 2. Extract Patient & Dataset IDs (matches cli.py manifest mappings)
+                pt_id = (
+                    batch_ref.get("patient_id") or batch_ref.get("pt_id") or
+                    batch.get("patient_id") or batch.get("pt_id") or
+                    batch_ref.get("sample_id") or batch.get("sample_id")
+                )
+                ds_id = (
+                    batch_ref.get("dataset_id") or batch_ref.get("ds_id") or
+                    batch.get("dataset_id") or batch.get("ds_id")
+                )
                 
-                # 4. Fetch dataset_id & patient_id from batch_ref / batch
-                dataset_id = str(batch_ref.get("dataset_id", batch.get("dataset_id", "default_dataset")))
-                patient_id = str(batch_ref.get("patient_id", batch.get("patient_id", "default_patient")))
-                sample_id = f"{dataset_id}_{patient_id}" if dataset_id != patient_id else patient_id
+                # Fallback to graph filepath stem if not stored directly in batch dict
+                if not pt_id:
+                    for k in ["path", "graph_path", "filepath", "file"]:
+                        if k in batch_ref:
+                            pt_id = Path(str(batch_ref[k])).stem.replace("_graph", "").replace(".pt", "")
+                            break
+                        if k in batch:
+                            pt_id = Path(str(batch[k])).stem.replace("_graph", "").replace(".pt", "")
+                            break
+                            
+                pt_id = str(pt_id) if pt_id else "sample_1"
+                ds_id = str(ds_id) if ds_id else "dataset_1"
+                sample_id = f"{ds_id}_{pt_id}" if ds_id != pt_id and ds_id != "Unknown" else pt_id
+
+                # 3. Extract Cell Barcodes
+                cell_ids = (
+                    batch.get("barcodes") or batch_ref.get("barcodes") or
+                    batch.get("cell_ids") or batch_ref.get("cell_ids") or
+                    batch.get("obs_names") or batch_ref.get("obs_names")
+                )
+                if cell_ids is None:
+                    cell_ids = [f"{sample_id}_cell_{i}" for i in range(n_cells)]
 
                 chunk_df = pd.DataFrame(z_np, index=cell_ids, columns=latent_cols)
-                chunk_df["dataset_id"] = dataset_id
-                chunk_df["patient_id"] = patient_id
+                chunk_df["dataset_id"] = ds_id
+                chunk_df["patient_id"] = pt_id
                 chunk_df["sample_id"] = sample_id
                 
                 latent_records.append(chunk_df)
 
     if latent_records:
         full_latents_df = pd.concat(latent_records, axis=0)
+        meta_cols = ["dataset_id", "patient_id", "sample_id"]
 
-        # 1. Save Master Latents (includes dataset_id, patient_id, sample_id metadata)
+        # 1. Save Master Latents (All Samples Combined)
         master_latent_path = out_dir / "libella_latent.csv"
         full_latents_df.to_csv(master_latent_path, index_label="cell_id")
         print(f"  ↳ Master latents saved -> {master_latent_path}")
 
-        # 2. Save Sample-Specific Latents (Pure cell x latent matrix for Seurat/Scanpy)
+        # 2. Save Batch/Sample-Specific Latents (in root out_dir AND sample_latents/)
         sample_out_dir = out_dir / "sample_latents"
         sample_out_dir.mkdir(parents=True, exist_ok=True)
         
-        meta_cols = ["dataset_id", "patient_id", "sample_id"]
         for s_id, sub_df in full_latents_df.groupby("sample_id"):
-            sample_file = sample_out_dir / f"{s_id}_latent.csv"
-            sub_df.drop(columns=meta_cols).to_csv(sample_file, index_label="cell_id")
+            clean_sub_df = sub_df.drop(columns=meta_cols)
             
-        print(f"  ↳ Sample-specific latents saved ({len(full_latents_df['sample_id'].unique())} samples) -> {sample_out_dir}/")
+            # Save root EcoTyper/BANKSY style: out_dir/libella_latent_<sample>.csv
+            root_sample_file = out_dir / f"libella_latent_{s_id}.csv"
+            clean_sub_df.to_csv(root_sample_file, index_label="cell_id")
+            
+            # Also keep organized in subfolder: out_dir/sample_latents/<sample>_latent.csv
+            nested_sample_file = sample_out_dir / f"{s_id}_latent.csv"
+            clean_sub_df.to_csv(nested_sample_file, index_label="cell_id")
+            
+            print(f"  ↳ Batch/Sample latent saved -> {root_sample_file}")
 
     return model, history
 
