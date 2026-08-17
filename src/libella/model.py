@@ -119,14 +119,12 @@ class LibellaGNN(nn.Module):
         h_0 = self.lin_appnp(self.ctx_enc(x_norm))
         N = h_0.size(0)
 
-        # 2. Sharpened Bilateral Edge Decay (Cosine Dissimilarity with Steep Sigmoid Drop)
+        # 2. Smooth Bilateral Edge Decay preserving sparse cell connectivity
         if len(src) > 0:
             with torch.no_grad():
-                # Cosine distance between neighboring cell expression profiles
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1)
-                dist = torch.clamp(1.0 - cos_sim, min=0.0)
-            # Sharp cutoff: sever edges between heterogeneous cell types at borders
-            decay = torch.exp(-15.0 * dist)
+                # Soft bilateral weighting: retains connections across sparse boundaries
+                decay = torch.sigmoid((cos_sim - 0.2) * 5.0)
         else:
             decay = torch.ones_like(edge_weights)
             
@@ -147,8 +145,8 @@ class LibellaGNN(nn.Module):
                 h_edge = h_src_proj[src] + h_dst_proj[dst] + edge_proj
                 
                 e_raw = self.gat_a(F.leaky_relu(h_edge)).squeeze(-1)
-                tau = torch.clamp(F.softplus(self.att_temp), min=0.05)
-                alpha_att = scatter_softmax(e_raw / tau, dst, N) 
+                tau = torch.clamp(F.softplus(self.att_temp) + 0.5, min=0.5, max=3.0)
+                alpha_att = scatter_softmax(e_raw / tau, dst, N)
                 
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
                 out.index_add_(0, dst, msg)
@@ -219,12 +217,8 @@ class LibellaGNN(nn.Module):
         # 4. Decode via L1-Constrained Compositional Atoms
         # Using positive softmax/abs-normalized atoms guarantees comp_profile.sum() == 1.0 natively
         w_dec_pos = F.softmax(self.decoder_weight, dim=-1)
-        comp_profile = torch.mm(gate_probs, w_dec_pos)
 
-        # 5. Modulate Compositional Profile by Magnitude & Cell Sequencing Depth
-        # z_mag is a per-cell intensity scalar (1D) or feature-gated vector that never cancels out
-        intensity_scale = z_mag.mean(dim=-1, keepdim=True) * cell_mass
-        x_recon = (comp_profile * intensity_scale) + self.decoder_bias
+        x_recon = torch.mm(z, w_dec_pos) * cell_mass + (cell_mass * self.decoder_bias.unsqueeze(0))
 
         # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
         aux_recon = None
@@ -274,9 +268,7 @@ class LibellaGNN(nn.Module):
             self.dynamic_w_ema.lerp_(current_dynamic_w, weight=0.1)
 
         w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
-        
-        # Anchor the global loss scale so the trajectory doesn't artificially inflate over epochs
-        w_mat = w_mat / torch.clamp(w_mat.mean(), min=1.0)
+        w_mat = w_mat / torch.clamp(w_mat.mean(), min=1e-5)
 
         raw_delta = recon_x - x_true
         asym_factor = 1.0 + (is_non_zero.float() * 2.0) * (raw_delta < 0).float()
@@ -286,22 +278,15 @@ class LibellaGNN(nn.Module):
 
         l_recon = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_true.numel())
 
-        # 2. Strided / Subsampled Oblique Orthogonality
-        ortho_margin = getattr(cfg, 'ortho_margin', 0.10)
-        if self.ortho_sample_size < self.n_latents:
-            sample_idx = torch.randint(0, self.n_latents, (self.ortho_sample_size,), device=w_dec_norm.device)
-            w_sub = w_dec_norm[sample_idx]
-            sub_mask = self.ortho_mask[sample_idx]
-            cosine_sim = torch.mm(w_sub, w_dec_norm.t()) * sub_mask
-            l_ortho = (F.relu(cosine_sim - ortho_margin) ** 2).sum() / (self.ortho_sample_size * (self.n_latents - 1))
-        else:
-            cosine_sim = torch.mm(w_dec_norm, w_dec_norm.t()) * self.ortho_mask
-            l_ortho = (F.relu(cosine_sim - ortho_margin) ** 2).sum() / (self.n_latents * (self.n_latents - 1))
+        # 2. Continuous Gram-Matrix Repulsion (Off-diagonal Correlation Penalty)
+        gram = torch.mm(w_dec_norm, w_dec_norm.t())
+        off_diag_gram = gram * self.ortho_mask
+        l_ortho = (off_diag_gram ** 2).sum() / (self.n_latents * (self.n_latents - 1))
 
         # 3. Sparsity Loss
         l_sparse = z.mean()
 
-        # 4. AuxK Residual Loss
+        # 4. AuxK Residual Loss (Dead Latent Revitalization)
         if aux_recon is not None and r_norm is not None:
             l_aux = F.mse_loss(aux_recon, r_norm)
         else:
@@ -309,8 +294,8 @@ class LibellaGNN(nn.Module):
 
         # 5. Combined Dynamic Schedules
         base_l1 = getattr(cfg, 'l1_coeff', 1e-3)
-        base_ortho = getattr(cfg, 'ortho_weight', 10.0)
-        aux_weight = getattr(cfg, 'aux_weight', 0.5)
+        base_ortho = getattr(cfg, 'ortho_weight', 2.0)
+        aux_weight = getattr(cfg, 'aux_weight', 1.0)
 
         sparsity_multiplier = 0.10 + 0.90 * (progress ** 0.8)
         current_l1 = base_l1 * sparsity_multiplier
