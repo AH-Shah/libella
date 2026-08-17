@@ -59,12 +59,13 @@ class LibellaGNN(nn.Module):
             nn.Softplus(beta=1.0)
         )
 
-        # 2. Spatial Context Gating Stream
+        # 2. Spatial Context Gating Stream with Learnable Gradient Gain
         self.gate_spatial_proj = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents)
         )
+        self.spatial_gain = nn.Parameter(torch.tensor(2.0))
 
         
 
@@ -183,12 +184,13 @@ class LibellaGNN(nn.Module):
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
         bio_sim = torch.mm(x_norm, w_dec_norm.t())
         
-        # Contextual spatial correction from the GNN
+        # Contextual spatial correction from GNN with active gradient scaling
         spatial_shift = self.gate_spatial_proj(h_norm)
-        base_logits = bio_sim + spatial_shift
         
-        # Restore PhaseTracker dynamic scale multiplier (stretches logit variance)
-        current_scale = getattr(self, 'current_scale', getattr(cfg, 'inference_scale', 12.0))
+        # GNN spatial shift and biological similarity operate at equal variance
+        base_logits = bio_sim + (self.spatial_gain * spatial_shift)
+        
+        current_scale = getattr(self, 'current_scale', getattr(cfg, 'inference_scale', 10.0))
         gate_logits = base_logits * current_scale
 
         return z_mag, gate_logits, cell_mass
@@ -214,15 +216,15 @@ class LibellaGNN(nn.Module):
         # 3. Bio-SAE Activation: Simplex Gate * Softplus Magnitude
         z = z_mag * gate_probs
 
-        # 4. Decode Compositional Profile (Unit-Norm Oblique Projection)
-        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        raw_comp = torch.mm(z, w_dec_norm)
+        # 4. Decode via L1-Constrained Compositional Atoms
+        # Using positive softmax/abs-normalized atoms guarantees comp_profile.sum() == 1.0 natively
+        w_dec_pos = F.softmax(self.decoder_weight, dim=-1)
+        comp_profile = torch.mm(gate_probs, w_dec_pos)
 
-        # 5. Normalize Gene Profile to Sum = 1.0 (Fixes 20x Count Explosion)
-        comp_profile = raw_comp / torch.clamp(raw_comp.sum(dim=-1, keepdim=True), min=1e-6)
-
-        # 6. Restore Exact Cell Count Mass + Global Bias
-        x_recon = (comp_profile * cell_mass) + self.decoder_bias
+        # 5. Modulate Compositional Profile by Magnitude & Cell Sequencing Depth
+        # z_mag is a per-cell intensity scalar (1D) or feature-gated vector that never cancels out
+        intensity_scale = z_mag.mean(dim=-1, keepdim=True) * cell_mass
+        x_recon = (comp_profile * intensity_scale) + self.decoder_bias
 
         # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
         aux_recon = None
@@ -244,13 +246,13 @@ class LibellaGNN(nn.Module):
                 num_dead = dead_indices.numel()
                 k_aux = min(self.aux_k, num_dead)
 
-                w_dead = w_dec_norm[dead_indices]
+                w_dead = w_dec_pos[dead_indices]
                 aux_logits = torch.mm(r_norm, w_dead.t())
                 topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
                 z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
                 aux_recon = torch.mm(z_aux, w_dead)
 
-        return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag
+        return x_recon, z, w_dec_pos, aux_recon, r_norm, z_mag
 
     def calc_loss(
         self, 
