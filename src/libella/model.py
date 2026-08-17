@@ -290,9 +290,10 @@ class LibellaGNN(nn.Module):
         # 3. Sparsity Loss
         l_sparse = z.mean()
 
-        # 4. AuxK Residual Loss (Dead Latent Revitalization)
+        # 4. AuxK Residual Loss: Cosine alignment prevents 1/D gradient vanishing
         if aux_recon is not None and r_norm is not None:
-            l_aux = F.mse_loss(aux_recon, r_norm)
+            cos_align = F.cosine_similarity(aux_recon, r_norm, dim=-1).clamp(min=-1.0, max=1.0)
+            l_aux = (1.0 - cos_align).mean()
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 

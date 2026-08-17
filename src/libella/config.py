@@ -82,7 +82,7 @@ class RunConfig:
     # Loss Functions & Regularization
     delta_clamp: float = 30.0
     dynamic_w_ema_weight: float = 0.10
-    asym_penalty_weight: float = 2.0
+    asym_penalty_weight: float = 0.50
     zero_mask_rate: float = 0.05
 
     l1_coeff: float = 2.5e-2
