@@ -557,7 +557,7 @@ def train_gnn(
         master_latent_path = out_dir / "libella_latent.npz"
         if not master_latent_path.exists():
             export_latents_from_graphs(model, graph_paths, out_dirs["out"], device)
-    return model, history, n_latents
+        return model, history, n_latents
 
     model, history = _train_loop(
         model, optimizer, scheduler, training_cache, start_epoch, best_composite_score, tracker_state, history
@@ -567,4 +567,3 @@ def train_gnn(
     return model, history, n_latents
 
 
-    
