@@ -245,7 +245,7 @@ def _train_loop(
 
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
         total_steps_per_epoch = len(meta_batches)
-        alpha_ema = min(0.005, 1.0 / (total_steps_per_epoch * 2.0 + 1e-9))
+        alpha_ema = min(cfg.alpha_ema_max, 1.0 / (total_steps_per_epoch * cfg.alpha_ema_step_multiplier + 1e-9))
         ema_latent_freq = None
         nan_detected = False
 
@@ -273,10 +273,15 @@ def _train_loop(
 
                 prog = tracker.get_progress()
                 model.current_progress = prog
-                # Linear schedule for scale and alpha to prevent early 1-hot saturation
+                
+                # Bounded Entmax Curvature Schedule
+                alpha_val = getattr(tracker, "alpha", cfg.alpha_start + (cfg.alpha_end - cfg.alpha_start) * prog)
+                model.current_alpha = float(np.clip(alpha_val, cfg.alpha_start, cfg.alpha_end))
+                
+                # Dynamic Sparsity Scale (Forces logit separation over time)
                 model.current_scale = cfg.scale_start + (cfg.scale_end - cfg.scale_start) * prog
-                model.current_alpha = cfg.alpha_start + (cfg.alpha_end - cfg.alpha_start) * prog
-                model.current_temp = cfg.temp_start + (cfg.temp_end - cfg.temp_start) * prog
+                
+                model.current_temp = getattr(tracker, "temp", cfg.temp_start + (cfg.temp_end - cfg.temp_start) * prog)
 
                 # 1. Defensive Forward Execution
                 forward_res = model(x, src, dst, weights)
@@ -317,7 +322,7 @@ def _train_loop(
 
                 # 3. GPU Telemetry Tracking
                 with torch.no_grad():
-                    batch_active = (z_train > 0).float()
+                    batch_active = (z_train > cfg.active_latent_threshold).float()
                     current_freq = batch_active.mean(dim=0)
                     
                     if ema_latent_freq is None:
@@ -362,7 +367,7 @@ def _train_loop(
                         w_mat = w_mat / torch.clamp(w_mat.mean(), min=1e-5)
                         
                         raw_delta_val = val_recon - x_val
-                        asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * 2.0) * (raw_delta_val < 0).to(x_val.dtype)
+                        asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * cfg.asym_penalty_weight) * (raw_delta_val < 0).to(x_val.dtype)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
                         val_loss_sum = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
@@ -461,8 +466,8 @@ def _train_loop(
             'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2),
             'z_mag_mean': round(epoch_telemetry.get('z_mag_mean', 0.0), 4),
             'tracker': {
-                'alpha': round(getattr(tracker, 'alpha', 1.7), 4),
-                'temp': round(getattr(tracker, 'temp', 0.3), 4),
+                'alpha': round(getattr(tracker, 'alpha', cfg.alpha_start), 4),
+                'temp': round(getattr(tracker, 'temp', cfg.temp_start), 4),
                 'progress': round(tracker.get_progress(), 4)
             }
         }
@@ -498,7 +503,7 @@ def _train_loop(
                 "history": history
             }, checkpoint_path)
 
-        if ((epoch + 1) % 5 == 0 or epoch == cfg.epochs - 1) and not nan_detected:
+        if ((epoch + 1) % cfg.checkpoint_freq == 0 or epoch == cfg.epochs - 1) and not nan_detected:
             autopsy_dir = out_dir / "autopsy_checkpoints"
             autopsy_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "metrics": epoch_metrics}, autopsy_dir / f"epoch_{(epoch+1):03d}.pt")
@@ -527,7 +532,7 @@ def _train_loop(
                 )
 
         epochs_remaining = cfg.epochs - epoch - 1
-        if tracker.phase == 1 and epochs_remaining <= 20:
+        if tracker.phase == 1 and epochs_remaining <= cfg.phase2_force_window:
             tqdm.write(f"\n[!] Approaching max epochs ({cfg.epochs}). Forcing Phase 2.")
             tracker.force_phase2(epoch, epoch_telemetry.get('l_rec', 0.0))
 

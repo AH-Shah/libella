@@ -19,84 +19,91 @@ def init_env():
 
 @dataclass
 class RunConfig:
-    """Pipeline configuration schema."""
+    # Execution & Pipeline
     mode: str = "PUBLISH"
     force_retrain: bool = False
-    
-    # Execution Phases & Setup
     phase: str = "ALL"
     unsupervised: bool = False
 
-    # --- Telemetry & Logging Flags ---
-    telemetry: str = "none"              # Choices: "none", "basic", "latents", "gradients", "all"
-    telemetry_layers: str = "all"        # Target specific layers (e.g. "gate_proj,decoder_weight")
-    logger_backend: str = "tensorboard"  # "none" or "tensorboard"
-    telemetry_step_freq: int = 10        # Log deep gradients every N batches (0 = epoch only)
-    log_histograms: bool = False         # Track full parameter distributions
-    
-    # Native K Controllers
-    n_prior_lineages: int = 30   
-    n_dict_components: int = 100
-    n_latents: int | None = 36
-    
+    # Logging & Telemetry
+    telemetry: str = "none"
+    telemetry_layers: str = "all"
+    logger_backend: str = "tensorboard"
+    telemetry_step_freq: int = 10
+    log_histograms: bool = False
+
+    # Architecture Capacities
     hidden_dim: int = 128
     k_hops: int = 2
+    n_prior_lineages: int = 30
+    n_dict_components: int = 100
+    n_latents: int | None = 36
     extra_topics: int = 0
-    
+
+    # Training & Batches
+    epochs: int = 300
     batch_size: int = 5000
     meta_batch_size: int = 5
-    epochs: int = 300
+    checkpoint_freq: int = 5
+    phase2_force_window: int = 20
 
-    # Graph Construction & Data
+    # Graph & Data
     k_neighbors: int = 11
     moran_k: int = 7
     chunk_size: int = 2000
     feature_cap: int = 50_000
-    
     top_n_genes: int = 2000
     max_cells_per_sample: int = 1_000_000
     prior_cells_per_sample: int = 5_000_000
-    
-    # Model Physics & Schedules
-    dict_temp: float = 0.25
-    att_temp: float = -2.25
-    gnn_shift_weight: float = 0.5
+
+    # GNN Physics & Message Passing
     train_noise: float = 0.05
     edge_dropout: float = 0.40
-    scale_start: float = 5.0                # Phase 1: Mild logit scaling (L0 ≈ 8-12 for exploration)
-    scale_end: float = 10.0                 # Phase 2: Calibrated scaling (L0 ≈ 3-5 for sharp boundaries)
-    alpha_start: float = 1.15
-    alpha_end: float = 1.45                  # Stable Entmax curvature (prevents 1-hot argmax collapse)
+    edge_sim_threshold: float = 0.10
+    edge_decay_slope: float = 10.0
+    appnp_alpha_scale: float = 0.85
+    appnp_alpha_offset: float = 0.10
+    att_temp: float = -2.25
+    att_temp_min: float = 0.5
+    att_temp_max: float = 3.0
+    spatial_gain_init: float = 2.0
+
+    # Latent Scaling & Gating Dynamics
+    scale_start: float = 8.0
+    scale_end: float = 16.0
+    alpha_start: float = 1.35
+    alpha_end: float = 1.50
     temp_start: float = 1.5
     temp_end: float = 0.3
+    active_latent_threshold: float = 1e-4
+    alpha_ema_max: float = 0.005
+    alpha_ema_step_multiplier: float = 2.0
 
-    # Loss & Regularization (Preserved + Native SAE Controls)
-    kl_weight: float = 5
-    kl_base: float = 0.25
-    kl_collapse_weight: float = 3.0
-    hub_threshold: float = 0.2
-    anchor_peak_threshold: float = 0.50
-    ortho_weight: float = 10.0
-    ortho_overlap_threshold: float = 0.15
-    ortho_margin: float = 0.10             # SAE Oblique Cosine Margin on Unit Sphere
-    tsallis_alpha: float = 1.5
+    # Loss Functions & Regularization
     delta_clamp: float = 30.0
+    dynamic_w_ema_weight: float = 0.10
+    asym_penalty_weight: float = 2.0
     zero_mask_rate: float = 0.05
-    
-    # Native SAE Sparsity & Capacity Engine (Calibrated)
-    l1_coeff: float = 8e-3                 # Stronger L1 pressure to enforce L0 ≈ 3-6 (kills chimerism)
-    aux_weight: float = 0.01               # Minimal AuxK pull to protect boundary contrast# Gentle AuxK revival (prevents noise overfitting)
-    aux_k: int = 4                         # Top-k dead atoms per batch
-    dead_step_threshold: int = 200         # Latents must be idle for 200 steps before revival
-    ortho_sample_size: int = 128           # Low memory Gram matrix slice
 
-    # Optimizers
+    l1_coeff: float = 8e-3
+    sparsity_min_scale: float = 0.10
+    sparsity_prog_pow: float = 0.80
+
+    ortho_weight: float = 5.0
+    ortho_overlap_threshold: float = 0.35
+    ortho_barrier_scale: float = 4.0
+    ortho_min_scale: float = 0.50
+
+    aux_weight: float = 0.50
+    aux_k: int = 4
+    aux_min_k: int = 2
+    aux_min_residual_energy: float = 0.05
+    dead_step_threshold: int = 200
+
+    # Optimizers & Gradients
     lr_base: float = 0.001
     wd_base: float = 1e-4
-    lr_decoder: float = 0.001              # Isolated learning rate for Unit-Norm Oblique Decoder
-    lr_threshold: float = 0.0005           # Learning rate for Jump thresholds (θ)
-    lr_anchor: float = 0.001
-    wd_anchor: float = 0
+    lr_decoder: float = 0.001
     grad_clip: float = 5.0
 
     # Inference & Topology

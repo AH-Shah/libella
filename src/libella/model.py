@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from entmax import entmax_bisect
 
 from .config import cfg
-from .utils import scatter_softmax
+from .utils import scatter_softmax, PhaseTracker
 
 
 class LibellaGNN(nn.Module):
@@ -65,7 +65,7 @@ class LibellaGNN(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents)
         )
-        self.spatial_gain = nn.Parameter(torch.tensor(2.0))
+        self.spatial_gain = nn.Parameter(torch.tensor(cfg.spatial_gain_init))
 
         
 
@@ -106,7 +106,7 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor, 
         dst: torch.Tensor, 
         edge_weights: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(src) > 0:
             src = src.contiguous()
             dst = dst.contiguous()
@@ -119,19 +119,19 @@ class LibellaGNN(nn.Module):
         h_0 = self.lin_appnp(self.ctx_enc(x_norm))
         N = h_0.size(0)
 
-        # 2. Smooth Bilateral Edge Decay preserving sparse cell connectivity
+        # 2. Smooth Bilateral Edge Decay (Preserves sparse cell graph connectivity)
         if len(src) > 0:
             with torch.no_grad():
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1)
-                # Soft bilateral weighting: retains connections across sparse boundaries
-                decay = torch.sigmoid((cos_sim - 0.2) * 5.0)
+
+            decay = torch.sigmoid((cos_sim - cfg.edge_sim_threshold) * cfg.edge_decay_slope)
         else:
             decay = torch.ones_like(edge_weights)
             
         W_bil = edge_weights * decay
 
         # 3. K-Hop Spatial Message Passing Loop
-        alpha = torch.sigmoid(self.alpha_proj(h_0)) * 0.85 + 0.10
+        alpha = torch.sigmoid(self.alpha_proj(h_0)) * cfg.appnp_alpha_scale + cfg.appnp_alpha_offset
         inv_alpha = 1.0 - alpha
         h_0_scaled = h_0 * alpha
 
@@ -145,7 +145,7 @@ class LibellaGNN(nn.Module):
                 h_edge = h_src_proj[src] + h_dst_proj[dst] + edge_proj
                 
                 e_raw = self.gat_a(F.leaky_relu(h_edge)).squeeze(-1)
-                tau = torch.clamp(F.softplus(self.att_temp) + 0.5, min=0.5, max=3.0)
+                tau = torch.clamp(F.softplus(self.att_temp) + cfg.att_temp_min, min=cfg.att_temp_min, max=cfg.att_temp_max)
                 alpha_att = scatter_softmax(e_raw / tau, dst, N)
                 
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
@@ -179,20 +179,14 @@ class LibellaGNN(nn.Module):
         # 5. Decoupled Dual-Stream Projections with Dictionary-Coupled Gating
         z_mag = self.mag_enc(x_norm)
         
-        # Direct projection against unit-norm dictionary atoms (exact cosine similarity)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
         bio_sim = torch.mm(x_norm, w_dec_norm.t())
         
-        # Contextual spatial correction from GNN with active gradient scaling
         spatial_shift = self.gate_spatial_proj(h_norm)
+        base_logits = bio_sim + (self.spatial_gain * spatial_shift)
         
-        # Normalize variances so neither stream dominates gating
-        bio_sim_norm = (bio_sim - bio_sim.mean(dim=-1, keepdim=True)) / (bio_sim.std(dim=-1, keepdim=True) + 1e-5)
-        spatial_shift_norm = (spatial_shift - spatial_shift.mean(dim=-1, keepdim=True)) / (spatial_shift.std(dim=-1, keepdim=True) + 1e-5)
-        
-        base_logits = bio_sim_norm + (self.spatial_gain * spatial_shift_norm)
-        
-        current_scale = getattr(self, 'current_scale', 4.0)
+        # Dynamic scale: starts at 8.0 for exploration, ramps to 14.0 for sharp cell boundaries
+        current_scale = getattr(self, 'current_scale', cfg.scale_end)
         gate_logits = base_logits * current_scale
 
         return z_mag, gate_logits, cell_mass
@@ -204,23 +198,26 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor, 
         edge_weights: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
-        z_mag, gate_logits, cell_mass, w_dec_pos = self.encode(x_dense, src, dst, edge_weights)
+        # Unpack the 3 tensors returned by encode
+        z_mag, gate_logits, cell_mass = self.encode(x_dense, src, dst, edge_weights)
 
-        # 1. Retrieve PhaseTracker variables populated by the training loop with bounded curvature
-        raw_alpha = getattr(self, 'current_alpha', getattr(cfg, 'inference_alpha', 1.5))
-        current_alpha = max(1.15, min(1.40, raw_alpha))
-        current_temp = getattr(self, 'current_temp', getattr(cfg, 'inference_temp', 0.3))
+
+        # 1. Retrieve dynamic alpha scheduled by the training loop
+        current_alpha = float(getattr(self, 'current_alpha', cfg.alpha_start))
+        current_temp = getattr(self, 'current_temp', cfg.temp_end)
         progress = getattr(self, 'current_progress', 1.0)
         
-        # 2. Calibrated Entmax Simplex Gating (Maintains L0 in 3-5 range)
+        # 2. Simplex gating providing non-vanishing gradients across co-active latents
         gate_probs = entmax_bisect(gate_logits, alpha=current_alpha, dim=-1)
 
-        # 3. Bio-SAE Activation: Simplex Gate * Softplus Magnitude
-        z = z_mag * gate_probs
 
-        w_dec_pos = F.softmax(self.decoder_weight, dim=-1)
+        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        x_recon = torch.mm(z, w_dec_pos) * cell_mass + (cell_mass * self.decoder_bias.unsqueeze(0))
+        # 3. Bio-SAE Activation: Independent magnitude per gene program
+        z = gate_probs * z_mag
+
+        # 4. Reconstruct via direct matrix multiplication with normalized dictionary
+        x_recon = torch.mm(z, w_dec_norm) * cell_mass + self.decoder_bias.unsqueeze(0)
 
         # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
         aux_recon = None
@@ -228,7 +225,7 @@ class LibellaGNN(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                active_in_batch = (gate_probs > 1e-4).any(dim=0)
+                active_in_batch = (gate_probs > cfg.active_latent_threshold).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
                 dead_mask = self.steps_since_active >= self.dead_step_threshold
@@ -238,18 +235,18 @@ class LibellaGNN(nn.Module):
             r_norm = (x_norm - x_recon_norm).detach()
             residual_energy = r_norm.norm(p=2, dim=-1).mean()
 
-            if dead_mask.any() and residual_energy > 0.05:
+            if dead_mask.any() and residual_energy > cfg.aux_min_residual_energy:
                 dead_indices = torch.nonzero(dead_mask).squeeze(-1)
                 num_dead = dead_indices.numel()
-                k_aux = min(max(2, self.aux_k), num_dead)
+                k_aux = min(max(cfg.aux_min_k, self.aux_k), num_dead)
 
-                w_dead = w_dec_pos[dead_indices]
+                w_dead = w_dec_norm[dead_indices]
                 aux_logits = torch.mm(r_norm, w_dead.t())
                 topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
                 z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
                 aux_recon = torch.mm(z_aux, w_dead)
 
-        return x_recon, z, w_dec_pos, aux_recon, r_norm, z_mag
+        return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag
 
     def calc_loss(
         self, 
@@ -268,13 +265,13 @@ class LibellaGNN(nn.Module):
         current_dynamic_w = (num_zeros / num_pos).detach()
 
         if self.training:
-            self.dynamic_w_ema.lerp_(current_dynamic_w, weight=0.1)
+            self.dynamic_w_ema.lerp_(current_dynamic_w, weight=cfg.dynamic_w_ema_weight)
 
         w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
         w_mat = w_mat / torch.clamp(w_mat.mean(), min=1e-5)
 
         raw_delta = recon_x - x_true
-        asym_factor = 1.0 + (is_non_zero.float() * 2.0) * (raw_delta < 0).float()
+        asym_factor = 1.0 + (is_non_zero.float() * cfg.asym_penalty_weight) * (raw_delta < 0).float()
         
         delta_clamp = getattr(cfg, 'delta_clamp', 30.0)
         scaled_delta = torch.clamp(raw_delta * asym_factor, min=-delta_clamp, max=delta_clamp)
@@ -285,9 +282,8 @@ class LibellaGNN(nn.Module):
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
         off_diag = gram * self.ortho_mask
         
-        # Exponential penalty on atom pairs exceeding biological overlap threshold (0.35)
-        excess_corr = F.relu(off_diag - 0.35)
-        l_ortho = torch.exp(4.0 * excess_corr).sub(1.0).sum() / (self.n_latents * (self.n_latents - 1))
+        excess_corr = F.relu(off_diag - cfg.ortho_overlap_threshold)
+        l_ortho = torch.exp(cfg.ortho_barrier_scale * excess_corr).sub(1.0).sum() / (self.n_latents * (self.n_latents - 1))
 
         # 3. Sparsity Loss
         l_sparse = z.mean()
@@ -299,13 +295,13 @@ class LibellaGNN(nn.Module):
             l_aux = torch.tensor(0.0, device=x_true.device)
 
         # 5. Combined Dynamic Schedules
-        base_l1 = getattr(cfg, 'l1_coeff', 1e-3)
-        base_ortho = getattr(cfg, 'ortho_weight', 2.0)
-        aux_weight = getattr(cfg, 'aux_weight', 1.0)
+        base_l1 = cfg.l1_coeff
+        base_ortho = cfg.ortho_weight
+        aux_weight = cfg.aux_weight
 
-        sparsity_multiplier = 0.10 + 0.90 * (progress ** 0.8)
+        sparsity_multiplier = cfg.sparsity_min_scale + (1.0 - cfg.sparsity_min_scale) * (progress ** cfg.sparsity_prog_pow)
         current_l1 = base_l1 * sparsity_multiplier
-        current_ortho = base_ortho * (0.5 + 0.5 * progress)
+        current_ortho = base_ortho * (cfg.ortho_min_scale + (1.0 - cfg.ortho_min_scale) * progress)
 
         total_loss = l_recon + (current_ortho * l_ortho) + (current_l1 * l_sparse) + (aux_weight * l_aux)
 
