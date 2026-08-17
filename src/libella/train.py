@@ -499,6 +499,67 @@ def _train_loop(
     else:
         print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
+    # -------------------------------------------------------------
+    # Post-Training: Export Master & Sample-Specific Latents
+    # -------------------------------------------------------------
+    print("\n-> Extracting & Exporting Libella Latent Representations...")
+    import pandas as pd
+    
+    model.eval()
+    latent_records = []
+    latent_cols = [f"MP_{i+1}" for i in range(model.n_latents)]
+    
+    with torch.no_grad():
+        for chunk in training_cache:
+            x = chunk["x"].to(device=device, non_blocking=True)
+            src = chunk["src"].to(device=device, non_blocking=True)
+            dst = chunk["dst"].to(device=device, non_blocking=True)
+            weights = chunk["weights"].to(device=device, non_blocking=True)
+            
+            x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
+            if device.type != 'mps':
+                src, dst = src.to(torch.int64), dst.to(torch.int64)
+
+            # Compute sparse latent activations (z)
+            _, z, _, _, _ = model(x, src, dst, weights)
+            
+            # Slice back to unpadded chunk length if padded
+            n_cells = chunk["x"].size(0)
+            z_np = z[:n_cells].detach().cpu().numpy()
+            
+            # Extract cell identifiers / barcodes if present, else fallback to indices
+            if "barcodes" in chunk:
+                cell_ids = chunk["barcodes"]
+            elif "cell_ids" in chunk:
+                cell_ids = chunk["cell_ids"]
+            else:
+                cell_ids = [f"cell_{i}" for i in range(n_cells)]
+                
+            sample_id = chunk.get("sample_id", chunk.get("sample", "sample_default"))
+            
+            chunk_df = pd.DataFrame(z_np, index=cell_ids, columns=latent_cols)
+            chunk_df["sample_id"] = sample_id
+            latent_records.append(chunk_df)
+
+    if latent_records:
+        full_latents_df = pd.concat(latent_records, axis=0)
+
+        # 1. Save Master Latents (All Samples Combined)
+        master_latent_path = out_dir / "libella_latent.csv"
+        full_latents_df.to_csv(master_latent_path, index_label="cell_id")
+        print(f"  ↳ Master latents saved -> {master_latent_path}")
+
+        # 2. Save Sample-Specific Latents
+        sample_out_dir = out_dir / "sample_latents"
+        sample_out_dir.mkdir(parents=True, exist_ok=True)
+        
+        for s_id, sub_df in full_latents_df.groupby("sample_id"):
+            sample_file = sample_out_dir / f"{s_id}_latent.csv"
+            # Drop the sample_id column for clean matrix import into Seurat/Scanpy obsm
+            sub_df.drop(columns=["sample_id"]).to_csv(sample_file, index_label="cell_id")
+            
+        print(f"  ↳ Sample-specific latents saved ({len(full_latents_df['sample_id'].unique())} samples) -> {sample_out_dir}/")
+
     return model, history
 
 def train_gnn(
