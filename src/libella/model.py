@@ -214,12 +214,15 @@ class LibellaGNN(nn.Module):
         # 3. Bio-SAE Activation: Simplex Gate * Softplus Magnitude
         z = z_mag * gate_probs
 
-        # 4. Decode Compositional Profile
+        # 4. Decode Compositional Profile (Unit-Norm Oblique Projection)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        x_recon_comp = torch.mm(z, w_dec_norm)
+        raw_comp = torch.mm(z, w_dec_norm)
 
-        # 5. Restore Absolute Scale (Add Bias AFTER Mass Scaling)
-        x_recon = (x_recon_comp * cell_mass) + self.decoder_bias
+        # 5. Normalize Gene Profile to Sum = 1.0 (Fixes 20x Count Explosion)
+        comp_profile = raw_comp / torch.clamp(raw_comp.sum(dim=-1, keepdim=True), min=1e-6)
+
+        # 6. Restore Exact Cell Count Mass + Global Bias
+        x_recon = (comp_profile * cell_mass) + self.decoder_bias
 
         # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
         aux_recon = None
