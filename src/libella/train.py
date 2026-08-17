@@ -383,20 +383,7 @@ def _train_loop(
                 if hasattr(model, 'decoder_weight'):
                     model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
 
-            # --- NEW: STEP-LEVEL LOGGING ---
-            global_step += 1
-            if getattr(cfg, "telemetry_step_freq", 0) > 0 and (global_step % cfg.telemetry_step_freq == 0):
-                # 1. Log basic step loss and learning rate
-                step_metrics = {
-                    "step/batch_loss": true_batch_loss.item(),
-                    "step/lr": optimizer.param_groups[0]['lr'],
-                    **logger.get_memory_metrics(device)
-                }
-                logger.log_metrics(global_step, step_metrics)
-                
-                # 2. Log your deep model telemetry (gradients & dictionary health)
-                logger.log_model_telemetry(global_step, model, log_histograms=getattr(cfg, "log_histograms", False))
-            # -------------------------------
+            
 
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
