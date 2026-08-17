@@ -132,44 +132,26 @@ class LibellaGNN(nn.Module):
             src = src.contiguous()
             dst = dst.contiguous()
 
-        # 1. Depth Disentanglement: Extract mass and compute normalized input
+        # 1. Depth Disentanglement: Extract library mass and L2 normalized counts
         cell_mass = torch.clamp(x_dense.sum(dim=-1, keepdim=True), min=1e-5)
         x_norm = F.normalize(x_dense, p=2, dim=-1)
 
-        # 2. Local Identity and Initial Context representations
         h_id = self.id_enc(x_norm)
         h_0 = self.lin_appnp(self.ctx_enc(x_norm))
-        
-
-        macro_ctx = h_0.mean(dim=0)
-        dict_shift = torch.tanh(self.spatial_bridge(macro_ctx)) * 2.0
-        
-        dynamic_logits = self.topic_gene_logits + dict_shift.view(self.n_metaprograms, -1)
-        
-        soft_anchors = F.softmax(dynamic_logits, dim=-1)
-        
-
-        safe_temp = torch.clamp(self.dict_temp, min=0.25, max=1.0)
-        sharp_anchors = F.softmax(dynamic_logits / safe_temp, dim=-1)
-        
-        anchors_raw = sharp_anchors.detach() + soft_anchors - soft_anchors.detach()
-
-        
         N = h_0.size(0)
-        
-        # 2. GNN Edge Decay 
+
+        # 2. Bilateral Graph Edge Decay (Direct Euclidean Metric on Normalized Expression)
         if len(src) > 0:
             with torch.no_grad():
-                bio_h = torch.mm(x_dense, anchors_raw.detach().t())
-                # 🚨 MPS FIX: Use direct multiplication instead of .pow(2)
-                diff = bio_h[src] - bio_h[dst]
+                diff = x_norm[src] - x_norm[dst]
                 dist = (diff * diff).sum(dim=1)
             decay = torch.exp(-F.softplus(self.gamma) * dist)
         else:
             decay = torch.ones_like(edge_weights)
             
-        W_bil = edge_weights * decay 
-        
+        W_bil = edge_weights * decay
+
+        # 3. K-Hop Spatial Message Passing Loop (Preserved)
         alpha = torch.sigmoid(self.alpha_proj(h_0)) * 0.85 + 0.10
         inv_alpha = 1.0 - alpha
         h_0_scaled = h_0 * alpha
@@ -196,6 +178,7 @@ class LibellaGNN(nn.Module):
             agg = F.silu(self.mp_update(out))
             h_ctx = agg * inv_alpha + h_0_scaled
 
+        # 4. Identity-Context Cross-Attention Bottleneck (Preserved)
         Q = self.q_proj(h_id)
         K = self.k_proj(h_ctx)
         V = self.v_proj(h_ctx)
@@ -205,7 +188,6 @@ class LibellaGNN(nn.Module):
         
         src_with_self = torch.cat([src, self_loops]) if len(src) > 0 else self_loops
         dst_with_self = torch.cat([dst, self_loops]) if len(src) > 0 else self_loops
-
             
         q_dst = Q[dst_with_self]
         k_src = K[src_with_self]
@@ -214,7 +196,6 @@ class LibellaGNN(nn.Module):
         cross_scores = (q_dst * k_src).sum(dim=-1) / (self.hidden_dim ** 0.5)
         cross_att = scatter_softmax(cross_scores, dst_with_self, N)
         
-
         pulled_msg = (v_src * cross_att.unsqueeze(1)).contiguous()
         ctx_pulled = torch.zeros_like(Q)
         ctx_pulled.index_add_(0, dst_with_self, pulled_msg)
@@ -222,11 +203,8 @@ class LibellaGNN(nn.Module):
         h_final = h_id + self.context_gate(ctx_pulled)
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
-        # 1. Compute Decoupled Streams
-        # A. Local Magnitude Stream (unaffected by neighbor graph smoothing)
+        # 5. Decoupled Dual-Stream Projections
         z_mag = self.mag_enc(x_norm)
-
-        # B. Spatial Context Gating Stream (conditioned by spatial graph)
         gate_logits = self.gate_proj(h_norm)
 
         return z_mag, gate_logits, cell_mass
@@ -316,33 +294,39 @@ class LibellaGNN(nn.Module):
         w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
         raw_delta = recon_x - x_true
         asym_factor = 1.0 + (is_non_zero.float() * 2.0) * (raw_delta < 0).float()
-        scaled_delta = torch.clamp(raw_delta * asym_factor, min=-30.0, max=30.0)
+        
+        delta_clamp = getattr(cfg, 'delta_clamp', 30.0)
+        scaled_delta = torch.clamp(raw_delta * asym_factor, min=-delta_clamp, max=delta_clamp)
 
         l_recon = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_true.numel())
 
-        # --- OPTIMIZATION 4: Strided / Subsampled Oblique Orthogonality ---
+        # 2. Strided / Subsampled Oblique Orthogonality
+        ortho_margin = getattr(cfg, 'ortho_margin', 0.10)
         if self.ortho_sample_size < self.n_latents:
-            # Sample a subset of rows to construct a rectangular (B_sub x M) Gram strip
             sample_idx = torch.randint(0, self.n_latents, (self.ortho_sample_size,), device=w_dec_norm.device)
             w_sub = w_dec_norm[sample_idx]
             sub_mask = self.ortho_mask[sample_idx]
             cosine_sim = torch.mm(w_sub, w_dec_norm.t()) * sub_mask
-            l_ortho = (F.relu(cosine_sim - 0.10) ** 2).sum() / (self.ortho_sample_size * (self.n_latents - 1))
+            l_ortho = (F.relu(cosine_sim - ortho_margin) ** 2).sum() / (self.ortho_sample_size * (self.n_latents - 1))
         else:
             cosine_sim = torch.mm(w_dec_norm, w_dec_norm.t()) * self.ortho_mask
-            l_ortho = (F.relu(cosine_sim - 0.10) ** 2).sum() / (self.n_latents * (self.n_latents - 1))
+            l_ortho = (F.relu(cosine_sim - ortho_margin) ** 2).sum() / (self.n_latents * (self.n_latents - 1))
 
-        # 2. Sparsity Penalty
+        # 3. Sparsity Loss (L1 proxy on latent code)
         l_sparse = z.mean()
 
-        # --- OPTIMIZATION 2: AuxK Residual Loss ---
+        # 4. AuxK Residual Loss for Dead Feature Revival
         if aux_recon is not None and r_norm is not None:
             l_aux = F.mse_loss(aux_recon, r_norm)
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # Combined Loss
-        total_loss = l_recon + (10.0 * l_ortho) + (cfg.l1_coeff * l_sparse) + (0.5 * l_aux)
+        # 5. Combined Loss with Safe Hyperparameter Lookups
+        l1_coeff = getattr(cfg, 'l1_coeff', 1e-3)
+        ortho_weight = getattr(cfg, 'ortho_weight', 10.0)
+        aux_weight = getattr(cfg, 'aux_weight', 0.5)
+
+        total_loss = l_recon + (ortho_weight * l_ortho) + (l1_coeff * l_sparse) + (aux_weight * l_aux)
 
         return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
         
