@@ -49,18 +49,19 @@ class LibellaGNN(nn.Module):
         )
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
 
-        # --- 1. Stabilized Local Magnitude Stream ---
+        # 1. Sharp Cell-Autonomous Magnitude Stream (Exact Zeros via ReLU)
         self.mag_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents),
             nn.LayerNorm(self.n_latents),
-            nn.Softplus(beta=1.0)
+            nn.ReLU()
         )
 
-        # --- 2. Context Gating Stream ---
-        self.gate_proj = nn.Sequential(
+        # 2. Dual-Stream Gate: Direct Single-Cell Identity + Spatial Prior Shift
+        self.gate_id_proj = nn.Linear(in_channels, self.n_latents)
+        self.gate_spatial_proj = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents)
