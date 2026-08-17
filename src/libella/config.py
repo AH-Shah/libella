@@ -70,7 +70,7 @@ class RunConfig:
 
     # Latent Scaling & Gating Dynamics
     scale_start: float = 8.0
-    scale_end: float = 36.0
+    scale_end: float = 42.0
     alpha_start: float = 1.35
     alpha_end: float = 1.50
     temp_start: float = 1.5
@@ -85,7 +85,7 @@ class RunConfig:
     asym_penalty_weight: float = 0.50
     zero_mask_rate: float = 0.05
 
-    l1_coeff: float = 6.0e-2
+    l1_coeff: float = 8.0e-2
     sparsity_min_scale: float = 0.10
     sparsity_prog_pow: float = 0.80
 
@@ -94,11 +94,11 @@ class RunConfig:
     ortho_barrier_scale: float = 4.0
     ortho_min_scale: float = 0.50
 
-    aux_weight: float = 0.2
+    aux_weight: float = 0.5
     aux_k: int = 4
     aux_min_k: int = 2
     aux_min_residual_energy: float = 0.05
-    dead_step_threshold: int = 200
+    dead_step_threshold: int = 150
 
     # Optimizers & Gradients
     lr_base: float = 0.001
