@@ -242,10 +242,11 @@ class LibellaGNN(nn.Module):
                 k_aux = min(max(cfg.aux_min_k, cfg.aux_k), num_dead)
 
                 w_dead = w_dec_norm[dead_indices]
-                # High-gain projection of unexplained residual variance
-                aux_logits = torch.mm(r_norm, w_dead.t()) / 0.20
-                topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
-                z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
+                aux_logits = torch.mm(r_norm, w_dead.t())
+                # Top-K on raw alignment ensures dead atoms always receive gradient updates
+                topk_aux = torch.topk(aux_logits, k=k_aux, dim=-1)
+                topk_weights = F.softplus(topk_aux.values)
+                z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_weights)
                 aux_recon = torch.mm(z_aux, w_dead)
 
         return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag
@@ -290,9 +291,10 @@ class LibellaGNN(nn.Module):
         # 3. Sparsity Loss
         l_sparse = z.mean()
 
-        # 4. AuxK Residual Loss: Cosine alignment prevents 1/D gradient vanishing
+        # 4. AuxK Residual Loss: Normalized cosine alignment with stable gradient scaling
         if aux_recon is not None and r_norm is not None:
-            cos_align = F.cosine_similarity(aux_recon, r_norm, dim=-1).clamp(min=-1.0, max=1.0)
+            aux_recon_norm = F.normalize(aux_recon, p=2, dim=-1)
+            cos_align = (aux_recon_norm * r_norm).sum(dim=-1).clamp(min=-1.0, max=1.0)
             l_aux = (1.0 - cos_align).mean()
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
