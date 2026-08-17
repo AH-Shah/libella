@@ -106,7 +106,7 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor, 
         dst: torch.Tensor, 
         edge_weights: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(src) > 0:
             src = src.contiguous()
             dst = dst.contiguous()
@@ -199,8 +199,8 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor, 
         dst: torch.Tensor, 
         edge_weights: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        z_mag, gate_logits, cell_mass = self.encode(x_dense, src, dst, edge_weights)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        z_mag, gate_logits, cell_mass, w_dec_pos = self.encode(x_dense, src, dst, edge_weights)
 
         # 1. Retrieve PhaseTracker variables populated by the training loop
         current_alpha = getattr(self, 'current_alpha', getattr(cfg, 'inference_alpha', 1.25))
