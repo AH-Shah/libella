@@ -26,6 +26,11 @@ class RunConfig:
     # Execution Phases & Setup
     phase: str = "ALL"
     unsupervised: bool = False
+
+    # --- Telemetry Control Flags ---
+    telemetry: str = "none"        # Choices: "none", "basic", "latents", "gradients", "all"
+    telemetry_step_freq: int = 10   # Log step-level metrics every N batches (0 = epoch only)
+    telemetry_layers: str = "all"   # Target specific layers (e.g. "gate_proj,decoder_weight,q_proj")
     
     # Native K Controllers
     n_prior_lineages: int = 30   

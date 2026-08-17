@@ -1,16 +1,19 @@
+"""Libella Command Line Pipeline Interface."""
+
 import argparse
+import dataclasses
 import gc
 import json
 import multiprocessing
 from pathlib import Path
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
-import dataclasses
 
-from .config import RunConfig, cfg, paths, init_env
-from .data import get_consensus_genes, build_graph_safe
+from .config import RunConfig, cfg, init_env, paths
+from .data import build_graph_safe, get_consensus_genes
 from .inference import (
     get_ecotypes,
     make_domains,
@@ -18,9 +21,10 @@ from .inference import (
     process_pt,
     run_meta,
 )
-from .model import LibellaGNN              
+from .model import LibellaGNN
 from .train import train_gnn
-from .utils import get_device, get_whitelist # Moved import here
+from .utils import get_device, get_whitelist
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for pipeline execution."""
@@ -39,7 +43,6 @@ def parse_args() -> argparse.Namespace:
             arg_name = f"--{field.name.replace('_', '-')}"
             f_type = type(getattr(dummy_cfg, field.name)) if getattr(dummy_cfg, field.name) is not None else float
             
-            # Handle boolean toggles appropriately
             if f_type == bool:
                 parser.add_argument(arg_name, type=lambda x: (str(x).lower() == 'true'), default=None, help=f"Override {field.name}")
             else:
@@ -47,23 +50,23 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
+
 def setup_config_from_args(args: argparse.Namespace) -> None:
     """Update the global config instance dynamically based on CLI args."""
     new_cfg = RunConfig.from_mode(args.mode)
     new_cfg.force_retrain = args.force_retrain
     
-    # Override defaults with any explicit CLI arguments provided by the user
     for field in dataclasses.fields(RunConfig):
         if field.name not in ["mode", "force_retrain", "suffix"]:
             val = getattr(args, field.name, None)
             if val is not None:
                 setattr(new_cfg, field.name, val)
     
-    # Update the global `cfg` object in-place
     for key, value in vars(new_cfg).items():
         setattr(cfg, key, value)
         
     paths.out_base = Path(args.out_dir).resolve()
+
 
 def run_pipeline(manifest_path: Path) -> None:
     """Execute the full Libella pipeline."""
@@ -86,14 +89,12 @@ def run_pipeline(manifest_path: Path) -> None:
     
     manifest["discovery"] = manifest["discovery"].astype(str).str.lower().isin(["true", "1", "yes", "t"])
     manifest["projection"] = manifest["projection"].astype(str).str.lower().isin(["true", "1", "yes", "t"])
-    
 
     if "patient_id" not in manifest.columns:
         manifest["patient_id"] = manifest["filepath"].apply(lambda x: Path(x).stem)
     if "dataset_id" not in manifest.columns:
         manifest["dataset_id"] = "Unknown"
         
-    # Build a metadata lookup dictionary
     file_metadata = {
         Path(row["filepath"]): {"pt_id": str(row["patient_id"]), "ds_id": str(row["dataset_id"])}
         for _, row in manifest.iterrows()
@@ -139,7 +140,6 @@ def run_pipeline(manifest_path: Path) -> None:
             
             clean_whitelist = set() if cfg.unsupervised else get_whitelist(paths.sig_csv)
             
-            # 🚨 ADDED: Pre-flight Gene Name Check
             if not cfg.unsupervised and len(discovery_files) > 0:
                 import scanpy as sc
                 _tmp_adata = sc.read_h5ad(discovery_files[0], backed='r')
@@ -178,8 +178,7 @@ def run_pipeline(manifest_path: Path) -> None:
 
         # --- TRAINING & PRIOR BLOCK ---
         if cfg.phase in ["ALL", "EXTRACT_PRIORS", "TRAIN"]:
-            print(f"\n[➤] PHASE 1b: GNN Training & MetaProgram Extraction")
-            # If we bypassed graph building, load preexisting ones
+            print("\n[➤] PHASE 1b: GNN Training & MetaProgram Extraction")
             if 'g_paths' not in locals():
                 g_paths = list(out_dirs["graphs"].glob("*_graph.pt"))
                 with open(genes_path, "r") as f: common_genes = json.load(f)
@@ -187,7 +186,6 @@ def run_pipeline(manifest_path: Path) -> None:
             model, hist, optimal_k = train_gnn(g_paths, common_genes)
             plot_curves(hist)
             
-            # Immediately destroy training model from memory
             del model
             gc.collect()
             if torch.backends.mps.is_available(): torch.mps.empty_cache()
@@ -202,7 +200,6 @@ def run_pipeline(manifest_path: Path) -> None:
         print("\n[➤] PHASE 2: Spatial Projection & Macro-Domain Smoothing")
         all_prebuilt_graphs = list(out_dirs["graphs"].glob("*_graph.pt"))
         
-        # Ensure dependencies exist if we launched straight into inference
         if 'common_genes' not in locals():
             with open(genes_path, "r") as f: common_genes = json.load(f)
 
@@ -214,11 +211,17 @@ def run_pipeline(manifest_path: Path) -> None:
                 raise FileNotFoundError(f"No trained model checkpoint found at {target_ckpt}. Run --phase TRAIN first.")
                 
             ckpt = torch.load(target_ckpt, map_location=get_device(), weights_only=False)
-            optimal_k = ckpt["model_state_dict"]["topic_gene_logits"].shape[0]
+            state_dict = ckpt.get("model_state_dict", ckpt)
+
+            if "decoder_weight" in state_dict:
+                optimal_k = state_dict["decoder_weight"].shape[0]
+            elif "topic_gene_logits" in state_dict:
+                optimal_k = state_dict["topic_gene_logits"].shape[0]
+            else:
+                optimal_k = getattr(cfg, 'n_latents', getattr(cfg, 'n_metaprograms', 64))
             
-            # Instantiate clean inference model
             infer_model = LibellaGNN(in_channels=len(common_genes), n_metaprograms=optimal_k).to(get_device())
-            infer_model.load_state_dict(ckpt["model_state_dict"])
+            infer_model.load_state_dict(state_dict, strict=False)
             infer_model.eval()
             
             common_genes, meta_names, used_topics = get_ecotypes(infer_model, all_prebuilt_graphs, common_genes)
@@ -254,6 +257,7 @@ def run_pipeline(manifest_path: Path) -> None:
             
         print(f"\n[✓] PIPELINE COMPLETE. All outputs saved to: {out_dir}\n")
 
+
 def main() -> None:
     try:
         multiprocessing.set_start_method("spawn", force=True)
@@ -263,6 +267,7 @@ def main() -> None:
     args = parse_args()
     setup_config_from_args(args)
     run_pipeline(Path(args.manifest.strip()))
+
 
 if __name__ == "__main__":
     main()
