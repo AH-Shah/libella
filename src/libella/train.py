@@ -508,21 +508,14 @@ def train_gnn(
     out_dirs = paths.make_dirs(cfg.suffix)
     checkpoint_path = out_dirs["checkpoint"]
 
-    # 1. Direct SAE Latent Dimension Resolution (Bypassing CPU Prior Factorization)
+    # 1. Resolve Native SAE Latent Dimension
     n_latents = getattr(cfg, "n_latents", getattr(cfg, "n_metaprograms", 512))
     print(f"[*] Initializing Native SAE Latent Space (M = {n_latents} features on unit sphere)...")
 
-    # 2. Initialize SAE Model & Optimizer
+    # 2. Initialize Model & Optimizers without legacy prior arrays
     model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
         common_genes, n_latents, checkpoint_path
     )
-    gc.collect()
-
-    # 2. _init_model will automatically check resume_latest.pt or checkpoint_path
-    model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
-        common_genes, n_latents, init_components, checkpoint_path
-    )
-    del init_components
     gc.collect()
 
     # 3. Only skip if all epochs were actually completed
