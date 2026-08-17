@@ -564,6 +564,8 @@ def train_gnn(
     )
     gc.collect()
     
+    export_latents_from_graphs(model, graph_paths, out_dirs["out"], device)
+    
     return model, history, n_latents
 
 
