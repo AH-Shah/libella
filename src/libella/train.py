@@ -30,16 +30,14 @@ from .utils import get_device, PhaseTracker
 
 def _init_model(
     common_genes: list[str], 
-    optimal_k: int, 
-    init_components: np.ndarray | None, 
+    n_latents: int, 
     checkpoint_path: Path | None = None
 ) -> tuple[LibellaGNN, torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler, float, dict[str, Any] | None, dict[str, list], int]:
     """Initialize GNN model, optimizers, and load state if available."""
     device = get_device()
     model = LibellaGNN(
         in_channels=len(common_genes), 
-        n_metaprograms=optimal_k, 
-        init_components=init_components
+        n_metaprograms=n_latents
     ).to(device)
     
     # 1. Isolate decoder, jump threshold, and backbone parameters
@@ -510,27 +508,19 @@ def train_gnn(
     out_dirs = paths.make_dirs(cfg.suffix)
     checkpoint_path = out_dirs["checkpoint"]
 
-    # 1. Get priors/slots as normal
-    init_components, optimal_k, _ = get_priors(graph_paths)
-    
-    if cfg.phase == "EXTRACT_PRIORS":
-        print("\n[✓] Phase 'EXTRACT_PRIORS' complete. Exiting before training.")
-        import sys; sys.exit(0)
+    # 1. Direct SAE Latent Dimension Resolution (Bypassing CPU Prior Factorization)
+    n_latents = getattr(cfg, "n_latents", getattr(cfg, "n_metaprograms", 512))
+    print(f"[*] Initializing Native SAE Latent Space (M = {n_latents} features on unit sphere)...")
 
-    n_extra_slots = getattr(cfg, 'extra_topics', getattr(cfg, 'extra_latents', 0))
-    if n_extra_slots > 0:
-        print(f"  ↳ Appending {n_extra_slots} extra randomized slots to the prior.")
-        if init_components is not None:
-            # Initialize extra dictionary atoms with isotropic Gaussian noise for unit-sphere projection
-            extra_slots = np.random.randn(n_extra_slots, init_components.shape[1]).astype(np.float32) * 0.05
-            init_components = np.vstack([init_components, extra_slots])
-            
-        optimal_k += n_extra_slots
+    # 2. Initialize SAE Model & Optimizer
+    model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
+        common_genes, n_latents, checkpoint_path
+    )
     gc.collect()
 
     # 2. _init_model will automatically check resume_latest.pt or checkpoint_path
     model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
-        common_genes, optimal_k, init_components, checkpoint_path
+        common_genes, n_latents, init_components, checkpoint_path
     )
     del init_components
     gc.collect()
@@ -538,7 +528,7 @@ def train_gnn(
     # 3. Only skip if all epochs were actually completed
     if start_epoch >= cfg.epochs:
         print(f"-> Training already reached target epoch ({start_epoch}/{cfg.epochs}). Skipping loop.")
-        return model, history, optimal_k
+        return model, history, n_latents
 
     training_cache = _prep_ssd_chunks(graph_paths)
     gc.collect()  
@@ -549,5 +539,5 @@ def train_gnn(
     )
     gc.collect()
     
-    return model, history, optimal_k
+    return model, history, n_latents
     
