@@ -3,7 +3,6 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from entmax import entmax_bisect
 from torch import nn
 
 from .config import cfg
@@ -90,23 +89,6 @@ class LibellaGNN(nn.Module):
         self.dead_step_threshold = getattr(cfg, 'dead_step_threshold', 100)
         self.aux_k = getattr(cfg, 'aux_k', min(32, max(4, self.n_latents // 16)))
         self.ortho_sample_size = getattr(cfg, 'ortho_sample_size', min(256, self.n_latents))
-
-        
-        if init_components is not None:
-            active_mask = (init_components > 0)
-
-
-            base_logits = np.where(active_mask, 2.0, -2.0)
-            
-            noise = np.random.randn(*base_logits.shape) * 0.1
-            init_logits = base_logits + noise
-            
-            self.topic_gene_logits = nn.Parameter(torch.tensor(init_logits, dtype=torch.float32))
-            self.register_buffer('anchor_logits', torch.tensor(init_logits, dtype=torch.float32).clone())
-
-        else:
-            self.topic_gene_logits = nn.Parameter(torch.randn(n_metaprograms, in_channels))
-            self.register_buffer('anchor_logits', torch.ones(n_metaprograms, in_channels))
 
         self.gamma = nn.Parameter(torch.tensor(1.0))
         self.alpha_proj = nn.Linear(self.hidden_dim, 1)
