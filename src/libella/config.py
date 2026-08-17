@@ -30,13 +30,13 @@ class RunConfig:
     # Native K Controllers
     n_prior_lineages: int = 30   
     n_dict_components: int = 100
-    k_override: int | None = None
+    k_override: int | None = 1024
     
     hidden_dim: int = 128
     k_hops: int = 2
     extra_topics: int = 0
     
-    batch_size: int = 10000
+    batch_size: int = 5000
     meta_batch_size: int = 5
     epochs: int = 300
 
