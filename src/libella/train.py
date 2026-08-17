@@ -565,3 +565,6 @@ def train_gnn(
     gc.collect()
     
     return model, history, n_latents
+
+
+    
