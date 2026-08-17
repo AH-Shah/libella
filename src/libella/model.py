@@ -216,13 +216,14 @@ class LibellaGNN(nn.Module):
             gate_probs = sparse_gate 
 
         # 3. Hybrid Bio-SAE Activation: Simplex Gate * ReLU Magnitude
-        # Entmax (gate_probs) restores boundary sharpness and prevents Chimerism.
-        # ReLU (z_mag) tracks true biological variance to fix R^2 = 0.0.
         z = z_mag * gate_probs
 
-        # 4. Decode with Unit-Norm Oblique Projection
+        # 4. Decode Compositional Profile
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        x_recon = torch.mm(z, w_dec_norm) + self.decoder_bias
+        x_recon_comp = torch.mm(z, w_dec_norm)
+
+        # 5. Restore Absolute Scale (Add Bias AFTER Mass Scaling)
+        x_recon = (x_recon_comp * cell_mass) + self.decoder_bias
 
         # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
         aux_recon = None
@@ -272,6 +273,10 @@ class LibellaGNN(nn.Module):
             self.dynamic_w_ema.lerp_(current_dynamic_w, weight=0.1)
 
         w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
+        
+        # Anchor the global loss scale so the trajectory doesn't artificially inflate over epochs
+        w_mat = w_mat / torch.clamp(w_mat.mean(), min=1.0)
+
         raw_delta = recon_x - x_true
         asym_factor = 1.0 + (is_non_zero.float() * 2.0) * (raw_delta < 0).float()
         
