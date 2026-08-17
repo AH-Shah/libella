@@ -236,7 +236,13 @@ class LibellaGNN(nn.Module):
                 # Identify dead features
                 dead_mask = self.steps_since_active >= self.dead_step_threshold
 
-            if dead_mask.any():
+            # Isolate unexplained residual on normalized inputs
+            x_norm = F.normalize(x_dense, p=2, dim=-1)
+            r_norm = (x_norm - x_recon_norm).detach()
+            residual_energy = r_norm.norm(p=2, dim=-1).mean()
+
+            # Only engage AuxK if dead latents exist AND residual energy is biologically meaningful (> 0.10)
+            if dead_mask.any() and residual_energy > 0.10:
                 dead_indices = torch.nonzero(dead_mask).squeeze(-1)
                 num_dead = dead_indices.numel()
 
