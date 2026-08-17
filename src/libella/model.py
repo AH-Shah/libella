@@ -207,13 +207,11 @@ class LibellaGNN(nn.Module):
         current_temp = getattr(self, 'current_temp', getattr(cfg, 'inference_temp', 0.3))
         progress = getattr(self, 'current_progress', 1.0)
         
-        # 2. Pure Temperature-Scaled Entmax Simplex Gating
-        safe_temp = max(0.05, float(current_temp))
-        scaled_logits = gate_logits / safe_temp
-        
-        gate_probs = entmax_bisect(scaled_logits, alpha=current_alpha, dim=-1)
+        # 2. Calibrated Entmax Simplex Gating (Prevents 1-Hot Collapse & Revives GNN Gradients)
+        # Dynamic scale from PhaseTracker (8.0 -> 12.0) provides exact logit variance for L0 ≈ 3-5
+        gate_probs = entmax_bisect(gate_logits, alpha=current_alpha, dim=-1)
 
-        # 3. Bio-SAE Activation: Pure Simplex Gate * Softplus Magnitude
+        # 3. Bio-SAE Activation: Simplex Gate * Softplus Magnitude
         z = z_mag * gate_probs
 
         # 4. Decode Compositional Profile
