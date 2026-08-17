@@ -10,6 +10,9 @@ import torch
 import math
 from typing import Dict, List, Optional, Tuple
 
+import psutil
+import torch
+
 from .config import NOISE_REGEX
 
 def get_device() -> torch.device:
@@ -221,3 +224,63 @@ class PhaseTracker:
             self.p1_baseline_rec = current_baseline
             if self.best_rec_loss == float("inf") or current_baseline < self.best_rec_loss:
                 self.best_rec_loss = current_baseline
+
+
+
+
+class UnifiedLogger:
+    """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
+    def __init__(self, backend: str, run_name: str, log_dir: str):
+        self.backend = backend.lower()
+        self.writer = None
+
+        if self.backend == "tensorboard":
+            from torch.utils.tensorboard import SummaryWriter
+            import os
+            tb_dir = os.path.join(log_dir, "tb_logs", run_name)
+            self.writer = SummaryWriter(log_dir=tb_dir)
+            print(f"[*] TensorBoard Logger initialized at: {tb_dir}")
+
+    def log_metrics(self, step: int, metrics: dict[str, float]):
+        """Logs a dictionary of scalar numbers to TensorBoard."""
+        if self.writer:
+            for k, v in metrics.items():
+                self.writer.add_scalar(k, v, global_step=step)
+
+    def log_model_telemetry(self, step: int, model: torch.nn.Module, log_histograms: bool = False):
+        """Pulls the deep telemetry you built into the model and logs it."""
+        if not self.writer:
+            return
+
+        # 1. Pull the custom telemetry dictionary you built in model.py
+        if hasattr(model, 'get_deep_telemetry'):
+            stats = model.get_deep_telemetry()
+            self.log_metrics(step, stats)
+
+        # 2. Add visual histograms of the weights/gradients if requested
+        if log_histograms:
+            for name, param in model.named_parameters():
+                p_clean = name.replace('.', '/')
+                if param.requires_grad:
+                    self.writer.add_histogram(f"weights/{p_clean}", param.data, global_step=step)
+                    if param.grad is not None:
+                        self.writer.add_histogram(f"grads/{p_clean}", param.grad, global_step=step)
+
+    @staticmethod
+    def get_memory_metrics(device: torch.device) -> dict[str, float]:
+        """Hardware-aware memory extraction for RAM and VRAM."""
+        mem = {}
+        mem["memory/ram_used_gb"] = psutil.virtual_memory().used / (1024 ** 3)
+
+        if device.type == "cuda":
+            mem["memory/cuda_allocated_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
+        elif device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+            mem["memory/mps_allocated_gb"] = torch.mps.current_allocated_memory() / (1024 ** 3)
+
+        return mem
+
+    def close(self):
+        """Safely shuts down the logger."""
+        if self.writer:
+            self.writer.flush()
+            self.writer.close()

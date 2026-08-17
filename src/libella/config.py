@@ -32,10 +32,10 @@ class RunConfig:
     telemetry_step_freq: int = 10   # Log step-level metrics every N batches (0 = epoch only)
     telemetry_layers: str = "all"   # Target specific layers (e.g. "gate_proj,decoder_weight,q_proj")
 
-    logger_backend: str = "tensorboard"  # Choices: "none", "tensorboard", "wandb"
-    project_name: str = "libella-gnn"
-    run_name: str = "sae-spatial-run"
-    log_histograms: bool = False         # Set True to log full weight/grad distributions
+    # --- Telemetry & Logging Flags ---
+    logger_backend: str = "tensorboard"  # "none" or "tensorboard"
+    telemetry_step_freq: int = 10        # Log deep gradients every N batches
+    log_histograms: bool = False         # Track full parameter distributions
     
     # Native K Controllers
     n_prior_lineages: int = 30   

@@ -1,8 +1,5 @@
 """Model training loops and orchestrators for the Spatial Ecotype GNN."""
 
-import os
-import psutil
-
 import gc
 import math
 from collections.abc import Iterator
@@ -24,7 +21,7 @@ from .data import (
     pt_to_scipy_csr,
 )
 from .model import LibellaGNN
-from .utils import PhaseTracker, get_device
+from .utils import PhaseTracker, get_device, UnifiedLogger
 
 
 def _init_model(
@@ -193,85 +190,6 @@ def prefetch_batches(
 
 
 
-
-class UnifiedLogger:
-    """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
-    def __init__(self, backend: str, project_name: str, run_name: str, config_dict: dict, log_dir: str):
-        self.backend = backend.lower()
-        self.writer = None
-        self.wandb = None
-
-        if self.backend == "tensorboard":
-            from torch.utils.tensorboard import SummaryWriter
-            self.writer = SummaryWriter(log_dir=f"{log_dir}/tb_logs/{run_name}")
-        elif self.backend == "wandb":
-            import wandb
-            self.wandb = wandb
-            self.wandb.init(project=project_name, name=run_name, config=config_dict)
-
-    def log_metrics(self, step: int, metrics: dict[str, float]):
-        """Log scalar metrics at step or epoch level."""
-        if self.backend == "tensorboard" and self.writer:
-            for k, v in metrics.items():
-                self.writer.add_scalar(k, v, global_step=step)
-        elif self.backend == "wandb" and self.wandb:
-            self.wandb.log(metrics, step=step)
-
-    def log_gradients_and_weights(self, step: int, model: torch.nn.Module, log_histograms: bool = False):
-        """Track gradient norms, vanishing layers, and parameter distributions."""
-        grad_metrics = {}
-        total_g_norm_sq = 0.0
-
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                p_clean = name.replace('.', '/')
-                g_norm = param.grad.detach().norm(2).item()
-                total_g_norm_sq += (g_norm ** 2)
-                
-                # Zero-gradient detection (dead paths)
-                zero_pct = (param.grad == 0).float().mean().item() * 100.0
-                grad_metrics[f"gradients/norm/{p_clean}"] = g_norm
-                grad_metrics[f"gradients/zero_pct/{p_clean}"] = zero_pct
-
-                # Heavy histogram tracking
-                if log_histograms:
-                    if self.backend == "tensorboard" and self.writer:
-                        self.writer.add_histogram(f"grads/{p_clean}", param.grad, global_step=step)
-                        self.writer.add_histogram(f"weights/{p_clean}", param.data, global_step=step)
-                    elif self.backend == "wandb" and self.wandb:
-                        grad_metrics[f"hist_grads/{p_clean}"] = self.wandb.Histogram(param.grad.cpu().numpy())
-
-        grad_metrics["gradients/global_l2"] = total_g_norm_sq ** 0.5
-        self.log_metrics(step, grad_metrics)
-
-    @staticmethod
-    def get_memory_metrics(device: torch.device) -> dict[str, float]:
-        """Hardware-aware memory extraction for CUDA, MPS (Apple Silicon), and Host RAM."""
-        mem = {}
-        # Host RAM
-        mem["memory/ram_used_gb"] = psutil.virtual_memory().used / (1024 ** 3)
-        mem["memory/ram_pct"] = psutil.virtual_memory().percent
-
-        # Nvidia GPU VRAM
-        if device.type == "cuda":
-            mem["memory/cuda_allocated_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
-            mem["memory/cuda_reserved_gb"] = torch.cuda.memory_reserved(device) / (1024 ** 3)
-            mem["memory/cuda_max_allocated_gb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-
-        # Apple Silicon MPS VRAM
-        elif device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
-            mem["memory/mps_allocated_gb"] = torch.mps.current_allocated_memory() / (1024 ** 3)
-            mem["memory/mps_driver_allocated_gb"] = torch.mps.driver_allocated_memory() / (1024 ** 3)
-
-        return mem
-
-    def close(self):
-        if self.writer:
-            self.writer.flush()
-            self.writer.close()
-        if self.wandb:
-            self.wandb.finish()
-
 def _train_loop(
     model: LibellaGNN, 
     optimizer: torch.optim.Optimizer, 
@@ -287,6 +205,13 @@ def _train_loop(
     out_dirs = paths.make_dirs(cfg.suffix)
     out_dir = out_dirs["out"]
     checkpoint_path = out_dirs["checkpoint"]
+    
+    logger = UnifiedLogger(
+        backend=getattr(cfg, "logger_backend", "tensorboard"),
+        run_name=f"run_{cfg.suffix}",
+        log_dir=str(out_dir)
+    )
+    global_step = 0
     
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
 
@@ -458,6 +383,21 @@ def _train_loop(
                 if hasattr(model, 'decoder_weight'):
                     model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
 
+            # --- NEW: STEP-LEVEL LOGGING ---
+            global_step += 1
+            if getattr(cfg, "telemetry_step_freq", 0) > 0 and (global_step % cfg.telemetry_step_freq == 0):
+                # 1. Log basic step loss and learning rate
+                step_metrics = {
+                    "step/batch_loss": true_batch_loss.item(),
+                    "step/lr": optimizer.param_groups[0]['lr'],
+                    **logger.get_memory_metrics(device)
+                }
+                logger.log_metrics(global_step, step_metrics)
+                
+                # 2. Log your deep model telemetry (gradients & dictionary health)
+                logger.log_model_telemetry(global_step, model, log_histograms=getattr(cfg, "log_histograms", False))
+            # -------------------------------
+
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
             break
@@ -503,6 +443,17 @@ def _train_loop(
             'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2)
         }
         history.setdefault('autopsy_metrics', []).append(epoch_metrics)
+
+        epoch_log = {
+            "epoch/train_loss": history['train_loss'][-1],
+            "epoch/val_loss": history['val_loss'][-1],
+            "epoch/composite_score": composite_score,
+            "loss/recon": epoch_telemetry.get('l_rec', 0.0),
+            "loss/sparse": epoch_telemetry.get('l_sparse', 0.0),
+            "sae/l0_avg": current_l0,
+            "sae/dead_latents": current_dead,
+        }
+        logger.log_metrics(epoch, epoch_log)
 
         # Checkpointing
         composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
@@ -563,6 +514,8 @@ def _train_loop(
             final_pw = epoch_telemetry.get('p_w', 0.0)
             tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
             break
+    
+    logger.close()
 
     if checkpoint_path.exists() and best_composite_score < float("inf"):
         print(f"  ↳ Restoring in-memory model to best Pareto Phase 2 checkpoint ({checkpoint_path.name})...")
