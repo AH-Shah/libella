@@ -273,8 +273,10 @@ def _train_loop(
 
                 prog = tracker.get_progress()
                 model.current_progress = prog
-                model.current_alpha = getattr(tracker, "alpha", 1.7)
-                model.current_temp = getattr(tracker, "temp", 0.3)
+                # Linear schedule for scale and alpha to prevent early 1-hot saturation
+                model.current_scale = cfg.scale_start + (cfg.scale_end - cfg.scale_start) * prog
+                model.current_alpha = cfg.alpha_start + (cfg.alpha_end - cfg.alpha_start) * prog
+                model.current_temp = cfg.temp_start + (cfg.temp_end - cfg.temp_start) * prog
 
                 # 1. Defensive Forward Execution
                 forward_res = model(x, src, dst, weights)
@@ -357,14 +359,13 @@ def _train_loop(
                         is_non_zero_val = (x_val > 0)
                         dynamic_w = getattr(model, 'dynamic_w_ema', torch.tensor(1.0, device=device))
                         w_mat = torch.where(is_non_zero_val, dynamic_w, 1.0)
-                        zero_expectation_mask = torch.where(is_non_zero_val, 1.0, cfg.zero_mask_rate).to(x_val.dtype)
-                        masked_w_mat_val = w_mat * zero_expectation_mask
+                        w_mat = w_mat / torch.clamp(w_mat.mean(), min=1e-5)
                         
                         raw_delta_val = val_recon - x_val
                         asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * 2.0) * (raw_delta_val < 0).to(x_val.dtype)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
-                        val_loss_sum = torch.sum(masked_w_mat_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
+                        val_loss_sum = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
                         val_log_cosh = val_loss_sum / max(1, x_val.numel())
                     
                         val_loss_acc += val_log_cosh.detach()
@@ -389,12 +390,14 @@ def _train_loop(
                     proj_grad = grad - (grad * w).sum(dim=1, keepdim=True) * w
                     model.decoder_weight.grad.copy_(proj_grad)
 
+            # 2. Oblique Tangent-Space Retraction for Non-negative Weights
             optimizer.step()
 
-            # 3. Strict Oblique Retraction
             with torch.no_grad():
                 if hasattr(model, 'decoder_weight'):
-                    model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
+                    # Retract to non-negative unit sphere
+                    w_clamped = F.relu(model.decoder_weight)
+                    model.decoder_weight.copy_(F.normalize(w_clamped + 1e-8, p=2, dim=-1))
 
             # --- NEW: STEP-LEVEL LOGGING ---
             global_step += 1
