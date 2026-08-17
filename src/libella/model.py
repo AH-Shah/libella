@@ -2,8 +2,8 @@
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 
 from .config import cfg
 from .utils import scatter_softmax
@@ -20,38 +20,36 @@ class LibellaGNN(nn.Module):
         super().__init__()
         self.hidden_dim = cfg.hidden_dim
         self.k_hops = cfg.k_hops
+        self.n_latents = n_metaprograms
+        self.in_channels = in_channels
 
+        # --- Context & Identity Encoders ---
         self.ctx_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(inplace=True)
-                            )
+        )
         self.lin_appnp = nn.Linear(self.hidden_dim, self.hidden_dim)
         
-
         self.id_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim * 2),
             nn.GLU(dim=-1),
             nn.LayerNorm(self.hidden_dim)
-                            )
+        )
 
+        # --- Cross-Attention Projections ---
         self.q_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         
-
         self.context_gate = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(inplace=True)
         )
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
-        
 
-        self.n_latents = n_metaprograms
-        self.in_channels = in_channels
-
-        # 1. Stabilized Local Magnitude Stream (LayerNorm + Softplus)
+        # --- 1. Stabilized Local Magnitude Stream ---
         self.mag_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
@@ -61,17 +59,17 @@ class LibellaGNN(nn.Module):
             nn.Softplus(beta=1.0)
         )
 
-        # 2. Context Gating Stream
+        # --- 2. Context Gating Stream ---
         self.gate_proj = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents)
         )
 
-        # 3. Learnable Jump Thresholds
+        # --- 3. Learnable Jump Thresholds ---
         self.jump_threshold = nn.Parameter(torch.full((self.n_latents,), 0.5, dtype=torch.float32))
 
-        # 4. Oblique Unit-Norm Decoder Dictionary (Initialized on Unit Sphere)
+        # --- 4. Oblique Unit-Norm Decoder Dictionary ---
         if init_components is not None:
             dec_init = torch.tensor(init_components, dtype=torch.float32)
             if dec_init.shape != (self.n_latents, in_channels):
@@ -83,7 +81,7 @@ class LibellaGNN(nn.Module):
         self.decoder_weight = nn.Parameter(dec_init)
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
 
-        # 5. Native Buffers & Optimizations
+        # --- 5. Buffers & Hyperparameters ---
         self.register_buffer('ortho_mask', 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer('steps_since_active', torch.zeros(self.n_latents, dtype=torch.int64))
         self.dead_step_threshold = getattr(cfg, 'dead_step_threshold', 100)
@@ -93,14 +91,13 @@ class LibellaGNN(nn.Module):
         self.gamma = nn.Parameter(torch.tensor(1.0))
         self.alpha_proj = nn.Linear(self.hidden_dim, 1)
         self.register_buffer('dynamic_w_ema', torch.tensor(1.0, dtype=torch.float32))
-        
 
-
+        # --- Spatial GAT Components ---
         self.gat_w_src = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.gat_w_dst = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.gat_w_edge = nn.Linear(1, self.hidden_dim, bias=True)
         self.gat_a = nn.Linear(self.hidden_dim, 1, bias=False)
-        self.att_temp = nn.Parameter(torch.tensor(cfg.att_temp))
+        self.att_temp = nn.Parameter(torch.tensor(float(getattr(cfg, 'att_temp', 1.0))))
         self.mp_update = nn.Linear(self.hidden_dim, self.hidden_dim)
 
     def encode(
@@ -114,7 +111,7 @@ class LibellaGNN(nn.Module):
             src = src.contiguous()
             dst = dst.contiguous()
 
-        # 1. Depth Disentanglement: Extract library mass and L2 normalized counts
+        # 1. Depth Disentanglement
         cell_mass = torch.clamp(x_dense.sum(dim=-1, keepdim=True), min=1e-5)
         x_norm = F.normalize(x_dense, p=2, dim=-1)
 
@@ -122,22 +119,18 @@ class LibellaGNN(nn.Module):
         h_0 = self.lin_appnp(self.ctx_enc(x_norm))
         N = h_0.size(0)
 
-        # 2. Bilateral Graph Edge Decay (Direct Euclidean Metric on Normalized Expression)
+        # 2. Bilateral Graph Edge Decay
         if len(src) > 0:
             with torch.no_grad():
-                # VRAM SAVER: (a-b)^2 = a^2 + b^2 - 2ab
-                # Since x_norm is L2 normalized, a^2 = 1 and b^2 = 1.
-                # Therefore: (a-b)^2 = 2 - 2(a dot b)
                 dot_prod = (x_norm[src] * x_norm[dst]).sum(dim=-1)
-                dist = 2.0 - 2.0 * dot_prod
-                dist = torch.clamp(dist, min=0.0) # Failsafe for float rounding
+                dist = torch.clamp(2.0 - 2.0 * dot_prod, min=0.0)
             decay = torch.exp(-F.softplus(self.gamma) * dist)
         else:
             decay = torch.ones_like(edge_weights)
             
         W_bil = edge_weights * decay
 
-        # 3. K-Hop Spatial Message Passing Loop (Preserved)
+        # 3. K-Hop Spatial Message Passing Loop
         alpha = torch.sigmoid(self.alpha_proj(h_0)) * 0.85 + 0.10
         inv_alpha = 1.0 - alpha
         h_0_scaled = h_0 * alpha
@@ -149,14 +142,11 @@ class LibellaGNN(nn.Module):
                 h_src_proj = self.gat_w_src(h_ctx)
                 h_dst_proj = self.gat_w_dst(h_ctx)
                 edge_proj = self.gat_w_edge(W_bil.unsqueeze(1))
-
                 h_edge = h_src_proj[src] + h_dst_proj[dst] + edge_proj
                 
                 e_raw = self.gat_a(F.leaky_relu(h_edge)).squeeze(-1)
                 tau = torch.clamp(F.softplus(self.att_temp), min=0.05)
-                e_scaled = e_raw / tau
-                
-                alpha_att = scatter_softmax(e_scaled, dst, N) 
+                alpha_att = scatter_softmax(e_raw / tau, dst, N) 
                 
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
                 out.index_add_(0, dst, msg)
@@ -164,7 +154,7 @@ class LibellaGNN(nn.Module):
             agg = F.silu(self.mp_update(out))
             h_ctx = agg * inv_alpha + h_0_scaled
 
-        # 4. Identity-Context Cross-Attention Bottleneck (Preserved)
+        # 4. Identity-Context Cross-Attention Bottleneck
         Q = self.q_proj(h_id)
         K = self.k_proj(h_ctx)
         V = self.v_proj(h_ctx)
@@ -175,14 +165,10 @@ class LibellaGNN(nn.Module):
         src_with_self = torch.cat([src, self_loops]) if len(src) > 0 else self_loops
         dst_with_self = torch.cat([dst, self_loops]) if len(src) > 0 else self_loops
             
-        q_dst = Q[dst_with_self]
-        k_src = K[src_with_self]
-        v_src = V[src_with_self]
-        
-        cross_scores = (q_dst * k_src).sum(dim=-1) / (self.hidden_dim ** 0.5)
+        cross_scores = (Q[dst_with_self] * K[src_with_self]).sum(dim=-1) / (self.hidden_dim ** 0.5)
         cross_att = scatter_softmax(cross_scores, dst_with_self, N)
         
-        pulled_msg = (v_src * cross_att.unsqueeze(1)).contiguous()
+        pulled_msg = (V[src_with_self] * cross_att.unsqueeze(1)).contiguous()
         ctx_pulled = torch.zeros_like(Q)
         ctx_pulled.index_add_(0, dst_with_self, pulled_msg)
 
@@ -222,31 +208,25 @@ class LibellaGNN(nn.Module):
         # 5. Restore Cell-Specific Mass
         x_recon = x_recon_norm * cell_mass
 
-        # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
+        # 6. AuxK Dead Latent Routing
         aux_recon = None
         r_norm = None
 
         if self.training:
             with torch.no_grad():
-                # Check which features fired in the current batch
                 active_in_batch = (jump_gate > 0).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
-                
-                # Identify dead features
                 dead_mask = self.steps_since_active >= self.dead_step_threshold
 
-            # Isolate unexplained residual on normalized inputs
             x_norm = F.normalize(x_dense, p=2, dim=-1)
             r_norm = (x_norm - x_recon_norm).detach()
             residual_energy = r_norm.norm(p=2, dim=-1).mean()
 
-            # Only engage AuxK if dead latents exist AND residual energy is biologically meaningful (> 0.10)
             if dead_mask.any() and residual_energy > 0.10:
                 dead_indices = torch.nonzero(dead_mask).squeeze(-1)
                 num_dead = dead_indices.numel()
 
-                # Laptop MPS Optimization: Cap candidate dead atoms to avoid wide TopK kernel stalls
                 max_dead_eval = min(num_dead, 128)
                 if num_dead > max_dead_eval:
                     perm = torch.randperm(num_dead, device=dead_indices.device)[:max_dead_eval]
@@ -254,11 +234,6 @@ class LibellaGNN(nn.Module):
                     num_dead = max_dead_eval
 
                 k_aux = min(self.aux_k, num_dead)
-
-                # Isolate unexplained residual
-                x_norm = F.normalize(x_dense, p=2, dim=-1)
-                r_norm = (x_norm - x_recon_norm).detach()
-
                 w_dead = w_dec_norm[dead_indices]
                 aux_logits = torch.mm(r_norm, w_dead.t())
                 topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
@@ -308,21 +283,20 @@ class LibellaGNN(nn.Module):
             cosine_sim = torch.mm(w_dec_norm, w_dec_norm.t()) * self.ortho_mask
             l_ortho = (F.relu(cosine_sim - ortho_margin) ** 2).sum() / (self.n_latents * (self.n_latents - 1))
 
-        # 3. Sparsity Loss (L1 proxy on latent code)
+        # 3. Sparsity Loss
         l_sparse = z.mean()
 
-        # 4. AuxK Residual Loss for Dead Feature Revival
+        # 4. AuxK Residual Loss
         if aux_recon is not None and r_norm is not None:
             l_aux = F.mse_loss(aux_recon, r_norm)
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # 5. Combined Loss with Safe Hyperparameter Lookups
+        # 5. Combined Dynamic Schedules
         base_l1 = getattr(cfg, 'l1_coeff', 1e-3)
         base_ortho = getattr(cfg, 'ortho_weight', 10.0)
         aux_weight = getattr(cfg, 'aux_weight', 0.5)
 
-        # Smooth asymptotic sparsity pressure (prevents late-stage loss explosion)
         sparsity_multiplier = 0.10 + 0.90 * (progress ** 0.8)
         current_l1 = base_l1 * sparsity_multiplier
         current_ortho = base_ortho * (0.5 + 0.5 * progress)
@@ -330,4 +304,31 @@ class LibellaGNN(nn.Module):
         total_loss = l_recon + (current_ortho * l_ortho) + (current_l1 * l_sparse) + (aux_weight * l_aux)
 
         return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
-        
+
+    @torch.no_grad()
+    def get_deep_telemetry(self) -> dict[str, float]:
+        """Self-inspecting telemetry harvest with exact off-diagonal correlation stats."""
+        stats = {}
+        total_g_norm_sq = 0.0
+
+        for name, param in self.named_parameters():
+            p_clean = name.replace('.', '/')
+            stats[f"param_norm/{p_clean}"] = param.detach().norm(2).item()
+            if param.grad is not None:
+                g_norm = param.grad.detach().norm(2).item()
+                total_g_norm_sq += (g_norm ** 2)
+                stats[f"grad_norm/{p_clean}"] = g_norm
+                stats[f"grad_zeros/{p_clean}_pct"] = (param.grad == 0).float().mean().item() * 100.0
+
+        stats["grad_norm/global_l2"] = total_g_norm_sq ** 0.5
+
+        if hasattr(self, 'decoder_weight'):
+            w = F.normalize(self.decoder_weight, p=2, dim=1)
+            sim = torch.mm(w, w.t())
+            off_diag_mask = ~torch.eye(w.size(0), dtype=torch.bool, device=w.device)
+            off_diag_vals = sim.masked_select(off_diag_mask)
+            if off_diag_vals.numel() > 0:
+                stats["dict/max_cross_corr"] = off_diag_vals.max().item()
+                stats["dict/mean_cross_corr"] = off_diag_vals.abs().mean().item()
+
+        return stats
