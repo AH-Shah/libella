@@ -249,6 +249,7 @@ def _train_loop(
 
         for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
             optimizer.zero_grad(set_to_none=True)
+            current_step_loss = 0.0
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
 
                 x = batch["x"].to(device=device, non_blocking=True)
