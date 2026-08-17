@@ -304,11 +304,16 @@ class LibellaGNN(nn.Module):
             l_aux = torch.tensor(0.0, device=x_true.device)
 
         # 5. Combined Loss with Safe Hyperparameter Lookups
-        l1_coeff = getattr(cfg, 'l1_coeff', 1e-3)
-        ortho_weight = getattr(cfg, 'ortho_weight', 10.0)
+        base_l1 = getattr(cfg, 'l1_coeff', 1e-3)
+        base_ortho = getattr(cfg, 'ortho_weight', 10.0)
         aux_weight = getattr(cfg, 'aux_weight', 0.5)
 
-        total_loss = l_recon + (ortho_weight * l_ortho) + (l1_coeff * l_sparse) + (aux_weight * l_aux)
+        # Phase 1: Focus on reconstruction manifold. Phase 2: Escalate sparsity pressure
+        sparsity_multiplier = 0.05 + 0.95 * (progress ** 1.5)
+        current_l1 = base_l1 * sparsity_multiplier
+        current_ortho = base_ortho * (0.5 + 0.5 * progress)
+
+        total_loss = l_recon + (current_ortho * l_ortho) + (current_l1 * l_sparse) + (aux_weight * l_aux)
 
         return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
         

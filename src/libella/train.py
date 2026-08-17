@@ -243,6 +243,9 @@ def _train_loop(
         }
 
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
+        total_steps_per_epoch = len(meta_batches)
+        alpha_ema = min(0.005, 1.0 / (total_steps_per_epoch * 2.0 + 1e-9))
+        ema_latent_freq = None
         nan_detected = False
 
         for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
@@ -296,15 +299,25 @@ def _train_loop(
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
 
-                # 3. GPU Telemetry Accumulation (Zero-sync execution)
+                # 3. GPU Telemetry & Feature Utilization EMA Tracking
                 with torch.no_grad():
+                    batch_active = (z_train > 0).float()
+                    current_freq = batch_active.mean(dim=0)
+                    
+                    if ema_latent_freq is None:
+                        ema_latent_freq = current_freq.clone()
+                    else:
+                        ema_latent_freq.lerp_(current_freq, weight=alpha_ema)
+
+                    # Compute Shannon Entropy over Latent Usage Profile
+                    p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
+                    latent_entropy = -(p_norm * torch.log(p_norm + 1e-9)).sum()
+
                     gpu_telemetry['l_rec'] += base_recon_val
                     gpu_telemetry['l_ort'] += base_ort_val
                     gpu_telemetry['l_sparse'] += base_sparse_val
                     gpu_telemetry['l_aux'] += base_aux_val
-                    
-                    # L0 calculation: count active latents per cell
-                    gpu_telemetry['l0_avg'] += (z_train > 0).float().sum(dim=-1).mean()
+                    gpu_telemetry['l0_avg'] += batch_active.sum(dim=-1).mean()
                     gpu_telemetry['dead_cnt'] += (model.steps_since_active >= model.dead_step_threshold).float().sum()
                     gpu_telemetry['max_act'] += z_train.max()
 
@@ -378,6 +391,11 @@ def _train_loop(
         if train_chunk_count > 0:
             for k, v in gpu_telemetry.items():
                 epoch_telemetry[k] = (v / train_chunk_count).item()
+            if ema_latent_freq is not None:
+                p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
+                epoch_telemetry['ent'] = -(p_norm * torch.log(p_norm + 1e-9)).sum().item()
+            else:
+                epoch_telemetry['ent'] = 0.0
 
         current_lr = round(optimizer.param_groups[0]['lr'], 6)
         current_rec = epoch_telemetry.get("l_rec", float("inf"))
@@ -386,6 +404,7 @@ def _train_loop(
 
         epoch_metrics = {
             'epoch': epoch,
+            'phase': tracker.phase,
             'train_loss': round(history['train_loss'][-1], 4),
             'val_loss': round(history['val_loss'][-1], 4),
             'lr': current_lr,
@@ -395,6 +414,7 @@ def _train_loop(
                 'sparse': round(epoch_telemetry.get('l_sparse', 0.0), 4),
                 'aux': round(epoch_telemetry.get('l_aux', 0.0), 4)
             },
+            'entropy': round(epoch_telemetry.get('ent', 0.0), 4),
             'l0_avg': round(current_l0, 2),
             'dead_latents': current_dead,
             'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2)
