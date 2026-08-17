@@ -37,7 +37,7 @@ class RunConfig:
     # Native K Controllers
     n_prior_lineages: int = 30   
     n_dict_components: int = 100
-    k_override: int | None = 1024
+    n_latents: int | None = 1024
     
     hidden_dim: int = 128
     k_hops: int = 2
