@@ -207,7 +207,7 @@ class LibellaGNN(nn.Module):
         z_mag, gate_logits, cell_mass, w_dec_pos = self.encode(x_dense, src, dst, edge_weights)
 
         # 1. Retrieve PhaseTracker variables populated by the training loop with bounded curvature
-        raw_alpha = getattr(self, 'current_alpha', 1.3)
+        raw_alpha = getattr(self, 'current_alpha', getattr(cfg, 'inference_alpha', 1.5))
         current_alpha = max(1.15, min(1.40, raw_alpha))
         current_temp = getattr(self, 'current_temp', getattr(cfg, 'inference_temp', 0.3))
         progress = getattr(self, 'current_progress', 1.0)
