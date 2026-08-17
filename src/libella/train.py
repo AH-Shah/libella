@@ -301,9 +301,11 @@ def _train_loop(
                     break
 
                 (true_batch_loss / len(meta_meta)).backward()
-                
+
+                current_step_loss += (true_batch_loss.detach().item() / len(meta_meta))
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
+                
 
                 # 3. GPU Telemetry Tracking
                 with torch.no_grad():
