@@ -327,7 +327,7 @@ def export_latents_from_graphs(
     all_cell_metadata = []
 
     with torch.no_grad():
-        for g_path in tqdm(graph_paths, desc="Exporting Latents per Graph", leave=False):
+        for g_path in graph_paths:
             g_path = Path(g_path)
             data = torch.load(g_path, map_location="cpu", weights_only=False)
 
