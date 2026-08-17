@@ -50,14 +50,15 @@ class LibellaGNN(nn.Module):
         )
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
 
-        # 1. Sharp Cell-Autonomous Magnitude Stream (Exact Zeros via ReLU)
+        # 1. Pure Intensity Stream (Strictly Positive, Non-Sparse Magnitude)
+        # Sparsity (L0) is strictly delegated to the Entmax Gate
         self.mag_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents),
             nn.LayerNorm(self.n_latents),
-            nn.ReLU()
+            nn.Softplus(beta=1.0)
         )
 
         # 2. Dual-Stream Gate: Direct Single-Cell Identity + Spatial Prior Shift
@@ -181,10 +182,10 @@ class LibellaGNN(nn.Module):
         # 5. Decoupled Dual-Stream Projections with Autonomous Skip-Gating
         z_mag = self.mag_enc(x_norm)
         
-        # Cell-intrinsic expression sets baseline support; GNN adds contextual prior shift
+        # Direct additive combination: GNN weights receive direct gradient signals
         id_gate_logits = self.gate_id_proj(x_norm)
-        spatial_shift = F.normalize(self.gate_spatial_proj(h_norm), p=2, dim=-1)
-        gate_logits = id_gate_logits + (0.5 * spatial_shift)
+        spatial_shift = self.gate_spatial_proj(h_norm)
+        gate_logits = id_gate_logits + spatial_shift
 
         return z_mag, gate_logits, cell_mass
 
@@ -202,22 +203,14 @@ class LibellaGNN(nn.Module):
         current_temp = getattr(self, 'current_temp', getattr(cfg, 'inference_temp', 0.3))
         progress = getattr(self, 'current_progress', 1.0)
         
-        # 2. Dynamic Entmax Simplex Gating (Restores PhaseTracker Annealing)
-        # BUGFIX: Temperature scaling is strictly required to stretch logits and force L0 < 6
-        scaled_logits = gate_logits / torch.clamp(torch.tensor(current_temp, device=gate_logits.device), min=0.1)
+        # 2. Pure Temperature-Scaled Entmax Simplex Gating
+        # Eliminate Softmax leak so exact zeros are strictly preserved during training
+        safe_temp = max(0.05, float(current_temp))
+        scaled_logits = gate_logits / safe_temp
         
-        sparse_gate = entmax_bisect(scaled_logits, alpha=current_alpha, dim=-1)
-        
-        # Smooth interpolation during early training to prevent dead-locking
-        if self.training:
-            smooth_gate = F.softmax(scaled_logits, dim=-1)
-            smooth_weight = 0.50 - (0.45 * progress)  # Anneals from 0.50 -> 0.05
-            sparse_weight = 1.0 - smooth_weight
-            gate_probs = (sparse_weight * sparse_gate) + (smooth_weight * smooth_gate)
-        else:
-            gate_probs = sparse_gate
+        gate_probs = entmax_bisect(scaled_logits, alpha=current_alpha, dim=-1)
 
-        # 3. Hybrid Bio-SAE Activation: Simplex Gate * ReLU Magnitude
+        # 3. Bio-SAE Activation: Pure Simplex Gate * Softplus Magnitude
         z = z_mag * gate_probs
 
         # 4. Decode Compositional Profile
