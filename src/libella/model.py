@@ -117,13 +117,18 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor, 
         dst: torch.Tensor, 
         edge_weights: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(src) > 0:
             src = src.contiguous()
             dst = dst.contiguous()
-            
-        h_id = self.id_enc(x_dense)
-        h_0 = self.lin_appnp(self.ctx_enc(x_dense))
+
+        # 1. Depth Disentanglement: Extract mass and compute normalized input
+        cell_mass = torch.clamp(x_dense.sum(dim=-1, keepdim=True), min=1e-5)
+        x_norm = F.normalize(x_dense, p=2, dim=-1)
+
+        # 2. Local Identity and Initial Context representations
+        h_id = self.id_enc(x_norm)
+        h_0 = self.lin_appnp(self.ctx_enc(x_norm))
         
 
         macro_ctx = h_0.mean(dim=0)
@@ -207,25 +212,14 @@ class LibellaGNN(nn.Module):
         h_final = h_id + self.context_gate(ctx_pulled)
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
-        
-        t_proj_weights = F.normalize(anchors_raw, p=2, dim=-1)
-        x_norm = F.normalize(x_dense, p=2, dim=-1)
-        
-        bio_sim = torch.mm(x_norm, t_proj_weights.t())
-        
+        # 1. Compute Decoupled Streams
+        # A. Local Magnitude Stream (unaffected by neighbor graph smoothing)
+        z_mag = self.mag_enc(x_norm)
 
-        gnn_shift_raw = self.topic_proj(h_norm)
-        gnn_shift_norm = F.normalize(gnn_shift_raw, p=2, dim=-1)
+        # B. Spatial Context Gating Stream (conditioned by spatial graph)
+        gate_logits = self.gate_proj(h_norm)
 
-        base_logits = bio_sim + (cfg.gnn_shift_weight * gnn_shift_norm)
-        
-        noise = torch.randn_like(base_logits) * cfg.train_noise if self.training else 0.0
-        base_logits = base_logits + noise
-        
-        current_scale = getattr(self, 'current_scale', cfg.inference_scale)
-        logits = base_logits * current_scale
-        
-        return logits, anchors_raw
+        return z_mag, gate_logits, cell_mass
 
     def forward(
         self, 
@@ -233,150 +227,64 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor, 
         dst: torch.Tensor, 
         edge_weights: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        logits, anchors_raw = self.encode(x_dense, src, dst, edge_weights)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z_mag, gate_logits, cell_mass = self.encode(x_dense, src, dst, edge_weights)
 
-        current_alpha = getattr(self, 'current_alpha', cfg.inference_alpha)
-        current_temp = getattr(self, 'current_temp', cfg.inference_temp)
-        progress = getattr(self, 'current_progress', 1.0)
+        # 1. Compute Gate Probabilities (Sigmoid or Entmax)
+        gate_probs = torch.sigmoid(gate_logits)
+
+        # 2. Straight-Through JumpReLU Operator
+        theta = torch.clamp(self.jump_threshold, min=0.01, max=0.99)
+        hard_mask = (gate_probs > theta).float()
         
-        sparse_prob = entmax_bisect(logits, alpha=current_alpha, dim=1)
-        mag = x_dense.sum(dim=1, keepdim=True) 
-        
-        if self.training:
-            smooth_prob = F.softmax(logits / current_temp, dim=1)
-            smooth_weight = 0.50 - (0.45 * progress)
-            sparse_weight = 1.0 - smooth_weight
-            prob = (sparse_weight * sparse_prob) + (smooth_weight * smooth_prob)
-        else:
-            prob = sparse_prob 
-        
-        frac = prob * mag
-        return frac, anchors_raw
+        # STE: Forward uses exact hard step; Backward passes gradient through sigmoid
+        jump_gate = hard_mask.detach() + gate_probs - gate_probs.detach()
+
+        # 3. Final Sparse Latent Code (magnitude isolated from gate)
+        z = z_mag * jump_gate
+
+        # 4. Decode with Unit-Norm Oblique Projection
+        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
+        x_recon_norm = torch.mm(z, w_dec_norm) + self.decoder_bias
+
+        # 5. Restore Cell-Specific Mass
+        x_recon = x_recon_norm * cell_mass
+
+        return x_recon, z, w_dec_norm
 
     def calc_loss(
         self, 
-        recon_c: torch.Tensor, 
-        x_c: torch.Tensor, 
-        anchors: torch.Tensor, 
-        ortho_mat: torch.Tensor | None, 
-        ep: int, 
-        total_epochs: int, 
-        f_train: torch.Tensor | None = None, 
-        target_f_dist: torch.Tensor | None = None, 
-        kl_weight: float = cfg.kl_weight,
-        progress: float | None = None,
-        **kwargs
+        recon_x: torch.Tensor, 
+        x_true: torch.Tensor, 
+        z: torch.Tensor,
+        w_dec_norm: torch.Tensor,
+        progress: float = 1.0
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Calculate regularized reconstruction loss."""
-        num_pos = torch.clamp((x_c > 0).float().sum(), min=1.0)
-        num_zeros = (x_c == 0).float().sum()
+        # 1. Asymmetric Log-Cosh Loss with Dynamic Zero-Weighting
+        is_non_zero = (x_true > 0)
+        num_pos = torch.clamp(is_non_zero.float().sum(), min=1.0)
+        num_zeros = (x_true == 0).float().sum()
         current_dynamic_w = (num_zeros / num_pos).detach()
-        
+
         if self.training:
             self.dynamic_w_ema.lerp_(current_dynamic_w, weight=0.1)
-            
-        
-        is_non_zero = (x_c > 0)
-        
-        if self.training:
-            zero_mask = torch.rand_like(x_c) < 0.05 
-            active_mask = (is_non_zero | zero_mask).to(x_c.dtype)
-            masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0) * active_mask
-        else:
-            masked_w_mat = torch.where(is_non_zero, current_dynamic_w, 1.0)
 
-            
-        raw_delta = recon_c - x_c
-        
-        asymmetry_factor = 1.0 + (is_non_zero.to(x_c.dtype) * 2.0) * (raw_delta < 0).float()
-        scaled_delta = torch.clamp(raw_delta * asymmetry_factor, min=-30.0, max=30.0)
+        w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
+        raw_delta = recon_x - x_true
+        asym_factor = 1.0 + (is_non_zero.float() * 2.0) * (raw_delta < 0).float()
+        scaled_delta = torch.clamp(raw_delta * asym_factor, min=-30.0, max=30.0)
 
-        l_recon_sum = torch.sum(masked_w_mat * torch.log(torch.cosh(scaled_delta + 1e-6)))
-        
-        # Direct scalar division without creating GPU tensor objects
-        total_elements = max(1, x_c.shape[0] * x_c.shape[1])
-        l_recon = l_recon_sum / total_elements
+        l_recon = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_true.numel())
 
+        # 2. Oblique Orthogonality Loss on Unit-Norm Dictionary (Strided/Sampled)
+        cosine_sim = torch.mm(w_dec_norm, w_dec_norm.t()) * self.ortho_mask
+        l_ortho = (F.relu(cosine_sim - 0.10) ** 2).sum() / (self.n_latents * (self.n_latents - 1))
 
-        anc_norm = F.normalize(anchors, p=2, dim=1)
+        # 3. Sparsity Penalty (encourages gate thresholds to settle sharply)
+        l_sparse = z.mean()
 
-        with torch.no_grad():
-            ref_probs = F.softmax(self.anchor_logits, dim=-1)
-            ref_norm = F.normalize(ref_probs, p=2, dim=1)
+        # Dynamic Loss Balancing
+        total_loss = l_recon + (10.0 * l_ortho) + (cfg.l1_coeff * l_sparse)
 
-        l_anc = 1.0 - (anc_norm * ref_norm).sum(dim=1).mean()
-
-        latent_ortho = torch.mm(anc_norm, anc_norm.t()) * self.ortho_mask
-
-        l_pairwise = (
-            F.relu(latent_ortho - cfg.ortho_overlap_threshold) ** 2
-        ).sum() / anchors.size(0)
-
-        l_frobenius = (latent_ortho**2).sum() / (anchors.size(0) * (anchors.size(0)-1))
-
-
-        l_ortho = l_pairwise + 0.10 * l_frobenius
-
-        peak_excess = F.relu(anchors - cfg.anchor_peak_threshold)
-        collapse_penalty = (peak_excess ** 2).sum(dim=1).mean()
-        gene_entropy = -(anchors * torch.log(anchors + 1e-9)).sum(dim=1).mean()
-        
-
-        im_loss = torch.tensor(0.0, device=x_c.device)
-        tsallis_val = 0.0
-        
-        if f_train is not None:
-            f_sum = f_train.sum(dim=1, keepdim=True)
-            f_norm = f_train / torch.clamp(f_sum, min=1e-6)
-            
-            alpha_ent = getattr(cfg, 'tsallis_alpha', 1.5)
-            f_safe = torch.clamp(f_norm, min=1e-5, max=1.0)
-            
-            if abs(alpha_ent - 1.0) > 1e-4:
-                tsallis_h = (1.0 - (f_safe ** alpha_ent).sum(dim=1).mean()) / (alpha_ent - 1.0)
-            else:
-                tsallis_h = -(f_safe * torch.log(f_safe)).sum(dim=1).mean()
-                
-            tsallis_val = tsallis_h.item()
-            p_mean = torch.clamp(f_norm.mean(dim=0), min=1e-5, max=1.0)
-            
-            # Ensure KL divergence doesn't compute log(0.0)
-            if target_f_dist is not None:
-                kl_target = torch.clamp(target_f_dist, min=1e-5)
-                kl_marginal = (p_mean * (torch.log(p_mean + 1e-9) - torch.log(kl_target + 1e-9))).sum()
-            else:
-                K_topics = anchors.shape[0]
-                uniform_prior = torch.ones(K_topics, device=x_c.device) / K_topics
-                kl_marginal = (p_mean * (torch.log(p_mean + 1e-9) - torch.log(uniform_prior))).sum()
-                
-        if progress is None:
-            progress = ep / max(1, total_epochs - 1)        
-        
-        
-        with torch.no_grad():
-            recon_mag = l_recon.item()
-            lock_weight = max(0.05, 1.0 - progress)
-            anc_scale = recon_mag * 0.1 * lock_weight 
-            kl_scale = recon_mag * 0.05
-            tsallis_weight = max(0.0, (progress - 0.5) * 2.0)
-            tsallis_scale = recon_mag * 0.05 * tsallis_weight
-
-        im_loss = (tsallis_h * tsallis_scale) + (kl_weight * kl_marginal * kl_scale)
-        scaled_anc = l_anc * anc_scale
-                
-        ortho_multiplier = recon_mag * (0.05 + 0.10 * progress)
-        scaled_ortho = (l_ortho + collapse_penalty) * ortho_multiplier * cfg.ortho_weight
-        scaled_gene_ent = gene_entropy * (recon_mag * 0.01)
-        
-        base_loss = l_recon + scaled_anc + scaled_ortho + scaled_gene_ent
-
-        self._last_losses = {
-            'rec': l_recon.item(), 'anc': l_anc.item(), 
-            'ort': l_ortho.item(), 'im': im_loss.item(), 'base': base_loss.item(),
-            'dyn_w': current_dynamic_w.item(), 'kl_w': kl_weight, 
-            'tsallis_val': tsallis_val
-        }
-
-        return (base_loss + im_loss, l_recon.detach(), l_anc.detach(), l_ortho.detach())
+        return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach()
         
