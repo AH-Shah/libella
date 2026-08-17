@@ -27,14 +27,11 @@ class RunConfig:
     phase: str = "ALL"
     unsupervised: bool = False
 
-    # --- Telemetry Control Flags ---
-    telemetry: str = "none"        # Choices: "none", "basic", "latents", "gradients", "all"
-    telemetry_step_freq: int = 10   # Log step-level metrics every N batches (0 = epoch only)
-    telemetry_layers: str = "all"   # Target specific layers (e.g. "gate_proj,decoder_weight,q_proj")
-
     # --- Telemetry & Logging Flags ---
+    telemetry: str = "none"              # Choices: "none", "basic", "latents", "gradients", "all"
+    telemetry_layers: str = "all"        # Target specific layers (e.g. "gate_proj,decoder_weight")
     logger_backend: str = "tensorboard"  # "none" or "tensorboard"
-    telemetry_step_freq: int = 10        # Log deep gradients every N batches
+    telemetry_step_freq: int = 10        # Log deep gradients every N batches (0 = epoch only)
     log_histograms: bool = False         # Track full parameter distributions
     
     # Native K Controllers
