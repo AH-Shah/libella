@@ -188,6 +188,48 @@ def prefetch_batches(
             chunks.append(chunk)
         yield meta_meta, chunks
 
+class watchdog:
+    """Monitors deep model telemetry for training collapse signatures."""
+    def __init__(self):
+        self.history = {}
+
+    def inspect(self, epoch: int, step: int, stats: dict[str, float], config_level: str, target_layers: str):
+        if config_level == "none":
+            return
+            
+        # 1. Filter by requested layers
+        filtered_stats = stats
+        if target_layers != "all":
+            allowed = target_layers.split(",")
+            filtered_stats = {k: v for k, v in stats.items() if any(layer in k for layer in allowed)}
+
+        warnings = []
+        
+        # --- WATCHDOG 1: Gradient Vanishing / Explosion ---
+        if config_level in ["gradients", "all"]:
+            global_l2 = filtered_stats.get("grad_norm/global_l2", 0)
+            if global_l2 > 50.0:
+                warnings.append(f"Exploding global gradient (L2: {global_l2:.2f})")
+            elif global_l2 < 1e-4 and step > 10:
+                warnings.append("Vanishing global gradient (L2 near 0)")
+                
+            # Check for dead gradients in specific layers
+            for k, v in filtered_stats.items():
+                if "grad_zeros" in k and v > 95.0:
+                    layer_name = k.replace("grad_zeros/", "").replace("_pct", "")
+                    warnings.append(f"Dead gradients in {layer_name} ({v:.1f}% zeros)")
+
+        # --- WATCHDOG 2: Dictionary Collapse (Oblique Sphere) ---
+        if config_level in ["latents", "all"]:
+            max_corr = filtered_stats.get("dict/max_cross_corr", 0)
+            if max_corr > 0.95:
+                warnings.append(f"Dictionary feature collapse (Max Corr: {max_corr:.3f})")
+
+        # 3. Report
+        if warnings:
+            from tqdm import tqdm
+            msg = f"  ↳ [WATCHDOG ALERT] Ep {epoch} Step {step}:\n      - " + "\n      - ".join(warnings)
+            tqdm.write(msg)
 
 def _train_loop(
     model: LibellaGNN, 
@@ -374,6 +416,17 @@ def _train_loop(
             with torch.no_grad():
                 if hasattr(model, 'decoder_weight'):
                     model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
+
+            if cfg.telemetry != "none" and cfg.telemetry_step_freq > 0:
+                if (step * len(meta_meta) + chunk_idx) % cfg.telemetry_step_freq == 0:
+                    deep_stats = model.get_deep_telemetry()
+                    watchdog.inspect(
+                        epoch=epoch, 
+                        step=step, 
+                        stats=deep_stats, 
+                        config_level=cfg.telemetry,
+                        target_layers=cfg.telemetry_layers
+                    )
 
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
