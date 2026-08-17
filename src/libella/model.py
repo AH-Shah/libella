@@ -50,19 +50,16 @@ class LibellaGNN(nn.Module):
         )
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
 
-        # 1. Pure Intensity Stream (Strictly Positive, Non-Sparse Magnitude)
-        # Sparsity (L0) is strictly delegated to the Entmax Gate
+        # 1. Pure Intensity Stream (Unconstrained Magnitude Scaling)
         self.mag_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents),
-            nn.LayerNorm(self.n_latents),
             nn.Softplus(beta=1.0)
         )
 
-        # 2. Dual-Stream Gate: Direct Single-Cell Identity + Spatial Prior Shift
-        self.gate_id_proj = nn.Linear(in_channels, self.n_latents)
+        # 2. Spatial Context Gating Stream
         self.gate_spatial_proj = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.SiLU(inplace=True),
@@ -179,13 +176,20 @@ class LibellaGNN(nn.Module):
         h_final = h_id + self.context_gate(ctx_pulled)
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
-        # 5. Decoupled Dual-Stream Projections with Autonomous Skip-Gating
+        # 5. Decoupled Dual-Stream Projections with Dictionary-Coupled Gating
         z_mag = self.mag_enc(x_norm)
         
-        # Direct additive combination: GNN weights receive direct gradient signals
-        id_gate_logits = self.gate_id_proj(x_norm)
+        # Direct projection against unit-norm dictionary atoms (exact cosine similarity)
+        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
+        bio_sim = torch.mm(x_norm, w_dec_norm.t())
+        
+        # Contextual spatial correction from the GNN
         spatial_shift = self.gate_spatial_proj(h_norm)
-        gate_logits = id_gate_logits + spatial_shift
+        base_logits = bio_sim + spatial_shift
+        
+        # Restore PhaseTracker dynamic scale multiplier (stretches logit variance)
+        current_scale = getattr(self, 'current_scale', getattr(cfg, 'inference_scale', 12.0))
+        gate_logits = base_logits * current_scale
 
         return z_mag, gate_logits, cell_mass
 
@@ -204,7 +208,6 @@ class LibellaGNN(nn.Module):
         progress = getattr(self, 'current_progress', 1.0)
         
         # 2. Pure Temperature-Scaled Entmax Simplex Gating
-        # Eliminate Softmax leak so exact zeros are strictly preserved during training
         safe_temp = max(0.05, float(current_temp))
         scaled_logits = gate_logits / safe_temp
         
