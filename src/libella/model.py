@@ -203,19 +203,15 @@ class LibellaGNN(nn.Module):
         z_mag, gate_logits, cell_mass = self.encode(x_dense, src, dst, edge_weights)
 
         # 1. Retrieve PhaseTracker variables populated by the training loop
-        current_alpha = getattr(self, 'current_alpha', getattr(cfg, 'inference_alpha', 1.7))
+        current_alpha = getattr(self, 'current_alpha', getattr(cfg, 'inference_alpha', 1.25))
         current_temp = getattr(self, 'current_temp', getattr(cfg, 'inference_temp', 0.3))
         progress = getattr(self, 'current_progress', 1.0)
-        
-        # 2. Calibrated Entmax Simplex Gating (Prevents 1-Hot Collapse & Revives GNN Gradients)
-        # Dynamic scale from PhaseTracker (8.0 -> 12.0) provides exact logit variance for L0 ≈ 3-5
+
         gate_probs = entmax_bisect(gate_logits, alpha=current_alpha, dim=-1)
 
         # 3. Bio-SAE Activation: Simplex Gate * Softplus Magnitude
         z = z_mag * gate_probs
 
-        # 4. Decode via L1-Constrained Compositional Atoms
-        # Using positive softmax/abs-normalized atoms guarantees comp_profile.sum() == 1.0 natively
         w_dec_pos = F.softmax(self.decoder_weight, dim=-1)
 
         x_recon = torch.mm(z, w_dec_pos) * cell_mass + (cell_mass * self.decoder_bias.unsqueeze(0))
@@ -226,19 +222,20 @@ class LibellaGNN(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                active_in_batch = (gate_probs > 0).any(dim=0)
+                active_in_batch = (gate_probs > 1e-4).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
                 dead_mask = self.steps_since_active >= self.dead_step_threshold
 
             x_norm = F.normalize(x_dense, p=2, dim=-1)
-            r_norm = (x_norm - F.normalize(x_recon, p=2, dim=-1)).detach()
+            x_recon_norm = F.normalize(F.relu(x_recon), p=2, dim=-1)
+            r_norm = (x_norm - x_recon_norm).detach()
             residual_energy = r_norm.norm(p=2, dim=-1).mean()
 
-            if dead_mask.any() and residual_energy > 0.10:
+            if dead_mask.any() and residual_energy > 0.05:
                 dead_indices = torch.nonzero(dead_mask).squeeze(-1)
                 num_dead = dead_indices.numel()
-                k_aux = min(self.aux_k, num_dead)
+                k_aux = min(max(2, self.aux_k), num_dead)
 
                 w_dead = w_dec_pos[dead_indices]
                 aux_logits = torch.mm(r_norm, w_dead.t())
