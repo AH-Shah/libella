@@ -281,10 +281,13 @@ class LibellaGNN(nn.Module):
 
         l_recon = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_true.numel())
 
-        # 2. Direct Off-Diagonal Gram Decorrelation Penalty
+        # 2. Sharp Log-Barrier Gram Decorrelation for Non-Negative Dictionary Atoms
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
         off_diag = gram * self.ortho_mask
-        l_ortho = (off_diag ** 2).sum() / (self.n_latents * (self.n_latents - 1))
+        
+        # Exponential penalty on atom pairs exceeding biological overlap threshold (0.35)
+        excess_corr = F.relu(off_diag - 0.35)
+        l_ortho = torch.exp(4.0 * excess_corr).sub(1.0).sum() / (self.n_latents * (self.n_latents - 1))
 
         # 3. Sparsity Loss
         l_sparse = z.mean()
