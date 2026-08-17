@@ -63,7 +63,7 @@ class RunConfig:
     temp_start: float = 1.5
     temp_end: float = 0.3
 
-    # Loss & Regularization
+    # Loss & Regularization (Preserved + Native SAE Controls)
     kl_weight: float = 5
     kl_base: float = 0.25
     kl_collapse_weight: float = 3.0
@@ -71,13 +71,23 @@ class RunConfig:
     anchor_peak_threshold: float = 0.50
     ortho_weight: float = 10.0
     ortho_overlap_threshold: float = 0.15
+    ortho_margin: float = 0.10             # SAE Oblique Cosine Margin on Unit Sphere
     tsallis_alpha: float = 1.5
     delta_clamp: float = 30.0
     zero_mask_rate: float = 0.05
+    
+    # Native SAE Sparsity & Capacity Engine
+    l1_coeff: float = 1e-3                 # Base L1 proxy coefficient for Jump gate
+    aux_weight: float = 0.5                # Loss weight for AuxK residual dead-latent revival
+    aux_k: int = 16                        # Number of dead latents activated per dead batch
+    dead_step_threshold: int = 100         # Steps of inactivity before a latent is marked dead
+    ortho_sample_size: int = 256           # Subsampled Gram matrix batch size for RAM efficiency
 
     # Optimizers
     lr_base: float = 0.001
     wd_base: float = 1e-4
+    lr_decoder: float = 0.001              # Isolated learning rate for Unit-Norm Oblique Decoder
+    lr_threshold: float = 0.0005           # Learning rate for Jump thresholds (θ)
     lr_anchor: float = 0.001
     wd_anchor: float = 0
     grad_clip: float = 5.0
