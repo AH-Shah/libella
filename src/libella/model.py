@@ -203,16 +203,19 @@ class LibellaGNN(nn.Module):
         progress = getattr(self, 'current_progress', 1.0)
         
         # 2. Dynamic Entmax Simplex Gating (Restores PhaseTracker Annealing)
-        sparse_gate = entmax_bisect(gate_logits, alpha=current_alpha, dim=-1)
+        # BUGFIX: Temperature scaling is strictly required to stretch logits and force L0 < 6
+        scaled_logits = gate_logits / torch.clamp(torch.tensor(current_temp, device=gate_logits.device), min=0.1)
+        
+        sparse_gate = entmax_bisect(scaled_logits, alpha=current_alpha, dim=-1)
         
         # Smooth interpolation during early training to prevent dead-locking
         if self.training:
-            smooth_gate = F.softmax(gate_logits / current_temp, dim=-1)
+            smooth_gate = F.softmax(scaled_logits, dim=-1)
             smooth_weight = 0.50 - (0.45 * progress)  # Anneals from 0.50 -> 0.05
             sparse_weight = 1.0 - smooth_weight
             gate_probs = (sparse_weight * sparse_gate) + (smooth_weight * smooth_gate)
         else:
-            gate_probs = sparse_gate 
+            gate_probs = sparse_gate
 
         # 3. Hybrid Bio-SAE Activation: Simplex Gate * ReLU Magnitude
         z = z_mag * gate_probs
