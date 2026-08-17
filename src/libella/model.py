@@ -250,7 +250,7 @@ class LibellaGNN(nn.Module):
                 z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
                 aux_recon = torch.mm(z_aux, w_dead)
 
-        return x_recon, z, w_dec_norm, aux_recon, r_norm
+        return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag
 
     def calc_loss(
         self, 
