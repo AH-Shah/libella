@@ -68,8 +68,7 @@ class LibellaGNN(nn.Module):
             nn.Linear(self.hidden_dim, self.n_latents)
         )
 
-        # --- 3. Learnable Jump Thresholds ---
-        self.jump_threshold = nn.Parameter(torch.full((self.n_latents,), 0.5, dtype=torch.float32))
+        
 
         # --- 4. Oblique Unit-Norm Decoder Dictionary ---
         if init_components is not None:
