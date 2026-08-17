@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from entmax import entmax_bisect
 
 from .config import cfg
 from .utils import scatter_softmax
@@ -197,54 +198,55 @@ class LibellaGNN(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         z_mag, gate_logits, cell_mass = self.encode(x_dense, src, dst, edge_weights)
 
-        # 1. Compute Gate Probabilities
-        gate_probs = torch.sigmoid(gate_logits)
+        # 1. Retrieve PhaseTracker variables populated by the training loop
+        current_alpha = getattr(self, 'current_alpha', getattr(cfg, 'inference_alpha', 1.7))
+        current_temp = getattr(self, 'current_temp', getattr(cfg, 'inference_temp', 0.3))
+        progress = getattr(self, 'current_progress', 1.0)
+        
+        # 2. Dynamic Entmax Simplex Gating (Restores PhaseTracker Annealing)
+        sparse_gate = entmax_bisect(gate_logits, alpha=current_alpha, dim=-1)
+        
+        # Smooth interpolation during early training to prevent dead-locking
+        if self.training:
+            smooth_gate = F.softmax(gate_logits / current_temp, dim=-1)
+            smooth_weight = 0.50 - (0.45 * progress)  # Anneals from 0.50 -> 0.05
+            sparse_weight = 1.0 - smooth_weight
+            gate_probs = (sparse_weight * sparse_gate) + (smooth_weight * smooth_gate)
+        else:
+            gate_probs = sparse_gate 
 
-        # 2. Straight-Through JumpReLU Operator
-        theta = torch.clamp(self.jump_threshold, min=0.01, max=0.99)
-        hard_mask = (gate_probs > theta).float()
-        jump_gate = hard_mask.detach() + (gate_probs - theta) - (gate_probs - theta).detach()
-
-        # 3. Final Sparse Latent Code
-        z = z_mag * jump_gate
+        # 3. Hybrid Bio-SAE Activation: Simplex Gate * ReLU Magnitude
+        # Entmax (gate_probs) restores boundary sharpness and prevents Chimerism.
+        # ReLU (z_mag) tracks true biological variance to fix R^2 = 0.0.
+        z = z_mag * gate_probs
 
         # 4. Decode with Unit-Norm Oblique Projection
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        x_recon_norm = torch.mm(z, w_dec_norm) + self.decoder_bias
+        x_recon = torch.mm(z, w_dec_norm) + self.decoder_bias
 
-        # 5. Restore Cell-Specific Mass
-        x_recon = x_recon_norm * cell_mass
-
-        # 6. AuxK Dead Latent Routing
+        # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
         aux_recon = None
         r_norm = None
 
         if self.training:
             with torch.no_grad():
-                active_in_batch = (jump_gate > 0).any(dim=0)
+                active_in_batch = (gate_probs > 0).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
                 dead_mask = self.steps_since_active >= self.dead_step_threshold
 
             x_norm = F.normalize(x_dense, p=2, dim=-1)
-            r_norm = (x_norm - x_recon_norm).detach()
+            r_norm = (x_norm - F.normalize(x_recon, p=2, dim=-1)).detach()
             residual_energy = r_norm.norm(p=2, dim=-1).mean()
 
             if dead_mask.any() and residual_energy > 0.10:
                 dead_indices = torch.nonzero(dead_mask).squeeze(-1)
                 num_dead = dead_indices.numel()
-
-                max_dead_eval = min(num_dead, 128)
-                if num_dead > max_dead_eval:
-                    perm = torch.randperm(num_dead, device=dead_indices.device)[:max_dead_eval]
-                    dead_indices = dead_indices[perm]
-                    num_dead = max_dead_eval
-
                 k_aux = min(self.aux_k, num_dead)
+
                 w_dead = w_dec_norm[dead_indices]
                 aux_logits = torch.mm(r_norm, w_dead.t())
                 topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
-
                 z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
                 aux_recon = torch.mm(z_aux, w_dead)
 
