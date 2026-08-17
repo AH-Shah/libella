@@ -63,10 +63,10 @@ class RunConfig:
     gnn_shift_weight: float = 0.5
     train_noise: float = 0.05
     edge_dropout: float = 0.40
-    scale_start: float = 8.0
-    scale_end: float = 16.0
+    scale_start: float = 6.0                # Phase 1: Mild logit scaling (L0 ≈ 8-12 for exploration)
+    scale_end: float = 12.0                 # Phase 2: Calibrated scaling (L0 ≈ 3-5 for sharp boundaries)
     alpha_start: float = 1.2
-    alpha_end: float = 1.7
+    alpha_end: float = 1.6                  # Stable Entmax curvature (prevents 1-hot argmax collapse)
     temp_start: float = 1.5
     temp_end: float = 0.3
 
