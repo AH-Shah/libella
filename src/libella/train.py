@@ -527,12 +527,14 @@ def _train_loop(
     else:
         print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
-    # Post-Training: Export Master & Patient/Sample Latents
+
     print("\n-> Extracting & Exporting Libella Latent Representations...")
     model.eval()
-    latent_records = []
-    latent_cols = [f"MP_{i+1}" for i in range(model.n_latents)]
     
+    csr_chunks = []
+    cell_metadata = []
+    patient_chunks = {}
+
     with torch.no_grad():
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
         for meta_meta, chunk_iter in prefetch_batches(meta_batches):
@@ -551,7 +553,11 @@ def _train_loop(
 
                 forward_eval = model(x, src, dst, weights)
                 z = forward_eval[1]
+                
+                # Convert slice directly to compressed CSR (bypasses dense Pandas memory)
                 z_np = z[:n_cells].detach().cpu().numpy()
+                chunk_csr = sp.csr_matrix(z_np)
+                csr_chunks.append(chunk_csr)
                 
                 patient_name = batch_ref.get("patient_name") or batch.get("patient_name")
                 if not patient_name:
@@ -563,29 +569,35 @@ def _train_loop(
                 if cell_ids is None:
                     cell_ids = [f"{patient_name}_cell_{i}" for i in range(n_cells)]
 
-                chunk_df = pd.DataFrame(z_np, index=cell_ids, columns=latent_cols)
-                chunk_df["patient_name"] = patient_name
-                latent_records.append(chunk_df)
+                patient_chunks.setdefault(patient_name, []).append((chunk_csr, cell_ids))
+                for cid in cell_ids:
+                    cell_metadata.append({"cell_id": cid, "patient_name": patient_name})
 
-    if latent_records:
-        full_latents_df = pd.concat(latent_records, axis=0)
+    if csr_chunks:
+        # 1. Save Master Sparse Matrix & Metadata
+        master_csr = sp.vstack(csr_chunks)
+        master_latent_path = out_dir / "libella_latent.npz"
+        sp.save_npz(master_latent_path, master_csr)
+        
+        meta_path = out_dir / "libella_cell_metadata.csv.gz"
+        pd.DataFrame(cell_metadata).to_csv(meta_path, index=False, compression="gzip")
+        print(f"  ↳ Master latents saved -> {master_latent_path} ({master_csr.shape[0]} cells, {master_csr.shape[1]} latents)")
 
-        z_csr = sp.csr_matrix(full_latents_df[latent_cols].values)
-        sp.save_npz(out_dir / "libella_latent.npz", z_csr)
-
+        # 2. Save Patient-Specific Sparse Matrices
         sample_out_dir = out_dir / "sample_latents"
         sample_out_dir.mkdir(parents=True, exist_ok=True)
         
-        for p_name, sub_df in full_latents_df.groupby("patient_name"):
-            clean_sub_df = sub_df.drop(columns=["patient_name"])
+        for p_name, p_data in patient_chunks.items():
+            p_csrs, p_cids_list = zip(*p_data)
+            p_combined_csr = sp.vstack(p_csrs)
+            p_cids = [cid for sub in p_cids_list for cid in sub]
             
-            root_sample_file = out_dir / f"libella_latent_{p_name}.csv"
-            clean_sub_df.to_csv(root_sample_file, index_label="cell_id")
+            p_latent_file = sample_out_dir / f"{p_name}_latent.npz"
+            p_meta_file = sample_out_dir / f"{p_name}_cells.csv.gz"
             
-            nested_sample_file = sample_out_dir / f"{p_name}_latent.csv"
-            clean_sub_df.to_csv(nested_sample_file, index_label="cell_id")
-            
-            print(f"  ↳ Patient latent saved -> {root_sample_file}")
+            sp.save_npz(p_latent_file, p_combined_csr)
+            pd.DataFrame({"cell_id": p_cids}).to_csv(p_meta_file, index=False, compression="gzip")
+            print(f"  ↳ Patient latent saved -> {p_latent_file}")
 
     return model, history
 
