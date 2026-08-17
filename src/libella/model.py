@@ -185,11 +185,15 @@ class LibellaGNN(nn.Module):
         # Contextual spatial correction from GNN with active gradient scaling
         spatial_shift = self.gate_spatial_proj(h_norm)
         
-        # Balance variance between biological similarity and GNN contextual shift
-        base_logits = bio_sim + (self.spatial_gain * spatial_shift)
+        # Standardize bio_sim and spatial_shift variances to prevent gate monopoly
+        bio_sim_scaled = (bio_sim - bio_sim.mean(dim=-1, keepdim=True)) / (bio_sim.std(dim=-1, keepdim=True) + 1e-5)
+        spatial_shift_scaled = (spatial_shift - spatial_shift.mean(dim=-1, keepdim=True)) / (spatial_shift.std(dim=-1, keepdim=True) + 1e-5)
         
-        current_scale = getattr(self, 'current_scale', 5.0)
-        gate_logits = base_logits * current_scale
+        base_logits = bio_sim_scaled + (self.spatial_gain * spatial_shift_scaled)
+        
+        # Controlled dynamic scale preventing hard 1-hot argmax collapse
+        current_scale = getattr(self, 'current_scale', 4.0)
+        gate_logits = base_logits * (current_scale / (self.n_latents ** 0.25))
 
         return z_mag, gate_logits, cell_mass, w_dec_pos
 
