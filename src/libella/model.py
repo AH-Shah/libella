@@ -49,24 +49,37 @@ class LibellaGNN(nn.Module):
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
         
 
-        self.topic_proj = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(self.hidden_dim, n_metaprograms)
-        )
+        self.n_latents = n_metaprograms  # Overcomplete latent dimension (M)
+        self.in_channels = in_channels    # Number of input genes (D)
 
-        self.spatial_bridge = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+        # 1. Stabilized Local Magnitude Stream
+        self.mag_enc = nn.Sequential(
+            nn.Linear(in_channels, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
             nn.SiLU(inplace=True),
-            nn.Linear(self.hidden_dim, n_metaprograms * in_channels)
+            nn.Linear(self.hidden_dim, self.n_latents),
+            nn.LayerNorm(self.n_latents),
+            nn.Softplus(beta=1.0)
         )
-        self.dict_temp = nn.Parameter(torch.tensor(cfg.dict_temp))
-        self.n_metaprograms = n_metaprograms
-        self.in_channels = in_channels
 
-        
-        self.register_buffer('ortho_mask', 1.0 - torch.eye(n_metaprograms, dtype=torch.float32))
+        # 2. Context Gating Stream (takes h_norm from untouched GNN)
+        self.gate_proj = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(self.hidden_dim, self.n_latents)
+        )
+
+        # 3. Learnable Jump Thresholds for strict L0 boundary control
+        self.jump_threshold = nn.Parameter(torch.full((self.n_latents,), 0.1, dtype=torch.float32))
+
+        # 4. Oblique Unit-Norm Decoder Dictionary (M x D)
+        dec_weight = torch.randn(self.n_latents, in_channels)
+        dec_weight = F.normalize(dec_weight, p=2, dim=1)
+        self.decoder_weight = nn.Parameter(dec_weight)
+        self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
+
+        # 5. Mask for Oblique Orthogonality
+        self.register_buffer('ortho_mask', 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
 
         
         if init_components is not None:
