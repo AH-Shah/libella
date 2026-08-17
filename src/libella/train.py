@@ -238,7 +238,9 @@ def _train_loop(
             'l_aux': torch.tensor(0.0, device=device),
             'l0_avg': torch.tensor(0.0, device=device),
             'dead_cnt': torch.tensor(0.0, device=device),
-            'max_act': torch.tensor(0.0, device=device)
+            'max_act': torch.tensor(0.0, device=device),
+            'dyn_w': torch.tensor(0.0, device=device),
+            'z_mag_mean': torch.tensor(0.0, device=device),
         }
 
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
@@ -271,12 +273,15 @@ def _train_loop(
 
                 prog = tracker.get_progress()
                 model.current_progress = prog
+                model.current_alpha = getattr(tracker, "alpha", 1.7)
+                model.current_temp = getattr(tracker, "temp", 0.3)
 
                 # 1. Defensive Forward Execution
                 forward_res = model(x, src, dst, weights)
                 recon, z, w_dec_norm = forward_res[0], forward_res[1], forward_res[2]
                 aux_recon = forward_res[3] if len(forward_res) > 3 else None
                 r_norm = forward_res[4] if len(forward_res) > 4 else None
+                z_mag = forward_res[5] if len(forward_res) > 5 else None
                 
                 train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
                 x_train = x[train_idx]
@@ -330,6 +335,11 @@ def _train_loop(
                     gpu_telemetry['l0_avg'] += batch_active.sum(dim=-1).mean()
                     gpu_telemetry['dead_cnt'] += dead_count_val
                     gpu_telemetry['max_act'] += z_train.max()
+                    
+                    # Accumulate zero-inflation weight and magnitude stream telemetry
+                    gpu_telemetry['dyn_w'] += model.dynamic_w_ema.detach()
+                    if z_mag is not None:
+                        gpu_telemetry['z_mag_mean'] += z_mag.detach().mean()
 
                 train_chunk_count += 1
 
@@ -439,12 +449,19 @@ def _train_loop(
                 'rec': round(current_rec, 4),
                 'ort': round(epoch_telemetry.get('l_ort', 0.0), 4),
                 'sparse': round(epoch_telemetry.get('l_sparse', 0.0), 4),
-                'aux': round(epoch_telemetry.get('l_aux', 0.0), 4)
+                'aux': round(epoch_telemetry.get('l_aux', 0.0), 4),
+                'dynamic_w_ema': round(epoch_telemetry.get('dyn_w', 1.0), 4)
             },
             'entropy': round(epoch_telemetry.get('ent', 0.0), 4),
             'l0_avg': round(current_l0, 2),
             'dead_latents': current_dead,
-            'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2)
+            'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2),
+            'z_mag_mean': round(epoch_telemetry.get('z_mag_mean', 0.0), 4),
+            'tracker': {
+                'alpha': round(getattr(tracker, 'alpha', 1.7), 4),
+                'temp': round(getattr(tracker, 'temp', 0.3), 4),
+                'progress': round(tracker.get_progress(), 4)
+            }
         }
         history.setdefault('autopsy_metrics', []).append(epoch_metrics)
 
@@ -455,9 +472,16 @@ def _train_loop(
             "epoch/val_loss": history['val_loss'][-1],
             "epoch/composite_score": composite_score,
             "loss/recon": epoch_telemetry.get('l_rec', 0.0),
+            "loss/ort": epoch_telemetry.get('l_ort', 0.0),
             "loss/sparse": epoch_telemetry.get('l_sparse', 0.0),
+            "loss/aux": epoch_telemetry.get('l_aux', 0.0),
+            "loss/dynamic_w_ema": epoch_telemetry.get('dyn_w', 1.0),
             "sae/l0_avg": current_l0,
             "sae/dead_latents": current_dead,
+            "sae/z_mag_mean": epoch_telemetry.get('z_mag_mean', 0.0),
+            "tracker/alpha": getattr(tracker, 'alpha', 1.7),
+            "tracker/temp": getattr(tracker, 'temp', 0.3),
+            "tracker/progress": tracker.get_progress(),
         }
         logger.log_metrics(epoch, epoch_log)
 
@@ -563,7 +587,7 @@ def train_gnn(
         model, optimizer, scheduler, training_cache, start_epoch, best_composite_score, tracker_state, history
     )
     gc.collect()
-    
+
     export_latents_from_graphs(model, graph_paths, out_dirs["out"], device)
     
     return model, history, n_latents
