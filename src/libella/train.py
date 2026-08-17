@@ -1,5 +1,8 @@
 """Model training loops and orchestrators for the Spatial Ecotype GNN."""
 
+import os
+import psutil
+
 import gc
 import math
 from collections.abc import Iterator
@@ -188,48 +191,86 @@ def prefetch_batches(
             chunks.append(chunk)
         yield meta_meta, chunks
 
-class TelemetryWatchdog:
-    """Monitors deep model telemetry for training collapse signatures."""
-    def __init__(self):
-        self.history = {}
 
-    def inspect(self, epoch: int, step: int, stats: dict[str, float], config_level: str, target_layers: str):
-        if config_level == "none":
-            return
-            
-        # 1. Filter by requested layers
-        filtered_stats = stats
-        if target_layers != "all":
-            allowed = target_layers.split(",")
-            filtered_stats = {k: v for k, v in stats.items() if any(layer in k for layer in allowed)}
 
-        warnings = []
-        
-        # --- WATCHDOG 1: Gradient Vanishing / Explosion ---
-        if config_level in ["gradients", "all"]:
-            global_l2 = filtered_stats.get("grad_norm/global_l2", 0)
-            if global_l2 > 50.0:
-                warnings.append(f"Exploding global gradient (L2: {global_l2:.2f})")
-            elif global_l2 < 1e-4 and step > 10:
-                warnings.append("Vanishing global gradient (L2 near 0)")
+
+class UnifiedLogger:
+    """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
+    def __init__(self, backend: str, project_name: str, run_name: str, config_dict: dict, log_dir: str):
+        self.backend = backend.lower()
+        self.writer = None
+        self.wandb = None
+
+        if self.backend == "tensorboard":
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(log_dir=f"{log_dir}/tb_logs/{run_name}")
+        elif self.backend == "wandb":
+            import wandb
+            self.wandb = wandb
+            self.wandb.init(project=project_name, name=run_name, config=config_dict)
+
+    def log_metrics(self, step: int, metrics: dict[str, float]):
+        """Log scalar metrics at step or epoch level."""
+        if self.backend == "tensorboard" and self.writer:
+            for k, v in metrics.items():
+                self.writer.add_scalar(k, v, global_step=step)
+        elif self.backend == "wandb" and self.wandb:
+            self.wandb.log(metrics, step=step)
+
+    def log_gradients_and_weights(self, step: int, model: torch.nn.Module, log_histograms: bool = False):
+        """Track gradient norms, vanishing layers, and parameter distributions."""
+        grad_metrics = {}
+        total_g_norm_sq = 0.0
+
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                p_clean = name.replace('.', '/')
+                g_norm = param.grad.detach().norm(2).item()
+                total_g_norm_sq += (g_norm ** 2)
                 
-            # Check for dead gradients in specific layers
-            for k, v in filtered_stats.items():
-                if "grad_zeros" in k and v > 95.0:
-                    layer_name = k.replace("grad_zeros/", "").replace("_pct", "")
-                    warnings.append(f"Dead gradients in {layer_name} ({v:.1f}% zeros)")
+                # Zero-gradient detection (dead paths)
+                zero_pct = (param.grad == 0).float().mean().item() * 100.0
+                grad_metrics[f"gradients/norm/{p_clean}"] = g_norm
+                grad_metrics[f"gradients/zero_pct/{p_clean}"] = zero_pct
 
-        # --- WATCHDOG 2: Dictionary Collapse (Oblique Sphere) ---
-        if config_level in ["latents", "all"]:
-            max_corr = filtered_stats.get("dict/max_cross_corr", 0)
-            if max_corr > 0.95:
-                warnings.append(f"Dictionary feature collapse (Max Corr: {max_corr:.3f})")
+                # Heavy histogram tracking
+                if log_histograms:
+                    if self.backend == "tensorboard" and self.writer:
+                        self.writer.add_histogram(f"grads/{p_clean}", param.grad, global_step=step)
+                        self.writer.add_histogram(f"weights/{p_clean}", param.data, global_step=step)
+                    elif self.backend == "wandb" and self.wandb:
+                        grad_metrics[f"hist_grads/{p_clean}"] = self.wandb.Histogram(param.grad.cpu().numpy())
 
-        # 3. Report
-        if warnings:
-            from tqdm import tqdm
-            msg = f"  ↳ [WATCHDOG ALERT] Ep {epoch} Step {step}:\n      - " + "\n      - ".join(warnings)
-            tqdm.write(msg)
+        grad_metrics["gradients/global_l2"] = total_g_norm_sq ** 0.5
+        self.log_metrics(step, grad_metrics)
+
+    @staticmethod
+    def get_memory_metrics(device: torch.device) -> dict[str, float]:
+        """Hardware-aware memory extraction for CUDA, MPS (Apple Silicon), and Host RAM."""
+        mem = {}
+        # Host RAM
+        mem["memory/ram_used_gb"] = psutil.virtual_memory().used / (1024 ** 3)
+        mem["memory/ram_pct"] = psutil.virtual_memory().percent
+
+        # Nvidia GPU VRAM
+        if device.type == "cuda":
+            mem["memory/cuda_allocated_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
+            mem["memory/cuda_reserved_gb"] = torch.cuda.memory_reserved(device) / (1024 ** 3)
+            mem["memory/cuda_max_allocated_gb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+
+        # Apple Silicon MPS VRAM
+        elif device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+            mem["memory/mps_allocated_gb"] = torch.mps.current_allocated_memory() / (1024 ** 3)
+            mem["memory/mps_driver_allocated_gb"] = torch.mps.driver_allocated_memory() / (1024 ** 3)
+
+        return mem
+
+    def close(self):
+        if self.writer:
+            self.writer.flush()
+            self.writer.close()
+        if self.wandb:
+            self.wandb.finish()
 
 def _train_loop(
     model: LibellaGNN, 
@@ -416,7 +457,6 @@ def _train_loop(
             with torch.no_grad():
                 if hasattr(model, 'decoder_weight'):
                     model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
-                    
 
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
