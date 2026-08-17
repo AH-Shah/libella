@@ -21,7 +21,7 @@ from .data import (
     pt_to_scipy_csr,
 )
 from .model import LibellaGNN
-from .utils import PhaseTracker, UnifiedLogger, export_latents, get_device
+from .utils import PhaseTracker, UnifiedLogger, export_latents_from_graphs, get_device
 
 
 def _init_model(
@@ -528,9 +528,6 @@ def _train_loop(
     else:
         print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
-    # Clean 1-line export call
-    export_latents(model, training_cache, out_dir, device, meta_batch_size=accumulation_steps)
-
     return model, history
 
 
@@ -559,8 +556,8 @@ def train_gnn(
         print(f"-> Training already reached target epoch ({start_epoch}/{cfg.epochs}). Skipping loop.")
         master_latent_path = out_dir / "libella_latent.npz"
         if not master_latent_path.exists():
-            export_latents(model, training_cache, out_dir, device, meta_batch_size=getattr(cfg, "meta_batch_size", 4))
-        return model, history, n_latents
+            export_latents_from_graphs(model, graph_paths, out_dirs["out"], device)
+    return model, history, n_latents
 
     model, history = _train_loop(
         model, optimizer, scheduler, training_cache, start_epoch, best_composite_score, tracker_state, history

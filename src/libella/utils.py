@@ -8,10 +8,18 @@ import numpy as np
 import pandas as pd
 import torch
 import math
-from typing import Dict, List, Optional, Tuple, Any
-
+from typing import Dict, List, Optional, Tuple, Any, Union
+from tqdm import tqdm
+from pathlib import Path
+from typing import Any, List, Optional, Union
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import torch
+from tqdm import tqdm
 import psutil
 import torch
+import gc
 
 from collections.abc import Iterator
 import scipy.sparse as sp
@@ -289,88 +297,145 @@ class UnifiedLogger:
             self.writer.close()
 
 
-def export_latents(
+
+def export_latents_from_graphs(
     model: torch.nn.Module,
-    training_cache: list[dict[str, Any]],
-    out_dir: Path,
+    graph_paths: List[Union[str, Path]],
+    out_dir: Union[str, Path],
     device: torch.device,
-    meta_batch_size: int = 4
-) -> None:
-    """Extract and export sparse CSR representations for master and patient cohorts."""
-    # Local import to prevent circular import issues between data and utils
-    from .data import make_meta_batches, pad_mps_shapes
-
-    def _prefetch(batches):
-        for meta_meta in batches:
-            chunks = [torch.load(b["chunk_file"], map_location="cpu", weights_only=False) for b in meta_meta]
-            yield meta_meta, chunks
-
-    print("\n-> Extracting & Exporting Libella Latent Representations (CSR)...")
-    model.eval()
+    batch_size: int = 4096,
+    k_hops: int = 2,
+) -> tuple[sp.csr_matrix, pd.DataFrame]:
+    """
+    Extracts and exports sparse CSR representations directly from graph.pt files.
     
-    csr_chunks = []
-    cell_metadata = []
-    patient_chunks = {}
+    Guarantees:
+      1. Zero halo-node duplication (only core nodes are extracted).
+      2. Exact 1:1 cell index and barcode alignment with graph.pt.
+      3. Outputs master and per-patient .npz matrices and .csv.gz metadata.
+    """
+    from .data import SpatialBatcher, pad_mps_shapes, pt_to_scipy_csr
+
+    out_dir = Path(out_dir).resolve()
+    sample_out_dir = out_dir / "sample_latents"
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n-> Extracting & Exporting Libella Latent Representations from graph.pt...")
+    model.eval()
+
+    all_patient_csrs = []
+    all_cell_metadata = []
 
     with torch.no_grad():
-        meta_batches = make_meta_batches(training_cache, meta_batch_size=meta_batch_size)
-        for meta_meta, chunk_iter in _prefetch(meta_batches):
-            for batch_ref, batch in zip(meta_meta, chunk_iter):
-                x = batch["x"].to(device=device, non_blocking=True)
-                src = batch["src"].to(device=device, non_blocking=True)
-                dst = batch["dst"].to(device=device, non_blocking=True)
-                weights = batch["weights"].to(device=device, non_blocking=True)
+        for g_path in tqdm(graph_paths, desc="Exporting Latents per Graph", leave=False):
+            g_path = Path(g_path)
+            data = torch.load(g_path, map_location="cpu", weights_only=False)
+
+            X_sp = pt_to_scipy_csr(data, "x_in")
+            N_cells = X_sp.shape[0]
+
+            # Reconstruct adjacency
+            e_attr = data.edge_attr.numpy()
+            e_row = data.edge_index[0].numpy()
+            e_col = data.edge_index[1].numpy()
+            adj_sp = sp.csr_matrix((e_attr, (e_row, e_col)), shape=(N_cells, N_cells))
+
+            patient_name = getattr(data, "patient_name", g_path.stem.replace("_graph", ""))
+            barcodes_raw = getattr(data, "barcodes", getattr(data, "cell_ids", None))
+            if barcodes_raw is None:
+                barcodes = [f"{patient_name}_cell_{i}" for i in range(N_cells)]
+            elif isinstance(barcodes_raw, np.ndarray):
+                barcodes = barcodes_raw.tolist()
+            else:
+                barcodes = list(barcodes_raw)
+
+            # SpatialBatcher over ALL cells (shuffle=False to keep order deterministic)
+            dummy_mask = np.ones(N_cells, dtype=bool)
+            batcher = SpatialBatcher(
+                X=X_sp,
+                adj=adj_sp,
+                coords=data.pos.numpy() if hasattr(data, "pos") else np.zeros((N_cells, 2)),
+                train_mask=dummy_mask,
+                val_mask=dummy_mask,
+                batch_size=batch_size,
+                k_hops=k_hops,
+                shuffle=False,
+            )
+
+            patient_z_chunks = []
+            patient_cell_indices = []
+
+            for chunk_idx, core_idx in enumerate(batcher.chunks):
+                chunk = batcher.get_chunk(chunk_idx)
                 
-                n_cells = x.size(0)
-                x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
-                
-                if device.type != 'mps':
+                # Tensorize input expression
+                if hasattr(chunk["x"], "toarray"):
+                    chunk_x = torch.from_numpy(chunk["x"].toarray()).to(torch.float32)
+                elif not isinstance(chunk["x"], torch.Tensor):
+                    chunk_x = torch.tensor(chunk["x"], dtype=torch.float32)
+                else:
+                    chunk_x = chunk["x"].to(torch.float32)
+
+                # Tensorize edges
+                adj_coo = chunk["adj"].tocoo()
+                src = torch.from_numpy(adj_coo.row).to(torch.int32)
+                dst = torch.from_numpy(adj_coo.col).to(torch.int32)
+                weights = torch.from_numpy(adj_coo.data).to(torch.float32)
+
+                chunk_x = chunk_x.to(device)
+                src = src.to(device)
+                dst = dst.to(device)
+                weights = weights.to(device)
+
+                chunk_x, src, dst, weights = pad_mps_shapes(chunk_x, src, dst, weights)
+                if device.type != "mps":
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                forward_eval = model(x, src, dst, weights)
+                # Forward inference
+                forward_eval = model(chunk_x, src, dst, weights)
                 z = forward_eval[1]
-                
-                z_np = z[:n_cells].detach().cpu().numpy()
-                chunk_csr = sp.csr_matrix(z_np)
-                csr_chunks.append(chunk_csr)
-                
-                patient_name = batch_ref.get("patient_name") or batch.get("patient_name")
-                if not patient_name:
-                    chunk_file = batch_ref.get("chunk_file")
-                    patient_name = Path(chunk_file).stem.split("_chunk_")[0] if chunk_file else "sample_1"
-                
-                patient_name = str(patient_name)
-                cell_ids = batch.get("barcodes") or batch.get("cell_ids")
-                if cell_ids is None:
-                    cell_ids = [f"{patient_name}_cell_{i}" for i in range(n_cells)]
 
-                patient_chunks.setdefault(patient_name, []).append((chunk_csr, cell_ids))
-                for cid in cell_ids:
-                    cell_metadata.append({"cell_id": cid, "patient_name": patient_name})
+                # CRITICAL: Slice ONLY local core nodes (drops 2-hop halo neighbors)
+                local_core = chunk["local_core_idx"]
+                z_core = z[local_core].detach().cpu().numpy()
 
-    if csr_chunks:
-        # 1. Save Master Sparse Matrix & Metadata
-        master_csr = sp.vstack(csr_chunks)
-        master_latent_path = out_dir / "libella_latent.npz"
-        sp.save_npz(master_latent_path, master_csr)
-        
-        meta_path = out_dir / "libella_cell_metadata.csv.gz"
-        pd.DataFrame(cell_metadata).to_csv(meta_path, index=False, compression="gzip")
-        print(f"  ↳ Master latents saved -> {master_latent_path} ({master_csr.shape[0]} cells, {master_csr.shape[1]} latents)")
+                patient_z_chunks.append(sp.csr_matrix(z_core))
+                patient_cell_indices.extend(core_idx)
 
-        # 2. Save Patient-Specific Sparse Matrices
-        sample_out_dir = out_dir / "sample_latents"
-        sample_out_dir.mkdir(parents=True, exist_ok=True)
-        
-        for p_name, p_data in patient_chunks.items():
-            p_csrs, p_cids_list = zip(*p_data)
-            p_combined_csr = sp.vstack(p_csrs)
-            p_cids = [cid for sub in p_cids_list for cid in sub]
-            
-            p_latent_file = sample_out_dir / f"{p_name}_latent.npz"
-            p_meta_file = sample_out_dir / f"{p_name}_cells.csv.gz"
-            
-            sp.save_npz(p_latent_file, p_combined_csr)
-            pd.DataFrame({"cell_id": p_cids}).to_csv(p_meta_file, index=False, compression="gzip")
-            print(f"  ↳ Patient latent saved -> {p_latent_file}")
+            # Assemble patient CSR in exact original graph order (0..N_cells-1)
+            patient_csr_unordered = sp.vstack(patient_z_chunks)
+            order_map = np.argsort(patient_cell_indices)
+            patient_csr = patient_csr_unordered[order_map]
+
+            # Save Patient-Specific Artifacts
+            p_latent_file = sample_out_dir / f"{patient_name}_latent.npz"
+            p_meta_file = sample_out_dir / f"{patient_name}_cells.csv.gz"
+
+            sp.save_npz(p_latent_file, patient_csr)
+            pd.DataFrame({"cell_id": barcodes, "patient_name": patient_name}).to_csv(
+                p_meta_file, index=False, compression="gzip"
+            )
+            print(f"  ↳ Saved patient {patient_name} -> {p_latent_file.name} ({patient_csr.shape[0]} cells)")
+
+            all_patient_csrs.append(patient_csr)
+            for cid in barcodes:
+                all_cell_metadata.append({"cell_id": cid, "patient_name": patient_name})
+
+            del data, X_sp, adj_sp, batcher
+            gc.collect()
+
+    # Save Master Cohort Artifacts
+    master_csr = sp.vstack(all_patient_csrs)
+    master_latent_path = out_dir / "libella_latent.npz"
+    sp.save_npz(master_latent_path, master_csr)
+
+    master_meta_df = pd.DataFrame(all_cell_metadata)
+    master_meta_path = out_dir / "libella_cell_metadata.csv.gz"
+    master_meta_df.to_csv(master_meta_path, index=False, compression="gzip")
+
+    print(f"\n[✓] Master export complete -> {master_latent_path}")
+    print(f"    Shape: {master_csr.shape[0]:,} cells × {master_csr.shape[1]:,} latents")
+
+    return master_csr, master_meta_df
+
