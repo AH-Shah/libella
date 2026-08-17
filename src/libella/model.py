@@ -172,7 +172,8 @@ class LibellaGNN(nn.Module):
         ctx_pulled = torch.zeros_like(Q)
         ctx_pulled.index_add_(0, dst_with_self, pulled_msg)
 
-        h_final = h_id + self.context_gate(ctx_pulled)
+        # Direct spatial highway connection to strengthen GNN backpropagation
+        h_final = h_id + self.context_gate(ctx_pulled) + ctx_pulled
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
         # 5. Decoupled Dual-Stream Projections with Dictionary-Coupled Gating
@@ -280,10 +281,10 @@ class LibellaGNN(nn.Module):
 
         l_recon = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_true.numel())
 
-        # 2. Continuous Gram-Matrix Repulsion (Off-diagonal Correlation Penalty)
+        # 2. Direct Off-Diagonal Gram Decorrelation Penalty
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
-        off_diag_gram = gram * self.ortho_mask
-        l_ortho = (off_diag_gram ** 2).sum() / (self.n_latents * (self.n_latents - 1))
+        off_diag = gram * self.ortho_mask
+        l_ortho = (off_diag ** 2).sum() / (self.n_latents * (self.n_latents - 1))
 
         # 3. Sparsity Loss
         l_sparse = z.mean()
