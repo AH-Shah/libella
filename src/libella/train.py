@@ -188,6 +188,61 @@ def prefetch_batches(
             chunks.append(chunk)
         yield meta_meta, chunks
 
+def harvest_telemetry(
+    model: LibellaGNN, 
+    z_train: torch.Tensor | None = None,
+    mode: str = "basic",
+    target_layers: str = "all"
+) -> dict[str, float]:
+    """Dynamically extracts only the metrics you care about."""
+    if mode == "none":
+        return {}
+
+    stats = {}
+
+    # --- Mode 1: Latent Code & Dictionary Telemetry ---
+    if mode in ["latents", "all"] and z_train is not None:
+        with torch.no_grad():
+            active_mask = (z_train > 0).float()
+            l0_per_cell = active_mask.sum(dim=-1).mean().item()
+            stats["l0_avg"] = l0_per_cell
+            stats["l0_pct"] = (l0_per_cell / model.n_latents) * 100.0
+            stats["max_act"] = z_train.max().item()
+            
+            # Dead latents tracking
+            if hasattr(model, "steps_since_active"):
+                dead_count = (model.steps_since_active >= model.dead_step_threshold).sum().item()
+                stats["dead_latents"] = dead_count
+
+            # Dictionary orthogonality / cross-correlation
+            if hasattr(model, "decoder_weight"):
+                w = F.normalize(model.decoder_weight, p=2, dim=1)
+                sim = torch.mm(w, w.t())
+                off_diag = sim * (1.0 - torch.eye(w.size(0), device=w.device))
+                stats["dict_max_sim"] = off_diag.max().item()
+                stats["dict_mean_sim"] = off_diag.abs().mean().item()
+
+    # --- Mode 2: Gradients & Parameter Telemetry ---
+    if mode in ["gradients", "all"]:
+        total_g_norm_sq = 0.0
+        selected = None if target_layers == "all" else target_layers.split(",")
+
+        for name, param in model.named_parameters():
+            if selected and not any(sel.strip() in name for sel in selected):
+                continue
+                
+            clean_name = name.replace(".", "/")
+            stats[f"param_norm/{clean_name}"] = param.detach().norm(2).item()
+
+            if param.grad is not None:
+                g_norm = param.grad.detach().norm(2).item()
+                total_g_norm_sq += (g_norm ** 2)
+                stats[f"grad_norm/{clean_name}"] = g_norm
+                stats[f"grad_zero_pct/{clean_name}"] = (param.grad == 0).float().mean().item() * 100.0
+
+        stats["grad_norm/global"] = total_g_norm_sq ** 0.5
+
+    return stats
 
 def _train_loop(
     model: LibellaGNN, 
