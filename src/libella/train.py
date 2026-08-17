@@ -500,7 +500,7 @@ def _train_loop(
         print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
     # -------------------------------------------------------------
-    # Post-Training: Export Master & Batch/Sample Latents (BANKSY / EcoTyper style)
+    # Post-Training: Export Master & Patient/Sample Latents
     # -------------------------------------------------------------
     print("\n-> Extracting & Exporting Libella Latent Representations...")
     import pandas as pd
@@ -530,72 +530,48 @@ def _train_loop(
                 _, z, _, _, _ = model(x, src, dst, weights)
                 z_np = z[:n_cells].detach().cpu().numpy()
                 
-                # 2. Extract Patient & Dataset IDs (matches cli.py manifest mappings)
-                pt_id = (
-                    batch_ref.get("patient_id") or batch_ref.get("pt_id") or
-                    batch.get("patient_id") or batch.get("pt_id") or
-                    batch_ref.get("sample_id") or batch.get("sample_id")
-                )
-                ds_id = (
-                    batch_ref.get("dataset_id") or batch_ref.get("ds_id") or
-                    batch.get("dataset_id") or batch.get("ds_id")
-                )
+                # 2. Extract Patient Name (Matches your training_cache key)
+                patient_name = batch_ref.get("patient_name") or batch.get("patient_name")
+                if not patient_name:
+                    chunk_file = batch_ref.get("chunk_file")
+                    patient_name = Path(chunk_file).stem.split("_chunk_")[0] if chunk_file else "sample_1"
                 
-                # Fallback to graph filepath stem if not stored directly in batch dict
-                if not pt_id:
-                    for k in ["path", "graph_path", "filepath", "file"]:
-                        if k in batch_ref:
-                            pt_id = Path(str(batch_ref[k])).stem.replace("_graph", "").replace(".pt", "")
-                            break
-                        if k in batch:
-                            pt_id = Path(str(batch[k])).stem.replace("_graph", "").replace(".pt", "")
-                            break
-                            
-                pt_id = str(pt_id) if pt_id else "sample_1"
-                ds_id = str(ds_id) if ds_id else "dataset_1"
-                sample_id = f"{ds_id}_{pt_id}" if ds_id != pt_id and ds_id != "Unknown" else pt_id
+                patient_name = str(patient_name)
 
-                # 3. Extract Cell Barcodes
-                cell_ids = (
-                    batch.get("barcodes") or batch_ref.get("barcodes") or
-                    batch.get("cell_ids") or batch_ref.get("cell_ids") or
-                    batch.get("obs_names") or batch_ref.get("obs_names")
-                )
+                # 3. Extract Cell Barcodes / IDs
+                cell_ids = batch.get("barcodes") or batch.get("cell_ids")
                 if cell_ids is None:
-                    cell_ids = [f"{sample_id}_cell_{i}" for i in range(n_cells)]
+                    # Fallback to indexed IDs with the true patient prefix (e.g. benchmark_cell_0)
+                    cell_ids = [f"{patient_name}_cell_{i}" for i in range(n_cells)]
 
                 chunk_df = pd.DataFrame(z_np, index=cell_ids, columns=latent_cols)
-                chunk_df["dataset_id"] = ds_id
-                chunk_df["patient_id"] = pt_id
-                chunk_df["sample_id"] = sample_id
-                
+                chunk_df["patient_name"] = patient_name
                 latent_records.append(chunk_df)
 
     if latent_records:
         full_latents_df = pd.concat(latent_records, axis=0)
-        meta_cols = ["dataset_id", "patient_id", "sample_id"]
 
-        # 1. Save Master Latents (All Samples Combined)
+        # 1. Save Master Latents (All Patients / Chunks Combined)
         master_latent_path = out_dir / "libella_latent.csv"
         full_latents_df.to_csv(master_latent_path, index_label="cell_id")
         print(f"  ↳ Master latents saved -> {master_latent_path}")
 
-        # 2. Save Batch/Sample-Specific Latents (in root out_dir AND sample_latents/)
+        # 2. Save Patient-Specific Latents (EcoTyper / BANKSY format)
         sample_out_dir = out_dir / "sample_latents"
         sample_out_dir.mkdir(parents=True, exist_ok=True)
         
-        for s_id, sub_df in full_latents_df.groupby("sample_id"):
-            clean_sub_df = sub_df.drop(columns=meta_cols)
+        for p_name, sub_df in full_latents_df.groupby("patient_name"):
+            clean_sub_df = sub_df.drop(columns=["patient_name"])
             
-            # Save root EcoTyper/BANKSY style: out_dir/libella_latent_<sample>.csv
-            root_sample_file = out_dir / f"libella_latent_{s_id}.csv"
+            # Root: out_dir/libella_latent_benchmark.csv
+            root_sample_file = out_dir / f"libella_latent_{p_name}.csv"
             clean_sub_df.to_csv(root_sample_file, index_label="cell_id")
             
-            # Also keep organized in subfolder: out_dir/sample_latents/<sample>_latent.csv
-            nested_sample_file = sample_out_dir / f"{s_id}_latent.csv"
+            # Subfolder: out_dir/sample_latents/benchmark_latent.csv
+            nested_sample_file = sample_out_dir / f"{p_name}_latent.csv"
             clean_sub_df.to_csv(nested_sample_file, index_label="cell_id")
             
-            print(f"  ↳ Batch/Sample latent saved -> {root_sample_file}")
+            print(f"  ↳ Patient latent saved -> {root_sample_file}")
 
     return model, history
 
