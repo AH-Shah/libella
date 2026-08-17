@@ -180,20 +180,20 @@ class LibellaGNN(nn.Module):
         # 5. Decoupled Dual-Stream Projections with Dictionary-Coupled Gating
         z_mag = self.mag_enc(x_norm)
         
-        # Direct projection against unit-norm dictionary atoms (exact cosine similarity)
-        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        bio_sim = torch.mm(x_norm, w_dec_norm.t())
+        # Non-negative L2-normalized dictionary for both encoder projection and decoder reconstruction
+        w_dec_pos = F.normalize(F.relu(self.decoder_weight) + 1e-8, p=2, dim=-1)
+        bio_sim = torch.mm(x_norm, w_dec_pos.t())
         
         # Contextual spatial correction from GNN with active gradient scaling
         spatial_shift = self.gate_spatial_proj(h_norm)
         
-        # GNN spatial shift and biological similarity operate at equal variance
+        # Balance variance between biological similarity and GNN contextual shift
         base_logits = bio_sim + (self.spatial_gain * spatial_shift)
         
-        current_scale = getattr(self, 'current_scale', getattr(cfg, 'inference_scale', 10.0))
+        current_scale = getattr(self, 'current_scale', 5.0)
         gate_logits = base_logits * current_scale
 
-        return z_mag, gate_logits, cell_mass
+        return z_mag, gate_logits, cell_mass, w_dec_pos
 
     def forward(
         self, 
