@@ -49,11 +49,10 @@ class LibellaGNN(nn.Module):
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
         
 
-        # In __init__:
-        self.n_latents = n_metaprograms  # Overcomplete latent dimension (M)
-        self.in_channels = in_channels    # Number of input genes (D)
+        self.n_latents = n_metaprograms
+        self.in_channels = in_channels
 
-        # 1. Stabilized Local Magnitude Stream
+        # 1. Stabilized Local Magnitude Stream (LayerNorm + Softplus)
         self.mag_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
             nn.LayerNorm(self.hidden_dim),
@@ -70,22 +69,26 @@ class LibellaGNN(nn.Module):
             nn.Linear(self.hidden_dim, self.n_latents)
         )
 
+        # 3. Learnable Jump Thresholds
         self.jump_threshold = nn.Parameter(torch.full((self.n_latents,), 0.1, dtype=torch.float32))
 
-        dec_weight = torch.randn(self.n_latents, in_channels)
-        dec_weight = F.normalize(dec_weight, p=2, dim=1)
-        self.decoder_weight = nn.Parameter(dec_weight)
+        # 4. Oblique Unit-Norm Decoder Dictionary (Initialized on Unit Sphere)
+        if init_components is not None:
+            dec_init = torch.tensor(init_components, dtype=torch.float32)
+            if dec_init.shape != (self.n_latents, in_channels):
+                dec_init = torch.randn(self.n_latents, in_channels)
+            dec_init = F.normalize(dec_init, p=2, dim=-1)
+        else:
+            dec_init = F.normalize(torch.randn(self.n_latents, in_channels), p=2, dim=-1)
+
+        self.decoder_weight = nn.Parameter(dec_init)
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
 
+        # 5. Native Buffers & Optimizations
         self.register_buffer('ortho_mask', 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
-
-        # --- OPTIMIZATION 2: AuxK Dead-Latent Tracking Buffers ---
         self.register_buffer('steps_since_active', torch.zeros(self.n_latents, dtype=torch.int64))
-        self.dead_step_threshold = getattr(cfg, 'dead_step_threshold', 100) # Steps until marked dead
-        self.aux_k = getattr(cfg, 'aux_k', min(32, max(4, self.n_latents // 16))) # Top-k dead atoms to fit
-
-        # --- OPTIMIZATION 4: Strided Orthogonality Chunk Size ---
-        # Caps Gram matrix memory to (sample_size x M) instead of (M x M)
+        self.dead_step_threshold = getattr(cfg, 'dead_step_threshold', 100)
+        self.aux_k = getattr(cfg, 'aux_k', min(32, max(4, self.n_latents // 16)))
         self.ortho_sample_size = getattr(cfg, 'ortho_sample_size', min(256, self.n_latents))
 
         
