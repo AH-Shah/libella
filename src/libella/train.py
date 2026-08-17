@@ -188,7 +188,7 @@ def prefetch_batches(
             chunks.append(chunk)
         yield meta_meta, chunks
 
-class watchdog:
+class TelemetryWatchdog:
     """Monitors deep model telemetry for training collapse signatures."""
     def __init__(self):
         self.history = {}
@@ -416,17 +416,7 @@ def _train_loop(
             with torch.no_grad():
                 if hasattr(model, 'decoder_weight'):
                     model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
-
-            if cfg.telemetry != "none" and cfg.telemetry_step_freq > 0:
-                if (step * len(meta_meta) + chunk_idx) % cfg.telemetry_step_freq == 0:
-                    deep_stats = model.get_deep_telemetry()
-                    watchdog.inspect(
-                        epoch=epoch, 
-                        step=step, 
-                        stats=deep_stats, 
-                        config_level=cfg.telemetry,
-                        target_layers=cfg.telemetry_layers
-                    )
+                    
 
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
