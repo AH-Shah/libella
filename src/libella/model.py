@@ -322,8 +322,8 @@ class LibellaGNN(nn.Module):
         base_ortho = getattr(cfg, 'ortho_weight', 10.0)
         aux_weight = getattr(cfg, 'aux_weight', 0.5)
 
-        # Phase 1: Focus on reconstruction manifold. Phase 2: Escalate sparsity pressure
-        sparsity_multiplier = 0.05 + 0.95 * (progress ** 1.5)
+        # Smooth asymptotic sparsity pressure (prevents late-stage loss explosion)
+        sparsity_multiplier = 0.10 + 0.90 * (progress ** 0.8)
         current_l1 = base_l1 * sparsity_multiplier
         current_ortho = base_ortho * (0.5 + 0.5 * progress)
 
