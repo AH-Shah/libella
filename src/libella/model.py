@@ -178,24 +178,23 @@ class LibellaGNN(nn.Module):
         # 5. Decoupled Dual-Stream Projections with Dictionary-Coupled Gating
         z_mag = self.mag_enc(x_norm)
         
-        # Non-negative L2-normalized dictionary for both encoder projection and decoder reconstruction
-        w_dec_pos = F.normalize(F.relu(self.decoder_weight) + 1e-8, p=2, dim=-1)
-        bio_sim = torch.mm(x_norm, w_dec_pos.t())
+        # Direct projection against unit-norm dictionary atoms (exact cosine similarity)
+        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
+        bio_sim = torch.mm(x_norm, w_dec_norm.t())
         
         # Contextual spatial correction from GNN with active gradient scaling
         spatial_shift = self.gate_spatial_proj(h_norm)
         
-        # Standardize bio_sim and spatial_shift variances to prevent gate monopoly
-        bio_sim_scaled = (bio_sim - bio_sim.mean(dim=-1, keepdim=True)) / (bio_sim.std(dim=-1, keepdim=True) + 1e-5)
-        spatial_shift_scaled = (spatial_shift - spatial_shift.mean(dim=-1, keepdim=True)) / (spatial_shift.std(dim=-1, keepdim=True) + 1e-5)
+        # Normalize variances so neither stream dominates gating
+        bio_sim_norm = (bio_sim - bio_sim.mean(dim=-1, keepdim=True)) / (bio_sim.std(dim=-1, keepdim=True) + 1e-5)
+        spatial_shift_norm = (spatial_shift - spatial_shift.mean(dim=-1, keepdim=True)) / (spatial_shift.std(dim=-1, keepdim=True) + 1e-5)
         
-        base_logits = bio_sim_scaled + (self.spatial_gain * spatial_shift_scaled)
+        base_logits = bio_sim_norm + (self.spatial_gain * spatial_shift_norm)
         
-        # Controlled dynamic scale preventing hard 1-hot argmax collapse
         current_scale = getattr(self, 'current_scale', 4.0)
-        gate_logits = base_logits * (current_scale / (self.n_latents ** 0.25))
+        gate_logits = base_logits * current_scale
 
-        return z_mag, gate_logits, cell_mass, w_dec_pos
+        return z_mag, gate_logits, cell_mass
 
     def forward(
         self, 
