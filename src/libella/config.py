@@ -76,12 +76,12 @@ class RunConfig:
     delta_clamp: float = 30.0
     zero_mask_rate: float = 0.05
     
-    # Native SAE Sparsity & Capacity Engine
+    # Native SAE Sparsity & Capacity Engine (Laptop Presets)
     l1_coeff: float = 1e-3                 # Base L1 proxy coefficient for Jump gate
     aux_weight: float = 0.5                # Loss weight for AuxK residual dead-latent revival
-    aux_k: int = 16                        # Number of dead latents activated per dead batch
-    dead_step_threshold: int = 100         # Steps of inactivity before a latent is marked dead
-    ortho_sample_size: int = 256           # Subsampled Gram matrix batch size for RAM efficiency
+    aux_k: int = 8                         # Lightweight TopK for mobile GPU/MPS
+    dead_step_threshold: int = 50          # Faster dead feature detection
+    ortho_sample_size: int = 128           # Low memory Gram matrix slice
 
     # Optimizers
     lr_base: float = 0.001

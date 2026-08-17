@@ -235,20 +235,24 @@ class LibellaGNN(nn.Module):
             if dead_mask.any():
                 dead_indices = torch.nonzero(dead_mask).squeeze(-1)
                 num_dead = dead_indices.numel()
+
+                # Laptop MPS Optimization: Cap candidate dead atoms to avoid wide TopK kernel stalls
+                max_dead_eval = min(num_dead, 128)
+                if num_dead > max_dead_eval:
+                    perm = torch.randperm(num_dead, device=dead_indices.device)[:max_dead_eval]
+                    dead_indices = dead_indices[perm]
+                    num_dead = max_dead_eval
+
                 k_aux = min(self.aux_k, num_dead)
 
-                # Isolate unexplained residual on normalized inputs (detach to prevent pulling live latents)
+                # Isolate unexplained residual
                 x_norm = F.normalize(x_dense, p=2, dim=-1)
                 r_norm = (x_norm - x_recon_norm).detach()
 
-                # Dead decoder subspace
                 w_dead = w_dec_norm[dead_indices]
-
-                # Project residual onto dead dictionary atoms
                 aux_logits = torch.mm(r_norm, w_dead.t())
                 topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
 
-                # Sparse AuxK activation matrix
                 z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
                 aux_recon = torch.mm(z_aux, w_dead)
 
