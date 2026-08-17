@@ -570,9 +570,8 @@ def _train_loop(
     if latent_records:
         full_latents_df = pd.concat(latent_records, axis=0)
 
-        master_latent_path = out_dir / "libella_latent.csv"
-        full_latents_df.to_csv(master_latent_path, index_label="cell_id")
-        print(f"  ↳ Master latents saved -> {master_latent_path}")
+        master_latent_path = out_dir / "libella_latent.csv.gz"
+        full_latents_df.to_csv(master_latent_path, index_label="cell_id", compression="gzip")
 
         sample_out_dir = out_dir / "sample_latents"
         sample_out_dir.mkdir(parents=True, exist_ok=True)
