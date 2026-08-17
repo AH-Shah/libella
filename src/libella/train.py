@@ -391,7 +391,7 @@ def _train_loop(
             if getattr(cfg, "telemetry_step_freq", 0) > 0 and (global_step % cfg.telemetry_step_freq == 0):
                 # 1. Log basic step loss and learning rate
                 step_metrics = {
-                    "step/batch_loss": true_batch_loss.item(),
+                    "step/batch_loss": current_step_loss,
                     "step/lr": optimizer.param_groups[0]['lr'],
                     **logger.get_memory_metrics(device)
                 }
