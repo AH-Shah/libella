@@ -510,53 +510,60 @@ def _train_loop(
     latent_cols = [f"MP_{i+1}" for i in range(model.n_latents)]
     
     with torch.no_grad():
-        for chunk in training_cache:
-            x = chunk["x"].to(device=device, non_blocking=True)
-            src = chunk["src"].to(device=device, non_blocking=True)
-            dst = chunk["dst"].to(device=device, non_blocking=True)
-            weights = chunk["weights"].to(device=device, non_blocking=True)
-            
-            x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
-            if device.type != 'mps':
-                src, dst = src.to(torch.int64), dst.to(torch.int64)
-
-            # Compute sparse latent activations (z)
-            _, z, _, _, _ = model(x, src, dst, weights)
-            
-            # Slice back to unpadded chunk length if padded
-            n_cells = chunk["x"].size(0)
-            z_np = z[:n_cells].detach().cpu().numpy()
-            
-            # Extract cell identifiers / barcodes if present, else fallback to indices
-            if "barcodes" in chunk:
-                cell_ids = chunk["barcodes"]
-            elif "cell_ids" in chunk:
-                cell_ids = chunk["cell_ids"]
-            else:
-                cell_ids = [f"cell_{i}" for i in range(n_cells)]
+        meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
+        for meta_meta, chunk_iter in prefetch_batches(meta_batches):
+            for batch_ref, batch in zip(meta_meta, chunk_iter):
+                # 1. Non-blocking tensor transfer from chunk loader
+                x = batch["x"].to(device=device, non_blocking=True)
+                src = batch["src"].to(device=device, non_blocking=True)
+                dst = batch["dst"].to(device=device, non_blocking=True)
+                weights = batch["weights"].to(device=device, non_blocking=True)
                 
-            sample_id = chunk.get("sample_id", chunk.get("sample", "sample_default"))
-            
-            chunk_df = pd.DataFrame(z_np, index=cell_ids, columns=latent_cols)
-            chunk_df["sample_id"] = sample_id
-            latent_records.append(chunk_df)
+                n_cells = x.size(0)
+                x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
+                
+                if device.type != 'mps':
+                    src = src.to(torch.int64)
+                    dst = dst.to(torch.int64)
+
+                # 2. Forward inference for sparse latent activations (z)
+                _, z, _, _, _ = model(x, src, dst, weights)
+                z_np = z[:n_cells].detach().cpu().numpy()
+                
+                # 3. Fetch Cell Barcodes / IDs
+                cell_ids = batch.get("barcodes") or batch_ref.get("barcodes") or \
+                           batch.get("cell_ids") or batch_ref.get("cell_ids")
+                if cell_ids is None:
+                    cell_ids = [f"cell_{i}" for i in range(n_cells)]
+                
+                # 4. Fetch dataset_id & patient_id from batch_ref / batch
+                dataset_id = str(batch_ref.get("dataset_id", batch.get("dataset_id", "default_dataset")))
+                patient_id = str(batch_ref.get("patient_id", batch.get("patient_id", "default_patient")))
+                sample_id = f"{dataset_id}_{patient_id}" if dataset_id != patient_id else patient_id
+
+                chunk_df = pd.DataFrame(z_np, index=cell_ids, columns=latent_cols)
+                chunk_df["dataset_id"] = dataset_id
+                chunk_df["patient_id"] = patient_id
+                chunk_df["sample_id"] = sample_id
+                
+                latent_records.append(chunk_df)
 
     if latent_records:
         full_latents_df = pd.concat(latent_records, axis=0)
 
-        # 1. Save Master Latents (All Samples Combined)
+        # 1. Save Master Latents (includes dataset_id, patient_id, sample_id metadata)
         master_latent_path = out_dir / "libella_latent.csv"
         full_latents_df.to_csv(master_latent_path, index_label="cell_id")
         print(f"  ↳ Master latents saved -> {master_latent_path}")
 
-        # 2. Save Sample-Specific Latents
+        # 2. Save Sample-Specific Latents (Pure cell x latent matrix for Seurat/Scanpy)
         sample_out_dir = out_dir / "sample_latents"
         sample_out_dir.mkdir(parents=True, exist_ok=True)
         
+        meta_cols = ["dataset_id", "patient_id", "sample_id"]
         for s_id, sub_df in full_latents_df.groupby("sample_id"):
             sample_file = sample_out_dir / f"{s_id}_latent.csv"
-            # Drop the sample_id column for clean matrix import into Seurat/Scanpy obsm
-            sub_df.drop(columns=["sample_id"]).to_csv(sample_file, index_label="cell_id")
+            sub_df.drop(columns=meta_cols).to_csv(sample_file, index_label="cell_id")
             
         print(f"  ↳ Sample-specific latents saved ({len(full_latents_df['sample_id'].unique())} samples) -> {sample_out_dir}/")
 
