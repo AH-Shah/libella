@@ -3,17 +3,15 @@
 import gc
 import math
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-import queue
-from threading import Thread, Event
 
 from .config import cfg, paths
 from .data import (
@@ -23,9 +21,7 @@ from .data import (
     pt_to_scipy_csr,
 )
 from .model import LibellaGNN
-from .prior import get_priors
-from .utils import get_device, PhaseTracker
-
+from .utils import PhaseTracker, get_device
 
 
 def _init_model(
@@ -88,6 +84,7 @@ def _init_model(
             raise e 
 
     return model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch
+
 
 def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
     """Slice patient graphs into SSD chunks for OOM-safe training."""
@@ -177,7 +174,6 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
     return training_cache
 
 
-
 def prefetch_batches(
     meta_batches: list[list[dict[str, Any]]]
 ) -> Iterator[tuple[list[dict[str, Any]], list[Any]]]:
@@ -191,6 +187,7 @@ def prefetch_batches(
             chunk = torch.load(b["chunk_file"], map_location="cpu", weights_only=False)
             chunks.append(chunk)
         yield meta_meta, chunks
+
 
 def _train_loop(
     model: LibellaGNN, 
@@ -209,7 +206,6 @@ def _train_loop(
     checkpoint_path = out_dirs["checkpoint"]
     
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
-    ema_mean = None
 
     tracker = PhaseTracker()
     if tracker_state is not None:
@@ -217,19 +213,16 @@ def _train_loop(
         print(f"  ↳ Restored PhaseTracker state (Phase {tracker.phase}, Pressure: {tracker.pressure:.2f}, Progress: {tracker.get_progress():.2f})")
         
     tqdm.write("\n[*] Adaptive Scheduler Initialized...")
-    
-    n_latents = model.n_latents
 
     for epoch in tqdm(range(start_epoch, cfg.epochs), desc="Training", leave=False):
         model.train()
         train_steps, val_steps = 0, 0
         train_chunk_count = 0
 
-        # GPU-resident accumulator buffers (Zero CPU-GPU sync stalls during loop)
+        # GPU-resident accumulator buffers
         train_loss_acc = torch.tensor(0.0, device=device)
         val_loss_acc = torch.tensor(0.0, device=device)
         
-        # Native SAE Telemetry Accumulators
         gpu_telemetry = {
             'l_rec': torch.tensor(0.0, device=device),
             'l_ort': torch.tensor(0.0, device=device),
@@ -250,7 +243,6 @@ def _train_loop(
             optimizer.zero_grad(set_to_none=True)
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
 
-                # Direct non-blocking transfers from pre-tensorized SSD chunks
                 x = batch["x"].to(device=device, non_blocking=True)
                 src = batch["src"].to(device=device, non_blocking=True)
                 dst = batch["dst"].to(device=device, non_blocking=True)
@@ -271,8 +263,11 @@ def _train_loop(
                 prog = tracker.get_progress()
                 model.current_progress = prog
 
-                # 1. Forward SAE execution
-                recon, z, w_dec_norm, aux_recon, r_norm = model(x, src, dst, weights)
+                # 1. Defensive Forward Execution
+                forward_res = model(x, src, dst, weights)
+                recon, z, w_dec_norm = forward_res[0], forward_res[1], forward_res[2]
+                aux_recon = forward_res[3] if len(forward_res) > 3 else None
+                r_norm = forward_res[4] if len(forward_res) > 4 else None
                 
                 train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
                 x_train = x[train_idx]
@@ -281,12 +276,17 @@ def _train_loop(
                 aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
                 r_norm_train = r_norm[train_idx] if r_norm is not None else None
 
-                # 2. Native SAE regularized loss calculation
-                true_batch_loss, base_recon_val, base_ort_val, base_sparse_val, base_aux_val = model.calc_loss(
+                # 2. Defensive Loss Calculation
+                loss_res = model.calc_loss(
                     recon_train, x_train, z_train, w_dec_norm,
                     aux_recon=aux_recon_train, r_norm=r_norm_train,
                     progress=prog
                 )
+                true_batch_loss = loss_res[0]
+                base_recon_val = loss_res[1]
+                base_ort_val = loss_res[2]
+                base_sparse_val = loss_res[3]
+                base_aux_val = loss_res[4] if len(loss_res) > 4 else torch.tensor(0.0, device=device)
 
                 if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
                     nan_detected = True
@@ -297,7 +297,7 @@ def _train_loop(
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
 
-                # 3. GPU Telemetry & Feature Utilization EMA Tracking
+                # 3. GPU Telemetry Tracking
                 with torch.no_grad():
                     batch_active = (z_train > 0).float()
                     current_freq = batch_active.mean(dim=0)
@@ -307,23 +307,24 @@ def _train_loop(
                     else:
                         ema_latent_freq.lerp_(current_freq, weight=alpha_ema)
 
-                    # Compute Shannon Entropy over Latent Usage Profile
-                    p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
-                    latent_entropy = -(p_norm * torch.log(p_norm + 1e-9)).sum()
+                    dead_count_val = (
+                        (model.steps_since_active >= model.dead_step_threshold).float().sum() 
+                        if hasattr(model, 'steps_since_active') else torch.tensor(0.0, device=device)
+                    )
 
                     gpu_telemetry['l_rec'] += base_recon_val
                     gpu_telemetry['l_ort'] += base_ort_val
                     gpu_telemetry['l_sparse'] += base_sparse_val
                     gpu_telemetry['l_aux'] += base_aux_val
                     gpu_telemetry['l0_avg'] += batch_active.sum(dim=-1).mean()
-                    gpu_telemetry['dead_cnt'] += (model.steps_since_active >= model.dead_step_threshold).float().sum()
+                    gpu_telemetry['dead_cnt'] += dead_count_val
                     gpu_telemetry['max_act'] += z_train.max()
 
                 train_chunk_count += 1
 
                 del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, true_batch_loss
 
-                # Validation Evaluation (Zero-sync check using CPU-resident numel)
+                # Validation Evaluation
                 val_core_idx_cpu = batch["val_core_idx"]
                 if val_core_idx_cpu.numel() > 0:
                     val_idx = val_core_idx_cpu.to(device=device, non_blocking=True)
@@ -333,7 +334,8 @@ def _train_loop(
                         x_val = x[val_idx]
                         
                         is_non_zero_val = (x_val > 0)
-                        w_mat = torch.where(is_non_zero_val, model.dynamic_w_ema, 1.0)
+                        dynamic_w = getattr(model, 'dynamic_w_ema', torch.tensor(1.0, device=device))
+                        w_mat = torch.where(is_non_zero_val, dynamic_w, 1.0)
                         zero_expectation_mask = torch.where(is_non_zero_val, 1.0, cfg.zero_mask_rate).to(x_val.dtype)
                         masked_w_mat_val = w_mat * zero_expectation_mask
                         
@@ -355,36 +357,36 @@ def _train_loop(
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            # 1. Standard Global Gradient Clipping
+            # 1. Global Gradient Clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
 
-            # 2. Tangent-Space Projection for Unit-Norm Decoder Parameters
+            # 2. Tangent-Space Projection
             with torch.no_grad():
-                if model.decoder_weight.grad is not None:
+                if hasattr(model, 'decoder_weight') and model.decoder_weight.grad is not None:
                     w = F.normalize(model.decoder_weight, p=2, dim=1)
                     grad = model.decoder_weight.grad
-                    # Project grad onto the tangent space of the hypersphere: G - (G · W)W
                     proj_grad = grad - (grad * w).sum(dim=1, keepdim=True) * w
                     model.decoder_weight.grad.copy_(proj_grad)
 
             optimizer.step()
 
-            # 3. Strict Oblique Retraction: Project back to the unit sphere
+            # 3. Strict Oblique Retraction
             with torch.no_grad():
-                model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
+                if hasattr(model, 'decoder_weight'):
+                    model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
 
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
             break
 
-        # Single CPU-GPU Synchronization at Epoch Boundary
+        # Epoch Synchronization
         history['train_loss'].append((train_loss_acc / (train_steps + 1e-9)).item())
         history['val_loss'].append((val_loss_acc / (val_steps + 1e-9)).item())
 
         scheduler.step()
         gc.collect()
 
-        # Telemetry Resolution (Executed once per epoch)
+        # Telemetry Resolution
         epoch_telemetry = {}
         if train_chunk_count > 0:
             for k, v in gpu_telemetry.items():
@@ -417,12 +419,9 @@ def _train_loop(
             'dead_latents': current_dead,
             'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2)
         }
-        history['autopsy_metrics'].append(epoch_metrics)
+        history.setdefault('autopsy_metrics', []).append(epoch_metrics)
 
-        # -------------------------------------------------------------
-        # 1. SAE Pareto Composite Checkpointing (Reconstruction vs L0 Sparsity)
-        # -------------------------------------------------------------
-        # Penalizes high reconstruction loss and over-dense representations
+        # Checkpointing
         composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
 
         if composite_score < best_composite_score and not nan_detected:
@@ -435,15 +434,11 @@ def _train_loop(
                 "history": history
             }, checkpoint_path)
 
-        # -------------------------------------------------------------
-        # 2. Periodic Resume State Saving (Every 5 Epochs)
-        # -------------------------------------------------------------
         if ((epoch + 1) % 5 == 0 or epoch == cfg.epochs - 1) and not nan_detected:
             autopsy_dir = out_dir / "autopsy_checkpoints"
             autopsy_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "metrics": epoch_metrics}, autopsy_dir / f"epoch_{(epoch+1):03d}.pt")
             
-            # Serialize complete tracker brain with zero tensor dependencies
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -467,18 +462,12 @@ def _train_loop(
                     f"L_Aux:{epoch_telemetry.get('l_aux', 0.0):<5.3f}"
                 )
 
-        # -------------------------------------------------------------
-        # 2. EVERY EPOCH: Tracker Math & Failsafes
-        # -------------------------------------------------------------
         epochs_remaining = cfg.epochs - epoch - 1
         if tracker.phase == 1 and epochs_remaining <= 20:
             tqdm.write(f"\n[!] Approaching max epochs ({cfg.epochs}). Forcing Phase 2.")
             tracker.force_phase2(epoch, epoch_telemetry.get('l_rec', 0.0))
 
-        # Track previous phase state so we can print the transition cleanly
         was_phase_1 = (tracker.phase == 1)
-
-        # Step the tracker with the full telemetry dictionary
         is_done = tracker.step(epoch_telemetry, epoch)
         
         if was_phase_1 and tracker.phase == 2:
@@ -488,9 +477,9 @@ def _train_loop(
             )
             
         if is_done:
-                final_pw = epoch_telemetry.get('p_w', 0.0)
-                tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
-                break
+            final_pw = epoch_telemetry.get('p_w', 0.0)
+            tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
+            break
 
     if checkpoint_path.exists() and best_composite_score < float("inf"):
         print(f"  ↳ Restoring in-memory model to best Pareto Phase 2 checkpoint ({checkpoint_path.name})...")
@@ -499,13 +488,8 @@ def _train_loop(
     else:
         print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
-    # -------------------------------------------------------------
     # Post-Training: Export Master & Patient/Sample Latents
-    # -------------------------------------------------------------
     print("\n-> Extracting & Exporting Libella Latent Representations...")
-    import pandas as pd
-    from pathlib import Path
-    
     model.eval()
     latent_records = []
     latent_cols = [f"MP_{i+1}" for i in range(model.n_latents)]
@@ -526,22 +510,18 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                # 1. Forward inference for sparse latent activations (z)
-                _, z, _, _, _ = model(x, src, dst, weights)
+                forward_eval = model(x, src, dst, weights)
+                z = forward_eval[1]
                 z_np = z[:n_cells].detach().cpu().numpy()
                 
-                # 2. Extract Patient Name (Matches your training_cache key)
                 patient_name = batch_ref.get("patient_name") or batch.get("patient_name")
                 if not patient_name:
                     chunk_file = batch_ref.get("chunk_file")
                     patient_name = Path(chunk_file).stem.split("_chunk_")[0] if chunk_file else "sample_1"
                 
                 patient_name = str(patient_name)
-
-                # 3. Extract Cell Barcodes / IDs
                 cell_ids = batch.get("barcodes") or batch.get("cell_ids")
                 if cell_ids is None:
-                    # Fallback to indexed IDs with the true patient prefix (e.g. benchmark_cell_0)
                     cell_ids = [f"{patient_name}_cell_{i}" for i in range(n_cells)]
 
                 chunk_df = pd.DataFrame(z_np, index=cell_ids, columns=latent_cols)
@@ -551,29 +531,26 @@ def _train_loop(
     if latent_records:
         full_latents_df = pd.concat(latent_records, axis=0)
 
-        # 1. Save Master Latents (All Patients / Chunks Combined)
         master_latent_path = out_dir / "libella_latent.csv"
         full_latents_df.to_csv(master_latent_path, index_label="cell_id")
         print(f"  ↳ Master latents saved -> {master_latent_path}")
 
-        # 2. Save Patient-Specific Latents (EcoTyper / BANKSY format)
         sample_out_dir = out_dir / "sample_latents"
         sample_out_dir.mkdir(parents=True, exist_ok=True)
         
         for p_name, sub_df in full_latents_df.groupby("patient_name"):
             clean_sub_df = sub_df.drop(columns=["patient_name"])
             
-            # Root: out_dir/libella_latent_benchmark.csv
             root_sample_file = out_dir / f"libella_latent_{p_name}.csv"
             clean_sub_df.to_csv(root_sample_file, index_label="cell_id")
             
-            # Subfolder: out_dir/sample_latents/benchmark_latent.csv
             nested_sample_file = sample_out_dir / f"{p_name}_latent.csv"
             clean_sub_df.to_csv(nested_sample_file, index_label="cell_id")
             
             print(f"  ↳ Patient latent saved -> {root_sample_file}")
 
     return model, history
+
 
 def train_gnn(
     graph_paths: list[Path], common_genes: list[str]
@@ -582,17 +559,14 @@ def train_gnn(
     out_dirs = paths.make_dirs(cfg.suffix)
     checkpoint_path = out_dirs["checkpoint"]
 
-    # 1. Resolve Native SAE Latent Dimension
     n_latents = getattr(cfg, "n_latents", getattr(cfg, "n_metaprograms", 512))
     print(f"[*] Initializing Native SAE Latent Space (M = {n_latents} features on unit sphere)...")
 
-    # 2. Initialize Model & Optimizers without legacy prior arrays
     model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
         common_genes, n_latents, checkpoint_path
     )
     gc.collect()
 
-    # 3. Only skip if all epochs were actually completed
     if start_epoch >= cfg.epochs:
         print(f"-> Training already reached target epoch ({start_epoch}/{cfg.epochs}). Skipping loop.")
         return model, history, n_latents
@@ -600,11 +574,9 @@ def train_gnn(
     training_cache = _prep_ssd_chunks(graph_paths)
     gc.collect()  
 
-    # 4. Resume training loop from start_epoch
     model, history = _train_loop(
         model, optimizer, scheduler, training_cache, start_epoch, best_composite_score, tracker_state, history
     )
     gc.collect()
     
     return model, history, n_latents
-    
