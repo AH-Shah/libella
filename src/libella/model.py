@@ -125,8 +125,12 @@ class LibellaGNN(nn.Module):
         # 2. Bilateral Graph Edge Decay (Direct Euclidean Metric on Normalized Expression)
         if len(src) > 0:
             with torch.no_grad():
-                diff = x_norm[src] - x_norm[dst]
-                dist = (diff * diff).sum(dim=1)
+                # VRAM SAVER: (a-b)^2 = a^2 + b^2 - 2ab
+                # Since x_norm is L2 normalized, a^2 = 1 and b^2 = 1.
+                # Therefore: (a-b)^2 = 2 - 2(a dot b)
+                dot_prod = (x_norm[src] * x_norm[dst]).sum(dim=-1)
+                dist = 2.0 - 2.0 * dot_prod
+                dist = torch.clamp(dist, min=0.0) # Failsafe for float rounding
             decay = torch.exp(-F.softplus(self.gamma) * dist)
         else:
             decay = torch.ones_like(edge_weights)
