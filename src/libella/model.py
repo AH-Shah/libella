@@ -49,6 +49,7 @@ class LibellaGNN(nn.Module):
         self.sp_norm = nn.LayerNorm(self.hidden_dim)
         
 
+        # In __init__:
         self.n_latents = n_metaprograms  # Overcomplete latent dimension (M)
         self.in_channels = in_channels    # Number of input genes (D)
 
@@ -62,24 +63,30 @@ class LibellaGNN(nn.Module):
             nn.Softplus(beta=1.0)
         )
 
-        # 2. Context Gating Stream (takes h_norm from untouched GNN)
+        # 2. Context Gating Stream
         self.gate_proj = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(self.hidden_dim, self.n_latents)
         )
 
-        # 3. Learnable Jump Thresholds for strict L0 boundary control
         self.jump_threshold = nn.Parameter(torch.full((self.n_latents,), 0.1, dtype=torch.float32))
 
-        # 4. Oblique Unit-Norm Decoder Dictionary (M x D)
         dec_weight = torch.randn(self.n_latents, in_channels)
         dec_weight = F.normalize(dec_weight, p=2, dim=1)
         self.decoder_weight = nn.Parameter(dec_weight)
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
 
-        # 5. Mask for Oblique Orthogonality
         self.register_buffer('ortho_mask', 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
+
+        # --- OPTIMIZATION 2: AuxK Dead-Latent Tracking Buffers ---
+        self.register_buffer('steps_since_active', torch.zeros(self.n_latents, dtype=torch.int64))
+        self.dead_step_threshold = getattr(cfg, 'dead_step_threshold', 100) # Steps until marked dead
+        self.aux_k = getattr(cfg, 'aux_k', min(32, max(4, self.n_latents // 16))) # Top-k dead atoms to fit
+
+        # --- OPTIMIZATION 4: Strided Orthogonality Chunk Size ---
+        # Caps Gram matrix memory to (sample_size x M) instead of (M x M)
+        self.ortho_sample_size = getattr(cfg, 'ortho_sample_size', min(256, self.n_latents))
 
         
         if init_components is not None:
@@ -227,20 +234,18 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor, 
         dst: torch.Tensor, 
         edge_weights: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         z_mag, gate_logits, cell_mass = self.encode(x_dense, src, dst, edge_weights)
 
-        # 1. Compute Gate Probabilities (Sigmoid or Entmax)
+        # 1. Compute Gate Probabilities
         gate_probs = torch.sigmoid(gate_logits)
 
         # 2. Straight-Through JumpReLU Operator
         theta = torch.clamp(self.jump_threshold, min=0.01, max=0.99)
         hard_mask = (gate_probs > theta).float()
-        
-        # STE: Forward uses exact hard step; Backward passes gradient through sigmoid
         jump_gate = hard_mask.detach() + gate_probs - gate_probs.detach()
 
-        # 3. Final Sparse Latent Code (magnitude isolated from gate)
+        # 3. Final Sparse Latent Code
         z = z_mag * jump_gate
 
         # 4. Decode with Unit-Norm Oblique Projection
@@ -250,7 +255,41 @@ class LibellaGNN(nn.Module):
         # 5. Restore Cell-Specific Mass
         x_recon = x_recon_norm * cell_mass
 
-        return x_recon, z, w_dec_norm
+        # --- OPTIMIZATION 2: AuxK Dead Latent Routing ---
+        aux_recon = None
+        r_norm = None
+
+        if self.training:
+            with torch.no_grad():
+                # Check which features fired in the current batch
+                active_in_batch = (jump_gate > 0).any(dim=0)
+                self.steps_since_active.add_(1)
+                self.steps_since_active.masked_fill_(active_in_batch, 0)
+                
+                # Identify dead features
+                dead_mask = self.steps_since_active >= self.dead_step_threshold
+
+            if dead_mask.any():
+                dead_indices = torch.nonzero(dead_mask).squeeze(-1)
+                num_dead = dead_indices.numel()
+                k_aux = min(self.aux_k, num_dead)
+
+                # Isolate unexplained residual on normalized inputs (detach to prevent pulling live latents)
+                x_norm = F.normalize(x_dense, p=2, dim=-1)
+                r_norm = (x_norm - x_recon_norm).detach()
+
+                # Dead decoder subspace
+                w_dead = w_dec_norm[dead_indices]
+
+                # Project residual onto dead dictionary atoms
+                aux_logits = torch.mm(r_norm, w_dead.t())
+                topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
+
+                # Sparse AuxK activation matrix
+                z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
+                aux_recon = torch.mm(z_aux, w_dead)
+
+        return x_recon, z, w_dec_norm, aux_recon, r_norm
 
     def calc_loss(
         self, 
@@ -258,8 +297,10 @@ class LibellaGNN(nn.Module):
         x_true: torch.Tensor, 
         z: torch.Tensor,
         w_dec_norm: torch.Tensor,
+        aux_recon: torch.Tensor | None = None,
+        r_norm: torch.Tensor | None = None,
         progress: float = 1.0
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Asymmetric Log-Cosh Loss with Dynamic Zero-Weighting
         is_non_zero = (x_true > 0)
         num_pos = torch.clamp(is_non_zero.float().sum(), min=1.0)
@@ -276,15 +317,29 @@ class LibellaGNN(nn.Module):
 
         l_recon = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta + 1e-6))) / max(1, x_true.numel())
 
-        # 2. Oblique Orthogonality Loss on Unit-Norm Dictionary (Strided/Sampled)
-        cosine_sim = torch.mm(w_dec_norm, w_dec_norm.t()) * self.ortho_mask
-        l_ortho = (F.relu(cosine_sim - 0.10) ** 2).sum() / (self.n_latents * (self.n_latents - 1))
+        # --- OPTIMIZATION 4: Strided / Subsampled Oblique Orthogonality ---
+        if self.ortho_sample_size < self.n_latents:
+            # Sample a subset of rows to construct a rectangular (B_sub x M) Gram strip
+            sample_idx = torch.randint(0, self.n_latents, (self.ortho_sample_size,), device=w_dec_norm.device)
+            w_sub = w_dec_norm[sample_idx]
+            sub_mask = self.ortho_mask[sample_idx]
+            cosine_sim = torch.mm(w_sub, w_dec_norm.t()) * sub_mask
+            l_ortho = (F.relu(cosine_sim - 0.10) ** 2).sum() / (self.ortho_sample_size * (self.n_latents - 1))
+        else:
+            cosine_sim = torch.mm(w_dec_norm, w_dec_norm.t()) * self.ortho_mask
+            l_ortho = (F.relu(cosine_sim - 0.10) ** 2).sum() / (self.n_latents * (self.n_latents - 1))
 
-        # 3. Sparsity Penalty (encourages gate thresholds to settle sharply)
+        # 2. Sparsity Penalty
         l_sparse = z.mean()
 
-        # Dynamic Loss Balancing
-        total_loss = l_recon + (10.0 * l_ortho) + (cfg.l1_coeff * l_sparse)
+        # --- OPTIMIZATION 2: AuxK Residual Loss ---
+        if aux_recon is not None and r_norm is not None:
+            l_aux = F.mse_loss(aux_recon, r_norm)
+        else:
+            l_aux = torch.tensor(0.0, device=x_true.device)
 
-        return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach()
+        # Combined Loss
+        total_loss = l_recon + (10.0 * l_ortho) + (cfg.l1_coeff * l_sparse) + (0.5 * l_aux)
+
+        return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
         

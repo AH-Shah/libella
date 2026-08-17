@@ -42,12 +42,19 @@ def _init_model(
         init_components=init_components
     ).to(device)
     
-    base_params = [p for n, p in model.named_parameters() if "topic_gene_logits" not in n]
-    anchor_params = [p for n, p in model.named_parameters() if "topic_gene_logits" in n]
+    # 1. Isolate decoder, jump threshold, and backbone parameters
+    decoder_params = [p for n, p in model.named_parameters() if "decoder_" in n]
+    threshold_params = [p for n, p in model.named_parameters() if "jump_threshold" in n]
+    base_params = [
+        p for n, p in model.named_parameters() 
+        if "decoder_" not in n and "jump_threshold" not in n
+    ]
 
+    # 2. Decoder parameters receive zero weight decay (preserved via Oblique Retraction)
     optimizer = torch.optim.AdamW([
         {"params": base_params, "lr": cfg.lr_base, "weight_decay": cfg.wd_base},
-        {"params": anchor_params, "lr": cfg.lr_anchor, "weight_decay": cfg.wd_anchor} 
+        {"params": decoder_params, "lr": getattr(cfg, "lr_decoder", cfg.lr_base), "weight_decay": 0.0},
+        {"params": threshold_params, "lr": getattr(cfg, "lr_threshold", cfg.lr_base * 0.5), "weight_decay": 0.0}
     ])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.epochs, eta_min=1e-6
@@ -213,8 +220,7 @@ def _train_loop(
         
     tqdm.write("\n[*] Adaptive Scheduler Initialized...")
     
-    optimal_k = model.n_metaprograms
-    max_entropy_scalar = float(np.log(optimal_k))
+    n_latents = model.n_latents
 
     for epoch in tqdm(range(start_epoch, cfg.epochs), desc="Training", leave=False):
         model.train()
@@ -224,22 +230,19 @@ def _train_loop(
         # GPU-resident accumulator buffers (Zero CPU-GPU sync stalls during loop)
         train_loss_acc = torch.tensor(0.0, device=device)
         val_loss_acc = torch.tensor(0.0, device=device)
-        epoch_p_mean_sum = torch.zeros(optimal_k, device=device)
         
+        # Native SAE Telemetry Accumulators
         gpu_telemetry = {
-            'ent': torch.tensor(0.0, device=device),
-            'col_r': torch.tensor(0.0, device=device),
-            'kl_w': torch.tensor(0.0, device=device),
-            'g_w': torch.tensor(0.0, device=device),
-            'p_w': torch.tensor(0.0, device=device),
             'l_rec': torch.tensor(0.0, device=device),
-            'l_anc': torch.tensor(0.0, device=device),
-            'l_ort': torch.tensor(0.0, device=device)
+            'l_ort': torch.tensor(0.0, device=device),
+            'l_sparse': torch.tensor(0.0, device=device),
+            'l_aux': torch.tensor(0.0, device=device),
+            'l0_avg': torch.tensor(0.0, device=device),
+            'dead_cnt': torch.tensor(0.0, device=device),
+            'max_act': torch.tensor(0.0, device=device)
         }
 
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
-        total_steps_per_epoch = len(meta_batches)
-        alpha_ema = min(0.001, 1.0 / (total_steps_per_epoch * 5.0 + 1e-9))
         nan_detected = False
 
         for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
@@ -266,45 +269,21 @@ def _train_loop(
 
                 prog = tracker.get_progress()
                 model.current_progress = prog
-                model.current_scale = cfg.scale_start + ((cfg.scale_end - cfg.scale_start) * (prog ** 0.8))
-                model.current_temp = cfg.temp_end + ((cfg.temp_start - cfg.temp_end) * ((1.0 - prog) ** 1.5))
-                model.current_alpha = cfg.alpha_start + ((cfg.alpha_end - cfg.alpha_start) * prog)
 
-                fracs, pure_anchors = model(x, src, dst, weights)
-                
+                # 1. Forward SAE execution
+                recon, z, w_dec_norm, aux_recon, r_norm = model(x, src, dst, weights)
                 
                 train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
-
-                f_train = fracs[train_idx]
                 x_train = x[train_idx]
+                recon_train = recon[train_idx]
+                z_train = z[train_idx]
+                aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
+                r_norm_train = r_norm[train_idx] if r_norm is not None else None
 
-                p_train = f_train / (f_train.sum(dim=1, keepdim=True) + 1e-9)
-                current_p_mean = p_train.mean(dim=0)
-                
-                # Pure GPU EMA Target Calculation (0 CPU-GPU syncs)
-                uniform_prior = torch.ones_like(current_p_mean) / pure_anchors.shape[0]
-                if ema_mean is None:
-                    ema_mean = current_p_mean.detach()
-                else:
-                    ema_mean = alpha_ema * current_p_mean.detach() + (1 - alpha_ema) * ema_mean
-                
-                ideal_c = uniform_prior * 2.0 - ema_mean
-                ideal_c = torch.clamp(ideal_c, min=1e-5) 
-                target_f_dist = ideal_c / ideal_c.sum()
-                    
-                ema_entropy = -torch.sum(ema_mean * torch.log(ema_mean + 1e-9))
-                collapse_ratio = torch.clamp(1.0 - (ema_entropy / max_entropy_scalar), min=0.0, max=1.0)
-
-                peak_p = ema_mean.max()
-                hub_multiplier = F.relu((peak_p / cfg.hub_threshold) - 1.0) * 50.0 
-
-                dynamic_kl_w = cfg.kl_base + (collapse_ratio * cfg.kl_collapse_weight) + hub_multiplier 
-
-                recon = f_train @ pure_anchors
-                
-                true_batch_loss, base_recon_val, base_anc_val, base_ort_val = model.calc_loss(
-                    recon, x_train, pure_anchors, None, epoch, cfg.epochs, 
-                    f_train=f_train, target_f_dist=target_f_dist, kl_weight=dynamic_kl_w,
+                # 2. Native SAE regularized loss calculation
+                true_batch_loss, base_recon_val, base_ort_val, base_sparse_val, base_aux_val = model.calc_loss(
+                    recon_train, x_train, z_train, w_dec_norm,
+                    aux_recon=aux_recon_train, r_norm=r_norm_train,
                     progress=prog
                 )
 
@@ -317,22 +296,21 @@ def _train_loop(
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
 
-                # 3. Complete GPU Telemetry Accumulation
-                gpu_telemetry['g_w'] += pure_anchors.max(dim=1).values.mean().detach() * 100.0
-                gpu_telemetry['p_w'] += p_train.max(dim=1).values.mean().detach() * 100.0
-                gpu_telemetry['ent'] += ema_entropy.detach()
-                gpu_telemetry['col_r'] += collapse_ratio.detach()
-                gpu_telemetry['kl_w'] += dynamic_kl_w.detach()
-                
-                # Accumulate all sub-losses cleanly
-                gpu_telemetry['l_rec'] += base_recon_val.detach()
-                gpu_telemetry['l_anc'] += base_anc_val.detach()
-                gpu_telemetry['l_ort'] += base_ort_val.detach()
-                
-                epoch_p_mean_sum += current_p_mean.detach()
+                # 3. GPU Telemetry Accumulation (Zero-sync execution)
+                with torch.no_grad():
+                    gpu_telemetry['l_rec'] += base_recon_val
+                    gpu_telemetry['l_ort'] += base_ort_val
+                    gpu_telemetry['l_sparse'] += base_sparse_val
+                    gpu_telemetry['l_aux'] += base_aux_val
+                    
+                    # L0 calculation: count active latents per cell
+                    gpu_telemetry['l0_avg'] += (z_train > 0).float().sum(dim=-1).mean()
+                    gpu_telemetry['dead_cnt'] += (model.steps_since_active >= model.dead_step_threshold).float().sum()
+                    gpu_telemetry['max_act'] += z_train.max()
+
                 train_chunk_count += 1
 
-                del train_idx, f_train, x_train, p_train, current_p_mean, uniform_prior, target_f_dist, recon, true_batch_loss, base_recon_val
+                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, true_batch_loss
 
                 # Validation Evaluation (Zero-sync check using CPU-resident numel)
                 val_core_idx_cpu = batch["val_core_idx"]
@@ -340,9 +318,8 @@ def _train_loop(
                     val_idx = val_core_idx_cpu.to(device=device, non_blocking=True)
                     
                     with torch.no_grad():
-                        f_val = fracs[val_idx]
+                        val_recon = recon[val_idx]
                         x_val = x[val_idx]
-                        val_recon = f_val @ pure_anchors
                         
                         is_non_zero_val = (x_val > 0)
                         w_mat = torch.where(is_non_zero_val, model.dynamic_w_ema, 1.0)
@@ -359,32 +336,31 @@ def _train_loop(
                         val_loss_acc += val_log_cosh.detach()
                         val_steps += 1
                         
-                    del val_idx, f_val, x_val, val_recon, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
+                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
 
-                del batch, src, dst, weights, x, fracs, pure_anchors
-                model.current_f_prob = None  
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm 
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            # 1. Clip GNN backbone and projection heads
-            base_params = [
-                p for n, p in model.named_parameters() 
-                if "topic_gene_logits" not in n and p.grad is not None
-            ]
-            if base_params:
-                torch.nn.utils.clip_grad_norm_(base_params, max_norm=cfg.grad_clip)
+            # 1. Standard Global Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
 
-            # 2. Clip anchor dictionary independently so it retains its full update budget
-            anchor_params = [
-                p for n, p in model.named_parameters() 
-                if "topic_gene_logits" in n and p.grad is not None
-            ]
-            if anchor_params:
-                torch.nn.utils.clip_grad_norm_(anchor_params, max_norm=cfg.grad_clip)
+            # 2. Tangent-Space Projection for Unit-Norm Decoder Parameters
+            with torch.no_grad():
+                if model.decoder_weight.grad is not None:
+                    w = F.normalize(model.decoder_weight, p=2, dim=1)
+                    grad = model.decoder_weight.grad
+                    # Project grad onto the tangent space of the hypersphere: G - (G · W)W
+                    proj_grad = grad - (grad * w).sum(dim=1, keepdim=True) * w
+                    model.decoder_weight.grad.copy_(proj_grad)
 
             optimizer.step()
+
+            # 3. Strict Oblique Retraction: Project back to the unit sphere
+            with torch.no_grad():
+                model.decoder_weight.copy_(F.normalize(model.decoder_weight, p=2, dim=1))
 
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
@@ -402,44 +378,36 @@ def _train_loop(
         if train_chunk_count > 0:
             for k, v in gpu_telemetry.items():
                 epoch_telemetry[k] = (v / train_chunk_count).item()
-            
-            epoch_p_mean = (epoch_p_mean_sum / train_chunk_count).cpu()
-            top_topic_val, top_topic_idx = epoch_p_mean.max(dim=0)
-            epoch_telemetry['top_t_pct'] = top_topic_val.item() * 100.0
-            epoch_telemetry['top_t_id'] = top_topic_idx.item()
 
         current_lr = round(optimizer.param_groups[0]['lr'], 6)
-        
+        current_rec = epoch_telemetry.get("l_rec", float("inf"))
+        current_l0 = epoch_telemetry.get("l0_avg", 0.0)
+        current_dead = int(epoch_telemetry.get("dead_cnt", 0))
+
         epoch_metrics = {
             'epoch': epoch,
             'train_loss': round(history['train_loss'][-1], 4),
             'val_loss': round(history['val_loss'][-1], 4),
             'lr': current_lr,
             'loss_components': {
-                'rec': round(epoch_telemetry.get('l_rec', 0.0), 4),
-                'anc': round(epoch_telemetry.get('l_anc', 0.0), 4),
-                'ort': round(epoch_telemetry.get('l_ort', 0.0), 4)
+                'rec': round(current_rec, 4),
+                'ort': round(epoch_telemetry.get('l_ort', 0.0), 4),
+                'sparse': round(epoch_telemetry.get('l_sparse', 0.0), 4),
+                'aux': round(epoch_telemetry.get('l_aux', 0.0), 4)
             },
-            'entropy': round(epoch_telemetry.get('ent', 0.0), 4),
-            'collapse_ratio': round(epoch_telemetry.get('col_r', 0.0), 4),
-            'kl_weight': round(epoch_telemetry.get('kl_w', 0.0), 4),
-            'g_w': round(epoch_telemetry.get('g_w', 0.0), 2),
-            'p_w': round(epoch_telemetry.get('p_w', 0.0), 2),
-            'top_topic_id': epoch_telemetry.get('top_t_id', 0),
-            'top_topic_pct': round(epoch_telemetry.get('top_t_pct', 0.0), 2)
+            'l0_avg': round(current_l0, 2),
+            'dead_latents': current_dead,
+            'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2)
         }
         history['autopsy_metrics'].append(epoch_metrics)
 
         # -------------------------------------------------------------
-        # 1. Pareto Composite Quality Checkpointing (Strict Score Trigger)
+        # 1. SAE Pareto Composite Checkpointing (Reconstruction vs L0 Sparsity)
         # -------------------------------------------------------------
-        current_rec = epoch_telemetry.get("l_rec", float("inf"))
-        current_pw = max(1e-3, epoch_telemetry.get("p_w", 0.0))
-        pw_fraction = current_pw / 100.0
-        composite_score = current_rec / math.sqrt(pw_fraction)
+        # Penalizes high reconstruction loss and over-dense representations
+        composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
 
-        is_in_phase2 = (tracker.phase == 2 or current_pw >= 40.0)
-        if is_in_phase2 and composite_score < best_composite_score and not nan_detected:
+        if composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
             torch.save({
                 "epoch": epoch,
@@ -469,15 +437,16 @@ def _train_loop(
             }, out_dir / "resume_latest.pt")
 
             with torch.no_grad():
+                l0_val = epoch_telemetry.get('l0_avg', 0.0)
+                l0_pct = (l0_val / model.n_latents) * 100.0
                 tqdm.write(
-                    f" [Ep {(epoch+1):03d}] Pure_Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
-                    f"V_Loss:{history['val_loss'][-1]:<5.3f} (Tot_Loss:{history['train_loss'][-1]:<5.3f}) | "
-                    f"G_W:{epoch_telemetry.get('g_w', 0.0):<4.1f}% P_W:{epoch_telemetry.get('p_w', 0.0):<4.1f}% "
-                    f"TopT:{epoch_telemetry.get('top_t_id', 0)}({epoch_telemetry.get('top_t_pct', 0.0):<4.1f}%) "
-                    f"Ent:{epoch_telemetry.get('ent', 0.0):<4.2f} | "
-                    f"KL_W:{epoch_telemetry.get('kl_w', 0.0):<4.2f} "
-                    f"L_Anc:{epoch_telemetry.get('l_anc', 0.0):<5.3f} "
-                    f"L_Ort:{epoch_telemetry.get('l_ort', 0.0):<5.3f}"
+                    f" [Ep {(epoch+1):03d}] Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
+                    f"V_Loss:{history['val_loss'][-1]:<5.3f} | "
+                    f"L0:{l0_val:<4.1f}/{model.n_latents} ({l0_pct:<4.1f}%) "
+                    f"Dead:{int(epoch_telemetry.get('dead_cnt', 0)):<3d} | "
+                    f"L_Ort:{epoch_telemetry.get('l_ort', 0.0):<5.3f} "
+                    f"L_Sp:{epoch_telemetry.get('l_sparse', 0.0):<5.3f} "
+                    f"L_Aux:{epoch_telemetry.get('l_aux', 0.0):<5.3f}"
                 )
 
         # -------------------------------------------------------------
