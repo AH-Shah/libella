@@ -420,6 +420,7 @@ def _train_loop(
             else:
                 epoch_telemetry['ent'] = 0.0
 
+        # 1. Telemetry metric resolution
         current_lr = round(optimizer.param_groups[0]['lr'], 6)
         current_rec = epoch_telemetry.get("l_rec", float("inf"))
         current_l0 = epoch_telemetry.get("l0_avg", 0.0)
@@ -444,6 +445,8 @@ def _train_loop(
         }
         history.setdefault('autopsy_metrics', []).append(epoch_metrics)
 
+        composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
+
         epoch_log = {
             "epoch/train_loss": history['train_loss'][-1],
             "epoch/val_loss": history['val_loss'][-1],
@@ -454,9 +457,6 @@ def _train_loop(
             "sae/dead_latents": current_dead,
         }
         logger.log_metrics(epoch, epoch_log)
-
-        # Checkpointing
-        composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
 
         if composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
