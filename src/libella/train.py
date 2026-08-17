@@ -21,7 +21,7 @@ from .data import (
     pt_to_scipy_csr,
 )
 from .model import LibellaGNN
-from .utils import PhaseTracker, get_device, UnifiedLogger
+from .utils import PhaseTracker, UnifiedLogger, export_latents, get_device
 
 
 def _init_model(
@@ -518,6 +518,7 @@ def _train_loop(
             tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
             break
     
+    # End of epoch loop
     logger.close()
 
     if checkpoint_path.exists() and best_composite_score < float("inf"):
@@ -527,77 +528,8 @@ def _train_loop(
     else:
         print(f"  ↳ Retaining final epoch in-memory state (P_W = {epoch_telemetry.get('p_w', 0.0):.1f}%)...")
 
-
-    print("\n-> Extracting & Exporting Libella Latent Representations...")
-    model.eval()
-    
-    csr_chunks = []
-    cell_metadata = []
-    patient_chunks = {}
-
-    with torch.no_grad():
-        meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
-        for meta_meta, chunk_iter in prefetch_batches(meta_batches):
-            for batch_ref, batch in zip(meta_meta, chunk_iter):
-                x = batch["x"].to(device=device, non_blocking=True)
-                src = batch["src"].to(device=device, non_blocking=True)
-                dst = batch["dst"].to(device=device, non_blocking=True)
-                weights = batch["weights"].to(device=device, non_blocking=True)
-                
-                n_cells = x.size(0)
-                x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
-                
-                if device.type != 'mps':
-                    src = src.to(torch.int64)
-                    dst = dst.to(torch.int64)
-
-                forward_eval = model(x, src, dst, weights)
-                z = forward_eval[1]
-                
-                # Convert slice directly to compressed CSR (bypasses dense Pandas memory)
-                z_np = z[:n_cells].detach().cpu().numpy()
-                chunk_csr = sp.csr_matrix(z_np)
-                csr_chunks.append(chunk_csr)
-                
-                patient_name = batch_ref.get("patient_name") or batch.get("patient_name")
-                if not patient_name:
-                    chunk_file = batch_ref.get("chunk_file")
-                    patient_name = Path(chunk_file).stem.split("_chunk_")[0] if chunk_file else "sample_1"
-                
-                patient_name = str(patient_name)
-                cell_ids = batch.get("barcodes") or batch.get("cell_ids")
-                if cell_ids is None:
-                    cell_ids = [f"{patient_name}_cell_{i}" for i in range(n_cells)]
-
-                patient_chunks.setdefault(patient_name, []).append((chunk_csr, cell_ids))
-                for cid in cell_ids:
-                    cell_metadata.append({"cell_id": cid, "patient_name": patient_name})
-
-    if csr_chunks:
-        # 1. Save Master Sparse Matrix & Metadata
-        master_csr = sp.vstack(csr_chunks)
-        master_latent_path = out_dir / "libella_latent.npz"
-        sp.save_npz(master_latent_path, master_csr)
-        
-        meta_path = out_dir / "libella_cell_metadata.csv.gz"
-        pd.DataFrame(cell_metadata).to_csv(meta_path, index=False, compression="gzip")
-        print(f"  ↳ Master latents saved -> {master_latent_path} ({master_csr.shape[0]} cells, {master_csr.shape[1]} latents)")
-
-        # 2. Save Patient-Specific Sparse Matrices
-        sample_out_dir = out_dir / "sample_latents"
-        sample_out_dir.mkdir(parents=True, exist_ok=True)
-        
-        for p_name, p_data in patient_chunks.items():
-            p_csrs, p_cids_list = zip(*p_data)
-            p_combined_csr = sp.vstack(p_csrs)
-            p_cids = [cid for sub in p_cids_list for cid in sub]
-            
-            p_latent_file = sample_out_dir / f"{p_name}_latent.npz"
-            p_meta_file = sample_out_dir / f"{p_name}_cells.csv.gz"
-            
-            sp.save_npz(p_latent_file, p_combined_csr)
-            pd.DataFrame({"cell_id": p_cids}).to_csv(p_meta_file, index=False, compression="gzip")
-            print(f"  ↳ Patient latent saved -> {p_latent_file}")
+    # Clean 1-line export call
+    export_latents(model, training_cache, out_dir, device, meta_batch_size=accumulation_steps)
 
     return model, history
 
@@ -608,6 +540,8 @@ def train_gnn(
     """Master orchestrator for GNN training phase."""
     out_dirs = paths.make_dirs(cfg.suffix)
     checkpoint_path = out_dirs["checkpoint"]
+    out_dir = out_dirs["out"]
+    device = get_device()
 
     n_latents = getattr(cfg, "n_latents", getattr(cfg, "n_metaprograms", 512))
     print(f"[*] Initializing Native SAE Latent Space (M = {n_latents} features on unit sphere)...")
@@ -617,12 +551,16 @@ def train_gnn(
     )
     gc.collect()
 
+    training_cache = _prep_ssd_chunks(graph_paths)
+    gc.collect()
+
+    # If already trained, check if latents are missing and export them immediately without re-training
     if start_epoch >= cfg.epochs:
         print(f"-> Training already reached target epoch ({start_epoch}/{cfg.epochs}). Skipping loop.")
+        master_latent_path = out_dir / "libella_latent.npz"
+        if not master_latent_path.exists():
+            export_latents(model, training_cache, out_dir, device, meta_batch_size=getattr(cfg, "meta_batch_size", 4))
         return model, history, n_latents
-
-    training_cache = _prep_ssd_chunks(graph_paths)
-    gc.collect()  
 
     model, history = _train_loop(
         model, optimizer, scheduler, training_cache, start_epoch, best_composite_score, tracker_state, history

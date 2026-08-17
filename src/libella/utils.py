@@ -8,10 +8,13 @@ import numpy as np
 import pandas as pd
 import torch
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import psutil
 import torch
+
+from collections.abc import Iterator
+import scipy.sparse as sp
 
 from .config import NOISE_REGEX
 
@@ -284,3 +287,90 @@ class UnifiedLogger:
         if self.writer:
             self.writer.flush()
             self.writer.close()
+
+
+def export_latents(
+    model: torch.nn.Module,
+    training_cache: list[dict[str, Any]],
+    out_dir: Path,
+    device: torch.device,
+    meta_batch_size: int = 4
+) -> None:
+    """Extract and export sparse CSR representations for master and patient cohorts."""
+    # Local import to prevent circular import issues between data and utils
+    from .data import make_meta_batches, pad_mps_shapes
+
+    def _prefetch(batches):
+        for meta_meta in batches:
+            chunks = [torch.load(b["chunk_file"], map_location="cpu", weights_only=False) for b in meta_meta]
+            yield meta_meta, chunks
+
+    print("\n-> Extracting & Exporting Libella Latent Representations (CSR)...")
+    model.eval()
+    
+    csr_chunks = []
+    cell_metadata = []
+    patient_chunks = {}
+
+    with torch.no_grad():
+        meta_batches = make_meta_batches(training_cache, meta_batch_size=meta_batch_size)
+        for meta_meta, chunk_iter in _prefetch(meta_batches):
+            for batch_ref, batch in zip(meta_meta, chunk_iter):
+                x = batch["x"].to(device=device, non_blocking=True)
+                src = batch["src"].to(device=device, non_blocking=True)
+                dst = batch["dst"].to(device=device, non_blocking=True)
+                weights = batch["weights"].to(device=device, non_blocking=True)
+                
+                n_cells = x.size(0)
+                x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
+                
+                if device.type != 'mps':
+                    src = src.to(torch.int64)
+                    dst = dst.to(torch.int64)
+
+                forward_eval = model(x, src, dst, weights)
+                z = forward_eval[1]
+                
+                z_np = z[:n_cells].detach().cpu().numpy()
+                chunk_csr = sp.csr_matrix(z_np)
+                csr_chunks.append(chunk_csr)
+                
+                patient_name = batch_ref.get("patient_name") or batch.get("patient_name")
+                if not patient_name:
+                    chunk_file = batch_ref.get("chunk_file")
+                    patient_name = Path(chunk_file).stem.split("_chunk_")[0] if chunk_file else "sample_1"
+                
+                patient_name = str(patient_name)
+                cell_ids = batch.get("barcodes") or batch.get("cell_ids")
+                if cell_ids is None:
+                    cell_ids = [f"{patient_name}_cell_{i}" for i in range(n_cells)]
+
+                patient_chunks.setdefault(patient_name, []).append((chunk_csr, cell_ids))
+                for cid in cell_ids:
+                    cell_metadata.append({"cell_id": cid, "patient_name": patient_name})
+
+    if csr_chunks:
+        # 1. Save Master Sparse Matrix & Metadata
+        master_csr = sp.vstack(csr_chunks)
+        master_latent_path = out_dir / "libella_latent.npz"
+        sp.save_npz(master_latent_path, master_csr)
+        
+        meta_path = out_dir / "libella_cell_metadata.csv.gz"
+        pd.DataFrame(cell_metadata).to_csv(meta_path, index=False, compression="gzip")
+        print(f"  ↳ Master latents saved -> {master_latent_path} ({master_csr.shape[0]} cells, {master_csr.shape[1]} latents)")
+
+        # 2. Save Patient-Specific Sparse Matrices
+        sample_out_dir = out_dir / "sample_latents"
+        sample_out_dir.mkdir(parents=True, exist_ok=True)
+        
+        for p_name, p_data in patient_chunks.items():
+            p_csrs, p_cids_list = zip(*p_data)
+            p_combined_csr = sp.vstack(p_csrs)
+            p_cids = [cid for sub in p_cids_list for cid in sub]
+            
+            p_latent_file = sample_out_dir / f"{p_name}_latent.npz"
+            p_meta_file = sample_out_dir / f"{p_name}_cells.csv.gz"
+            
+            sp.save_npz(p_latent_file, p_combined_csr)
+            pd.DataFrame({"cell_id": p_cids}).to_csv(p_meta_file, index=False, compression="gzip")
+            print(f"  ↳ Patient latent saved -> {p_latent_file}")
