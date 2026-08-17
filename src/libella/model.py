@@ -238,10 +238,11 @@ class LibellaGNN(nn.Module):
             if dead_mask.any() and residual_energy > cfg.aux_min_residual_energy:
                 dead_indices = torch.nonzero(dead_mask).squeeze(-1)
                 num_dead = dead_indices.numel()
-                k_aux = min(max(cfg.aux_min_k, self.aux_k), num_dead)
+                k_aux = min(max(cfg.aux_min_k, cfg.aux_k), num_dead)
 
                 w_dead = w_dec_norm[dead_indices]
-                aux_logits = torch.mm(r_norm, w_dead.t())
+                # High-gain projection of unexplained residual variance
+                aux_logits = torch.mm(r_norm, w_dead.t()) / 0.20
                 topk_aux = torch.topk(F.relu(aux_logits), k=k_aux, dim=-1)
                 z_aux = torch.zeros_like(aux_logits).scatter(-1, topk_aux.indices, topk_aux.values)
                 aux_recon = torch.mm(z_aux, w_dead)

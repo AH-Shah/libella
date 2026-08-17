@@ -271,17 +271,20 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                prog = tracker.get_progress()
+                # Map tracker progress with a convex curve to preserve early exploration
+                tracker_prog = tracker.get_progress()
+                epoch_prog = epoch / max(1, cfg.epochs - 1)
+                prog = max(tracker_prog, epoch_prog)
                 model.current_progress = prog
                 
-                # Bounded Entmax Curvature Schedule
-                alpha_val = getattr(tracker, "alpha", cfg.alpha_start + (cfg.alpha_end - cfg.alpha_start) * prog)
+                # Bounded Entmax Curvature Schedule (1.35 -> 1.50)
+                alpha_val = cfg.alpha_start + (cfg.alpha_end - cfg.alpha_start) * (prog ** 0.8)
                 model.current_alpha = float(np.clip(alpha_val, cfg.alpha_start, cfg.alpha_end))
                 
-                # Dynamic Sparsity Scale (Forces logit separation over time)
-                model.current_scale = cfg.scale_start + (cfg.scale_end - cfg.scale_start) * prog
+                # Convex Sparsity Scale: stays exploratory early, ramps aggressively to scale_end
+                model.current_scale = cfg.scale_start + (cfg.scale_end - cfg.scale_start) * (prog ** 1.3)
                 
-                model.current_temp = getattr(tracker, "temp", cfg.temp_start + (cfg.temp_end - cfg.temp_start) * prog)
+                model.current_temp = cfg.temp_start + (cfg.temp_end - cfg.temp_start) * prog
 
                 # 1. Defensive Forward Execution
                 forward_res = model(x, src, dst, weights)
