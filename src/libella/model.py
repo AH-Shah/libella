@@ -206,7 +206,7 @@ class LibellaGNN(nn.Module):
         # 2. Straight-Through JumpReLU Operator
         theta = torch.clamp(self.jump_threshold, min=0.01, max=0.99)
         hard_mask = (gate_probs > theta).float()
-        jump_gate = hard_mask.detach() + gate_probs - gate_probs.detach()
+        jump_gate = hard_mask.detach() + (gate_probs - theta) - (gate_probs - theta).detach()
 
         # 3. Final Sparse Latent Code
         z = z_mag * jump_gate
