@@ -120,12 +120,14 @@ class LibellaGNN(nn.Module):
         h_0 = self.lin_appnp(self.ctx_enc(x_norm))
         N = h_0.size(0)
 
-        # 2. Bilateral Graph Edge Decay
+        # 2. Sharpened Bilateral Edge Decay (Cosine Dissimilarity with Steep Sigmoid Drop)
         if len(src) > 0:
             with torch.no_grad():
-                dot_prod = (x_norm[src] * x_norm[dst]).sum(dim=-1)
-                dist = torch.clamp(2.0 - 2.0 * dot_prod, min=0.0)
-            decay = torch.exp(-F.softplus(self.gamma) * dist)
+                # Cosine distance between neighboring cell expression profiles
+                cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1)
+                dist = torch.clamp(1.0 - cos_sim, min=0.0)
+            # Sharp cutoff: sever edges between heterogeneous cell types at borders
+            decay = torch.exp(-15.0 * dist)
         else:
             decay = torch.ones_like(edge_weights)
             
@@ -176,9 +178,13 @@ class LibellaGNN(nn.Module):
         h_final = h_id + self.context_gate(ctx_pulled)
         h_norm = F.normalize(self.sp_norm(h_final), p=2, dim=-1)
 
-        # 5. Decoupled Dual-Stream Projections
+        # 5. Decoupled Dual-Stream Projections with Autonomous Skip-Gating
         z_mag = self.mag_enc(x_norm)
-        gate_logits = self.gate_proj(h_norm)
+        
+        # Cell-intrinsic expression sets baseline support; GNN adds contextual prior shift
+        id_gate_logits = self.gate_id_proj(x_norm)
+        spatial_shift = F.normalize(self.gate_spatial_proj(h_norm), p=2, dim=-1)
+        gate_logits = id_gate_logits + (0.5 * spatial_shift)
 
         return z_mag, gate_logits, cell_mass
 

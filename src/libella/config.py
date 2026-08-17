@@ -84,8 +84,8 @@ class RunConfig:
     zero_mask_rate: float = 0.05
     
     # Native SAE Sparsity & Capacity Engine (Calibrated)
-    l1_coeff: float = 1e-3                 # Base L1 proxy coefficient for Jump gate
-    aux_weight: float = 0.05               # Gentle AuxK revival (prevents noise overfitting)
+    l1_coeff: float = 8e-3                 # Stronger L1 pressure to enforce L0 ≈ 3-6 (kills chimerism)
+    aux_weight: float = 0.01               # Minimal AuxK pull to protect boundary contrast# Gentle AuxK revival (prevents noise overfitting)
     aux_k: int = 4                         # Top-k dead atoms per batch
     dead_step_threshold: int = 200         # Latents must be idle for 200 steps before revival
     ortho_sample_size: int = 128           # Low memory Gram matrix slice
