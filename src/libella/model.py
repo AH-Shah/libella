@@ -140,8 +140,8 @@ class LibellaGNN(nn.Module):
         # 7. Unconstrained Magnitude & Spatial Gating Shifts
         z_mag = self.mag_head(h_fused)
 
+        # 4. Gating (True Zero-Floor)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        # Direct GEMM without explicit transpose view allocations
         bio_sim = F.linear(x_norm, w_dec_norm)
         spatial_shift = self.spatial_gate_head(h_sp)
 
