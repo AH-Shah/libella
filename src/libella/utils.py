@@ -24,7 +24,7 @@ import gc
 from collections.abc import Iterator
 import scipy.sparse as sp
 
-from .config import NOISE_REGEX
+from .config import NOISE_REGEX, cfg
 
 def get_device() -> torch.device:
     """Get optimal compute device."""
@@ -82,54 +82,93 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
 """Adaptive Elastic Phase Controller with Dual-Horizon Oscillation Filtering."""
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any
+import numpy as np
+from .config import cfg
 
 
 class PhaseTracker:
+    """Multi-Objective Adaptive Phase and Elastic Sparsity Governor.
+    
+    Coordinates:
+      - Phase 1: Manifold discovery with guaranteed biological runway.
+      - Phase 2: Dynamic elastic Pareto squeeze governor.
+      - Centralized schedule generation (Alpha, Temperature, Scale, L1, Warmup).
+    """
+
     def __init__(
         self,
-        cycle_window: int = 8,        # Cut window from 12 -> 6 (responds 2x faster)
-        target_pw: float = 70.0,
-        rel_tolerance: float = 0.1,  # 6% reconstruction budget ceiling
-        max_p1_epochs: int = 20,      
+        total_epochs: int = 50,
+        rel_tolerance: float = 0.08,
     ) -> None:
         self.phase: int = 1
-        self.cycle_window: int = cycle_window
-        self.target_pw: float = target_pw
+        self.total_epochs: int = max(1, total_epochs)
         self.rel_tolerance: float = rel_tolerance
-        self.max_p1_epochs: int = max_p1_epochs
-        
+
+        # --- Phase 1 Horizons (Prevents premature exit at Epoch 3) ---
+        self.min_p1_epochs: int = max(
+            getattr(cfg, "min_p1_epochs", 8),
+            int(self.total_epochs * getattr(cfg, "p1_min_ratio", 0.16))
+        )
+        self.max_p1_epochs: int = max(
+            self.min_p1_epochs + 2,
+            int(self.total_epochs * getattr(cfg, "p1_max_ratio", 0.30))
+        )
+        self.p1_plateau_patience: int = 3
+        self.p1_plateau_count: int = 0
+
+        # --- Window & Horizon Sizing ---
+        self.cycle_window: int = max(3, int(self.total_epochs * getattr(cfg, "tracker_window_ratio", 0.08)))
+        self.patience_epochs: int = max(5, int(self.total_epochs * getattr(cfg, "patience_ratio", 0.12)))
+
+        # --- Histories & Baselines ---
         self.rec_history: list[float] = []
-        self.pw_history: list[float] = []
-        
+        self.val_history: list[float] = []
+        self.l0_history: list[float] = []
+
         self.best_rec_loss: float = float("inf")
+        self.best_val_loss: float = float("inf")
+        self.best_composite_score: float = float("inf")
         self.p1_baseline_rec: float | None = None
-        
-        # Faster ramp dynamics
+        self.p2_start_epoch: int = 0
+
+        # --- Dynamic Governor State ---
         self.pressure: float = 0.0
-        self.squeeze_momentum: float = 0.04   # Step size 0.05 (ramps in ~20 epochs instead of 80)
         self.breathing_cooldown: int = 0
-        
-        self.saturation_streak: int = 0
-        self.required_saturation_streak: int = 4
+        self.no_improve_count: int = 0
+
+        # Target Sparsity Range
+        self.target_l0_min: float = getattr(cfg, "target_l0_min", 4.0)
+        self.target_l0_max: float = getattr(cfg, "target_l0_max", 7.0)
+
+        # Telemetry Cache
+        self._progress: float = 0.0
+        self.alpha: float = getattr(cfg, "alpha_start", 1.15)
+        self.temp: float = getattr(cfg, "temp_start", 1.0)
+        self.scale: float = getattr(cfg, "scale_start", 2.0)
+        self.spatial_warmup: float = 0.0
+        self.sparsity_multiplier: float = getattr(cfg, "sparsity_min_scale", 0.05)
 
     @staticmethod
-    def _fit_ols(series: List[float]) -> Tuple[float, float, float]:
-        """Calculates slope, mean, and residual standard deviation."""
+    def _fit_ols(series: list[float]) -> tuple[float, float, float]:
+        """Calculates slope, mean, and residual standard deviation with zero-division guards."""
         n = len(series)
         if n < 3:
             return 0.0, float(series[-1]) if series else 0.0, 0.01
 
-        t_mean = (n - 1) / 2.0
-        y_mean = sum(series) / n
+        t = np.arange(n, dtype=np.float64)
+        y = np.array(series, dtype=np.float64)
 
-        num = sum((i - t_mean) * (series[i] - y_mean) for i in range(n))
-        den = sum((i - t_mean) ** 2 for i in range(n))
+        t_mean = (n - 1) / 2.0
+        y_mean = float(np.mean(y))
+
+        num = float(np.sum((t - t_mean) * (y - y_mean)))
+        den = float(np.sum((t - t_mean) ** 2))
         slope = num / max(1e-9, den)
         intercept = y_mean - slope * t_mean
 
-        res_sq = sum((series[i] - (slope * i + intercept)) ** 2 for i in range(n))
-        residual_std = math.sqrt(res_sq / max(1, n - 2))
+        res_sq = np.sum((y - (slope * t + intercept)) ** 2)
+        residual_std = float(np.sqrt(res_sq / max(1, n - 2)))
 
         return slope, y_mean, residual_std
 
@@ -137,107 +176,156 @@ class PhaseTracker:
         """Returns smooth Cosine S-curve progress in [0.0, 1.0]."""
         if self.phase == 1:
             return 0.0
-        # S-curve smooths out micro-adjustments
-        return 0.5 * (1.0 - math.cos(math.pi * self.pressure))
+        return 0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure))))
 
-    def step(self, epoch_telemetry: Dict[str, float], epoch: int) -> bool:
-        """Evaluates epoch telemetry, adjusting squeeze pressure elastically."""
+    def _update_schedules(self, epoch: int) -> None:
+        """Computes coordinated schedules across all model components."""
+        self._progress = self.get_progress()
+
+        # 1. Entmax Curvature Schedule (Smooth 1.15 -> 1.45 annealing)
+        a_start = getattr(cfg, "alpha_start", 1.15)
+        a_end = getattr(cfg, "alpha_end", 1.45)
+        self.alpha = float(a_start + (a_end - a_start) * (self._progress ** 1.0))
+
+        # 2. Gating Scale Schedule (Bounded 2.0 -> 8.0 to prevent 1-hot snapping)
+        s_start = getattr(cfg, "scale_start", 2.0)
+        s_end = getattr(cfg, "scale_end", 8.0)
+        self.scale = float(s_start + (s_end - s_start) * (self._progress ** 1.0))
+
+        # 3. Softmax Temperature Annealing (1.0 -> 0.10)
+        t_start = getattr(cfg, "temp_start", 1.0)
+        t_end = getattr(cfg, "temp_end", 0.10)
+        self.temp = float(t_start + (t_end - t_start) * self._progress)
+
+        # 4. Spatial Logit Warmup (Linear exploration during Phase 1 -> Full in Phase 2)
+        if self.phase == 1:
+            self.spatial_warmup = min(1.0, float(epoch + 1) / max(1, self.min_p1_epochs))
+        else:
+            self.spatial_warmup = 1.0
+
+        # 5. Sparsity L1 Multiplier
+        s_min = getattr(cfg, "sparsity_min_scale", 0.05)
+        p_pow = getattr(cfg, "sparsity_prog_pow", 1.2)
+        self.sparsity_multiplier = float(s_min + (1.0 - s_min) * (self._progress ** p_pow))
+
+    def step(self, epoch_telemetry: dict[str, float], epoch: int, val_loss: float | None = None) -> bool:
+        """Evaluates epoch telemetry, adjusting governor pressure dynamically.
+        
+        Returns:
+            bool: True if Pareto optimal convergence is reached (Early Stop).
+        """
         current_rec = float(epoch_telemetry.get("l_rec", 0.0))
-        current_pw = float(epoch_telemetry.get("p_w", 0.0))
+        current_val = float(val_loss if val_loss is not None else current_rec)
+        current_l0 = float(epoch_telemetry.get("l0_avg", float(getattr(cfg, "n_latents", 36))))
+        max_corr = float(epoch_telemetry.get("dict/max_cross_corr", epoch_telemetry.get("d_max_cross_corr", 0.0)))
 
         self.rec_history.append(current_rec)
-        self.pw_history.append(current_pw)
+        self.val_history.append(current_val)
+        self.l0_history.append(current_l0)
 
-        # Track absolute lowest reconstruction loss achieved
-        if current_rec < self.best_rec_loss:
+        if self.phase == 2 and current_rec < self.best_rec_loss:
             self.best_rec_loss = current_rec
+
+        # Maintain internal dynamic schedules
+        self._update_schedules(epoch)
 
         if len(self.rec_history) < self.cycle_window:
             return False
 
         window_rec = self.rec_history[-self.cycle_window:]
-        window_pw = self.pw_history[-self.cycle_window:]
-
         rec_slope, rec_mu, rec_sigma = self._fit_ols(window_rec)
-        pw_slope, pw_mu, _ = self._fit_ols(window_pw)
 
-        # -----------------------------------------------------------------
-        # PHASE 1: Manifold Discovery & Plateau Detection
-        # -----------------------------------------------------------------
+        # =============================================================
+        # PHASE 1: Manifold Discovery with Guaranteed Biological Runway
+        # =============================================================
         if self.phase == 1:
-            # 1. Hard cutoff: Force Phase 2 at max_p1_epochs regardless
-            if epoch >= self.max_p1_epochs:
-                self.force_phase2(epoch, rec_mu)
-                return False
-                
-            # 2. Faster slope trigger (transition when relative drop < 0.8% per epoch)
+            drop_tol = getattr(cfg, "p1_drop_tol", 0.012)
             relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
-            if relative_drop_rate < 0.008:
+
+            # Check for plateau
+            if relative_drop_rate < drop_tol:
+                self.p1_plateau_count += 1
+            else:
+                self.p1_plateau_count = 0
+
+            # Guard: Must satisfy MINIMUM Phase 1 runway before considering transition
+            can_exit_min = epoch >= (self.min_p1_epochs - 1)
+            hit_max_budget = epoch >= (self.max_p1_epochs - 1)
+            sustained_plateau = self.p1_plateau_count >= self.p1_plateau_patience
+
+            if hit_max_budget or (can_exit_min and sustained_plateau):
                 self.force_phase2(epoch, rec_mu)
+
             return False
 
-        # -----------------------------------------------------------------
-        # PHASE 2: Elastic Squeeze & Breathe Dynamic Governor
-        # -----------------------------------------------------------------
-        if self.phase == 2:
-            # Dynamic Variance Ceiling: minimum 6% budget or 2.5x oscillation noise
-            dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.5 * rec_sigma)
-            loss_ceiling = self.best_rec_loss + dynamic_budget
+        # =============================================================
+        # PHASE 2: Multi-Signal Elastic Squeeze Governor
+        # =============================================================
+        remaining_epochs = max(1, self.total_epochs - self.p2_start_epoch)
+        base_step = 1.0 / remaining_epochs
 
-            overshoot = current_rec - loss_ceiling
+        # 1. Reconstruction Budget & Overshoot
+        dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.0 * rec_sigma)
+        loss_ceiling = self.best_rec_loss + dynamic_budget
+        overshoot = current_rec - loss_ceiling
 
-            # SENSE FRAGILITY & BREATHE: Loss exceeded tolerance band
-            if overshoot > 0.0:
-                # Severity ratio of the loss spike
-                severity = min(2.0, overshoot / max(1e-5, dynamic_budget))
-                
-                # Proportional elastic release: drops pressure rapidly to relieve strain
-                release_amount = 0.04 * severity
-                self.pressure = max(0.10, self.pressure - release_amount)
-                self.squeeze_momentum = 0.008  # Reset momentum to cautious
-                self.breathing_cooldown = 3    # Hold pressure for 2 epochs to recover
-                self.saturation_streak = 0
-            
-            # SAFE TO SQUEEZE: Loss is healthy inside the manifold envelope
+        # 2. Multi-Objective Stress Checks
+        dict_stress = max_corr > 0.65  # Atoms starting to correlate
+        l0_too_fast = current_l0 < self.target_l0_min  # Overshot sparsity
+
+        if overshoot > 0.0 or dict_stress or l0_too_fast:
+            # Fragile manifold: Proportional elastic release & breathing cooldown
+            severity = max(
+                min(2.0, overshoot / max(1e-5, dynamic_budget)),
+                1.5 if dict_stress else 0.5
+            )
+            self.pressure = max(0.02, self.pressure - (base_step * 1.5 * severity))
+            self.breathing_cooldown = max(2, int(self.cycle_window * 0.6))
+        else:
+            if self.breathing_cooldown > 0:
+                self.breathing_cooldown -= 1
             else:
-                if self.breathing_cooldown > 0:
-                    self.breathing_cooldown -= 1
-                else:
-                    # Gradually accelerate squeeze momentum when stable
-                    self.squeeze_momentum = min(0.035, self.squeeze_momentum + 0.002)
-                    self.pressure = min(1.0, self.pressure + self.squeeze_momentum)
+                # Stable manifold: Advance pressure at accelerated rate if L0 is high
+                speed_boost = 1.35 if current_l0 > self.target_l0_max else 1.0
+                self.pressure = min(1.0, self.pressure + (base_step * speed_boost))
 
-            # -------------------------------------------------------------
-            # STRICT TERMINATION AUDIT (Prevents premature exit at < 70% P_W)
-            # -------------------------------------------------------------
-            # Only consider stopping if:
-            # 1. Full pressure is deployed (pressure >= 0.95)
-            # 2. P_W reached the target regime (>= 72.0%)
-            # 3. P_W slope is completely flat (< +0.05% / epoch over 12 epochs)
-            # 4. Sustained over a full 8-epoch oscillation streak
-            if self.pressure >= 0.95 and current_pw >= (self.target_pw - 3.0):
-                if pw_slope < 0.05:
-                    self.saturation_streak += 1
-                else:
-                    self.saturation_streak = max(0, self.saturation_streak - 1)
+        # Re-update schedules with modified pressure
+        self._update_schedules(epoch)
 
-                if self.saturation_streak >= self.required_saturation_streak:
-                    return True
+        # =============================================================
+        # SCALE-INVARIANT PARETO EARLY STOPPING
+        # =============================================================
+        min_progress = getattr(cfg, "min_stop_progress", 0.85)
+        rel_tol = getattr(cfg, "early_stop_rel_tol", 1e-3)
+
+        if self._progress >= min_progress and current_l0 <= self.target_l0_max:
+            if (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss) > rel_tol:
+                self.best_val_loss = current_val
+                self.no_improve_count = 0
             else:
-                self.saturation_streak = 0
+                self.no_improve_count += 1
+
+            if self.no_improve_count >= self.patience_epochs:
+                return True
+        else:
+            if current_val < self.best_val_loss:
+                self.best_val_loss = current_val
+            self.no_improve_count = 0
 
         return False
 
     def force_phase2(self, epoch: int, current_baseline: float) -> None:
-        """Transitions tracker to Phase 2."""
+        """Transitions tracker from Discovery (Phase 1) to Pareto Squeeze (Phase 2)."""
         if self.phase == 1:
             self.phase = 2
+            self.p2_start_epoch = epoch
             self.p1_baseline_rec = current_baseline
-            if self.best_rec_loss == float("inf") or current_baseline < self.best_rec_loss:
-                self.best_rec_loss = current_baseline
-
-
-
+            self.best_rec_loss = current_baseline
+            self.best_val_loss = float("inf")
+            self.pressure = 0.0
+            self.breathing_cooldown = 0
+            self.no_improve_count = 0
+            self._update_schedules(epoch)
 
 class UnifiedLogger:
     """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
@@ -263,7 +351,7 @@ class UnifiedLogger:
         if not self.writer:
             return
 
-        # 1. Pull the custom telemetry dictionary you built in model.py
+        # 1. Pull live deep telemetry from model (SVD, Effective Rank, Gram, Ambient, Gradients)
         if hasattr(model, 'get_deep_telemetry'):
             stats = model.get_deep_telemetry()
             self.log_metrics(step, stats)
@@ -276,6 +364,40 @@ class UnifiedLogger:
                     self.writer.add_histogram(f"weights/{p_clean}", param.data, global_step=step)
                     if param.grad is not None:
                         self.writer.add_histogram(f"grads/{p_clean}", param.grad, global_step=step)
+
+    def log_checkpoint_autopsy(self, step: int, ckpt_path: str) -> dict[str, float]:
+        """Loads a saved checkpoint file, performs deep dictionary autopsy, and logs metrics."""
+        import torch
+        import torch.nn.functional as F
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        state = ckpt.get("model_state_dict", ckpt)
+        metrics = {}
+
+        if "decoder_weight" in state:
+            w = F.normalize(state["decoder_weight"], p=2, dim=-1)
+            s = torch.linalg.svdvals(w)
+            eff_rank = (s.sum() ** 2) / torch.clamp((s ** 2).sum(), min=1e-9)
+
+            gram = torch.mm(w, w.t())
+            off_diag_mask = ~torch.eye(w.size(0), dtype=torch.bool)
+            off_diag_vals = gram.masked_select(off_diag_mask)
+
+            metrics["autopsy/effective_rank"] = eff_rank.item()
+            metrics["autopsy/svd_sigma_1"] = s[0].item()
+            metrics["autopsy/svd_sigma_2"] = s[1].item() if s.numel() > 1 else 0.0
+            metrics["autopsy/max_cross_corr"] = off_diag_vals.max().item() if off_diag_vals.numel() > 0 else 0.0
+            metrics["autopsy/mean_cross_corr"] = off_diag_vals.abs().mean().item() if off_diag_vals.numel() > 0 else 0.0
+
+        if "ambient_scale" in state:
+            amb_val = state["ambient_scale"].item()
+            amb_pct = (1.0 / (1.0 + 2.718281828459045 ** (-amb_val * 5.0))) * 0.40 * 100.0
+            metrics["autopsy/ambient_absorption_pct"] = amb_pct
+
+        if self.writer:
+            self.log_metrics(step, metrics)
+
+        return metrics
 
     @staticmethod
     def get_memory_metrics(device: torch.device) -> dict[str, float]:

@@ -31,6 +31,8 @@ class RunConfig:
     logger_backend: str = "tensorboard"
     telemetry_step_freq: int = 10
     log_histograms: bool = False
+    checkpoint_freq: int = 5          # Save autopsy checkpoint every 5 epochs
+
 
     # Architecture Capacities
     hidden_dim: int = 128
@@ -59,25 +61,31 @@ class RunConfig:
     # GNN Physics & Message Passing
     train_noise: float = 0.05
     edge_dropout: float = 0.40
-    edge_sim_threshold: float = 0.10
-    edge_decay_slope: float = 10.0
+    edge_sim_threshold: float = 0.6
+    edge_decay_slope: float = 20.0
     appnp_alpha_scale: float = 0.85
     appnp_alpha_offset: float = 0.10
-    att_temp: float = -2.25
-    att_temp_min: float = 0.5
-    att_temp_max: float = 3.0
+    att_temp: float = -1.0
+    att_temp_min: float = 0.01
+    att_temp_max: float = 2.0
     spatial_gain_init: float = 2.0
 
-    # Latent Scaling & Gating Dynamics
-    scale_start: float = 8.0
-    scale_end: float = 42.0
-    alpha_start: float = 1.35
-    alpha_end: float = 1.50
+    # Latent Scaling & Gating Dynamics (Exploration Warmup -> Sharp Deconvolution)
+    scale_start: float = 2.0
+    scale_end: float = 36.0
+    alpha_start: float = 1.20  
+    alpha_end: float = 1.5   
     temp_start: float = 1.5
     temp_end: float = 0.3
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
+    gate_leak_temp: float = 1.0
+    gate_leak_ratio: float = 0.02
+
+    # Ambient & Background Baseline
+    ambient_lr_mult: float = 4
+    ambient_max_cap: float = 0.4
 
     # Loss Functions & Regularization
     delta_clamp: float = 30.0
@@ -85,26 +93,43 @@ class RunConfig:
     asym_penalty_weight: float = 0.50
     zero_mask_rate: float = 0.05
 
-    l1_coeff: float = 8.0e-2
-    sparsity_min_scale: float = 0.10
-    sparsity_prog_pow: float = 0.80
+    # Natural Sparsity & Elastic Pressure
+    l1_coeff: float = 0.5         # Natural linear activation regularizer
+    sparse_eps: float = 1e-3
+    sparsity_min_scale: float = 0.05
+    sparsity_prog_pow: float = 1.2
+    ambient_lr_mult: float = 10.0
+    ambient_max_cap: float = 0.35
 
-    ortho_weight: float = 5.0
-    ortho_overlap_threshold: float = 0.35
-    ortho_barrier_scale: float = 4.0
+
+    # Sharp Gram Orthogonality Barrier
+    ortho_weight: float = 8
+    ortho_overlap_threshold: float = 0.30  # Strict cap on max cross-correlation
+    ortho_barrier_scale: float = 8.0       # High-gradient barrier for violating pairs
     ortho_min_scale: float = 0.50
 
-    aux_weight: float = 0.5
+    topk_k: int = 3                      
+    aux_weight: float = 0.5        # Balanced Ghost + Residual MSE weight
     aux_k: int = 4
     aux_min_k: int = 2
     aux_min_residual_energy: float = 0.05
-    dead_step_threshold: int = 150
+    dead_step_threshold: int = 20   # ~1 epoch on 25k cells (fast-acting resurrection trigger)
 
     # Optimizers & Gradients
     lr_base: float = 0.001
     wd_base: float = 1e-4
     lr_decoder: float = 0.001
     grad_clip: float = 5.0
+    mse_weight: float = 0.5
+
+    # Scale-Invariant PhaseTracker & Early Stopping
+    p1_max_ratio: float = 0.15        # Phase 1 capped at 15% of total epochs
+    p1_drop_tol: float = 0.010        # Relative plateau drop rate to trigger Phase 2
+    tracker_window_ratio: float = 0.08 # Sliding window size as fraction of total epochs (min 3)
+    patience_ratio: float = 0.12      # Early stopping patience window (min 5 epochs)
+    min_stop_progress: float = 0.85   # Do not stop before 85% squeeze progress
+    early_stop_rel_tol: float = 1e-3  # Relative val loss improvement threshold (0.1%)
+    
 
     # Inference & Topology
     entropy_pruning: bool = True

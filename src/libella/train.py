@@ -24,67 +24,6 @@ from .model import LibellaGNN
 from .utils import PhaseTracker, UnifiedLogger, export_latents_from_graphs, get_device
 
 
-def _init_model(
-    common_genes: list[str], 
-    n_latents: int, 
-    checkpoint_path: Path | None = None
-) -> tuple[LibellaGNN, torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler, float, dict[str, Any] | None, dict[str, list], int]:
-    """Initialize GNN model, optimizers, and load state if available."""
-    device = get_device()
-    model = LibellaGNN(
-        in_channels=len(common_genes), 
-        n_metaprograms=n_latents
-    ).to(device)
-    
-    # 1. Isolate decoder, jump threshold, and backbone parameters
-    decoder_params = [p for n, p in model.named_parameters() if "decoder_" in n]
-    threshold_params = [p for n, p in model.named_parameters() if "jump_threshold" in n]
-    base_params = [
-        p for n, p in model.named_parameters() 
-        if "decoder_" not in n and "jump_threshold" not in n
-    ]
-
-    # 2. Decoder parameters receive zero weight decay (preserved via Oblique Retraction)
-    optimizer = torch.optim.AdamW([
-        {"params": base_params, "lr": cfg.lr_base, "weight_decay": cfg.wd_base},
-        {"params": decoder_params, "lr": getattr(cfg, "lr_decoder", cfg.lr_base), "weight_decay": 0.0},
-        {"params": threshold_params, "lr": getattr(cfg, "lr_threshold", cfg.lr_base * 0.5), "weight_decay": 0.0}
-    ])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.epochs, eta_min=1e-6
-    )
-    
-    best_composite_score = float("inf")
-    tracker_state = None
-    history = {"train_loss": [], "val_loss": [], "autopsy_metrics": []}
-    start_epoch = 0
-
-    out_dirs = paths.make_dirs(cfg.suffix)
-    resume_path = out_dirs["out"] / "resume_latest.pt"
-    target_ckpt = resume_path if resume_path.exists() else checkpoint_path
-
-    if target_ckpt and Path(target_ckpt).exists():
-        try:
-            print(f"  ↳ Loading state from: {target_ckpt.name}")
-            ckpt = torch.load(target_ckpt, map_location=device, weights_only=False)
-            model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            
-            if "optimizer_state_dict" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            if ckpt.get("scheduler_state_dict"):
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                
-            best_composite_score = ckpt.get("best_composite_score", ckpt.get("best_val_loss", float("inf")))
-            tracker_state = ckpt.get("tracker_state", None)
-            history = ckpt.get("history", history)
-            start_epoch = ckpt.get("epoch", -1) + 1
-            print(f"  ↳ Successfully resumed from Epoch {start_epoch}")
-        except Exception as e:
-            print(f"  ↳ [!] Failed to load checkpoint: {e}. Raising error to prevent accidental overwrite.")
-            raise e 
-
-    return model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch
-
 
 def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
     """Slice patient graphs into SSD chunks for OOM-safe training."""
@@ -188,6 +127,79 @@ def prefetch_batches(
             chunks.append(chunk)
         yield meta_meta, chunks
 
+def _init_model(
+    common_genes: list[str], 
+    n_latents: int, 
+    checkpoint_path: Path | None = None
+) -> tuple[LibellaGNN, torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler, float, dict[str, Any] | None, dict[str, list], int]:
+    """Initialize GNN model, optimizers, and load state if available."""
+    device = get_device()
+    model = LibellaGNN(
+        in_channels=len(common_genes), 
+        n_metaprograms=n_latents
+    ).to(device)
+    
+    # 1. Parameter grouping with dedicated bias/ambient learning rates
+    bias_ambient_params = [
+        p for n, p in model.named_parameters() 
+        if any(k in n for k in ["decoder_bias", "ambient_scale"])
+    ]
+    decoder_weight_params = [
+        p for n, p in model.named_parameters() 
+        if "decoder_weight" in n
+    ]
+    threshold_params = [
+        p for n, p in model.named_parameters() 
+        if "jump_threshold" in n
+    ]
+    base_params = [
+        p for n, p in model.named_parameters() 
+        if not any(k in n for k in ["decoder_", "ambient_scale", "jump_threshold"])
+    ]
+
+    # 2. Optimizer with 5x higher LR for bias & ambient baseline absorption
+    lr_base = cfg.lr_base
+    optimizer = torch.optim.AdamW([
+        {"params": base_params, "lr": lr_base, "weight_decay": cfg.wd_base},
+        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base), "weight_decay": 0.0},
+        {"params": bias_ambient_params, "lr": lr_base * 5.0, "weight_decay": 0.0},  # Elevated LR for baseline absorption
+        {"params": threshold_params, "lr": getattr(cfg, "lr_threshold", lr_base * 0.5), "weight_decay": 0.0}
+    ])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.epochs, eta_min=1e-6
+    )
+    
+    best_composite_score = float("inf")
+    tracker_state = None
+    history = {"train_loss": [], "val_loss": [], "autopsy_metrics": []}
+    start_epoch = 0
+
+    out_dirs = paths.make_dirs(cfg.suffix)
+    resume_path = out_dirs["out"] / "resume_latest.pt"
+    target_ckpt = resume_path if resume_path.exists() else checkpoint_path
+
+    if target_ckpt and Path(target_ckpt).exists():
+        try:
+            print(f"  ↳ Loading state from: {target_ckpt.name}")
+            ckpt = torch.load(target_ckpt, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if ckpt.get("scheduler_state_dict"):
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                
+            best_composite_score = ckpt.get("best_composite_score", ckpt.get("best_val_loss", float("inf")))
+            tracker_state = ckpt.get("tracker_state", None)
+            history = ckpt.get("history", history)
+            start_epoch = ckpt.get("epoch", -1) + 1
+            print(f"  ↳ Successfully resumed from Epoch {start_epoch}")
+        except Exception as e:
+            print(f"  ↳ [!] Failed to load checkpoint: {e}. Raising error to prevent accidental overwrite.")
+            raise e 
+
+    return model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch
+
 
 
 def _train_loop(
@@ -215,7 +227,7 @@ def _train_loop(
     
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)  
 
-    tracker = PhaseTracker()
+    tracker = PhaseTracker(total_epochs=cfg.epochs)
     if tracker_state is not None:
         tracker.__dict__.update(tracker_state)
         print(f"  ↳ Restored PhaseTracker state (Phase {tracker.phase}, Pressure: {tracker.pressure:.2f}, Progress: {tracker.get_progress():.2f})")
@@ -271,27 +283,33 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                # Map tracker progress with a convex curve to preserve early exploration
-                tracker_prog = tracker.get_progress()
-                epoch_prog = epoch / max(1, cfg.epochs - 1)
-                prog = max(tracker_prog, epoch_prog)
+                
+                prog = tracker.get_progress() if tracker.phase == 2 else 0.0
                 model.current_progress = prog
-                
-                # Bounded Entmax Curvature Schedule (1.35 -> 1.50)
-                alpha_val = cfg.alpha_start + (cfg.alpha_end - cfg.alpha_start) * (prog ** 0.8)
-                model.current_alpha = float(np.clip(alpha_val, cfg.alpha_start, cfg.alpha_end))
-                
-                # Convex Sparsity Scale: stays exploratory early, ramps aggressively to scale_end
-                model.current_scale = cfg.scale_start + (cfg.scale_end - cfg.scale_start) * (prog ** 1.3)
-                
-                model.current_temp = cfg.temp_start + (cfg.temp_end - cfg.temp_start) * prog
 
-                # 1. Defensive Forward Execution
+                # 2. Entmax Curvature Schedule (Smooth 1.15 -> 1.45 annealing)
+                alpha_start = getattr(cfg, 'alpha_start', 1.15)
+                alpha_end = getattr(cfg, 'alpha_end', 1.5)
+                model.current_alpha = float(alpha_start + (alpha_end - alpha_start) * (prog ** 1.0))
+
+                # 3. Gating Scale Schedule (Bounded 2.0 -> 8.0 to prevent 1-hot snapping)
+                scale_start = getattr(cfg, 'scale_start', 2.0)
+                scale_end = getattr(cfg, 'scale_end', 16.0)
+                model.current_scale = float(scale_start + (scale_end - scale_start) * (prog ** 1.0))
+
+                # 4. Softmax Temperature Schedule (1.0 -> 0.10)
+                temp_start = getattr(cfg, 'temp_start', 1.0)
+                temp_end = getattr(cfg, 'temp_end', 0.10)
+                model.current_temp = float(temp_start + (temp_end - temp_start) * prog)
+
+                # 1. Forward Execution
                 forward_res = model(x, src, dst, weights)
                 recon, z, w_dec_norm = forward_res[0], forward_res[1], forward_res[2]
                 aux_recon = forward_res[3] if len(forward_res) > 3 else None
                 r_norm = forward_res[4] if len(forward_res) > 4 else None
                 z_mag = forward_res[5] if len(forward_res) > 5 else None
+                r_pos = forward_res[6] if len(forward_res) > 6 else None
+                dead_mask = forward_res[7] if len(forward_res) > 7 else None
                 
                 train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
                 x_train = x[train_idx]
@@ -300,7 +318,7 @@ def _train_loop(
                 aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
                 r_norm_train = r_norm[train_idx] if r_norm is not None else None
 
-                # 2. Defensive Loss Calculation
+                # 2. Loss Calculation
                 loss_res = model.calc_loss(
                     recon_train, x_train, z_train, w_dec_norm,
                     aux_recon=aux_recon_train, r_norm=r_norm_train,
@@ -367,13 +385,16 @@ def _train_loop(
                         is_non_zero_val = (x_val > 0)
                         dynamic_w = getattr(model, 'dynamic_w_ema', torch.tensor(1.0, device=device))
                         w_mat = torch.where(is_non_zero_val, dynamic_w, 1.0)
-                        w_mat = w_mat / torch.clamp(w_mat.mean(), min=1e-5)
+                        
+                        # FIX: Apply Variance-Weighting to Validation so it matches Training!
+                        variance_weight_val = w_mat * (1.0 + torch.log1p(x_val))
+                        variance_weight_val = variance_weight_val / torch.clamp(variance_weight_val.mean(), min=1e-5)
                         
                         raw_delta_val = val_recon - x_val
                         asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * cfg.asym_penalty_weight) * (raw_delta_val < 0).to(x_val.dtype)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-cfg.delta_clamp, max=cfg.delta_clamp)
                         
-                        val_loss_sum = torch.sum(w_mat * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
+                        val_loss_sum = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
                         val_log_cosh = val_loss_sum / max(1, x_val.numel())
                     
                         val_loss_acc += val_log_cosh.detach()
@@ -387,10 +408,30 @@ def _train_loop(
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            # 1. Global Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip)
+            # 1. Dual-Group Gradient Clipping (Protects Baseline/Recon Core from Spatial Gradient Surges)
+            recon_keys = ('decoder_bias', 'ambient_scale', 'decoder_weight')
+            recon_params = [
+                p for n, p in model.named_parameters() 
+                if any(k in n for k in recon_keys) and p.grad is not None
+            ]
+            spatial_params = [
+                p for n, p in model.named_parameters() 
+                if not any(k in n for k in recon_keys) and p.grad is not None
+            ]
 
-            # 2. Tangent-Space Projection
+            # Clip reconstruction core and spatial routing independently
+            if recon_params:
+                torch.nn.utils.clip_grad_norm_(
+                    recon_params, 
+                    max_norm=getattr(cfg, "grad_clip_recon", 5.0)
+                )
+            if spatial_params:
+                torch.nn.utils.clip_grad_norm_(
+                    spatial_params, 
+                    max_norm=getattr(cfg, "grad_clip_spatial", 15.0)
+                )
+
+            # 2. Tangent-Space Projection (Preserved)
             with torch.no_grad():
                 if hasattr(model, 'decoder_weight') and model.decoder_weight.grad is not None:
                     w = F.normalize(model.decoder_weight, p=2, dim=1)
@@ -398,7 +439,7 @@ def _train_loop(
                     proj_grad = grad - (grad * w).sum(dim=1, keepdim=True) * w
                     model.decoder_weight.grad.copy_(proj_grad)
 
-            # 2. Oblique Tangent-Space Retraction for Non-negative Weights
+            # 3. Oblique Tangent-Space Retraction for Non-negative Weights
             optimizer.step()
 
             with torch.no_grad():
@@ -406,6 +447,10 @@ def _train_loop(
                     # Retract to non-negative unit sphere
                     w_clamped = F.relu(model.decoder_weight)
                     model.decoder_weight.copy_(F.normalize(w_clamped + 1e-8, p=2, dim=-1))
+
+                # 3. Dynamic Residual Resampling Hook (Guarantees 0 Dead Latents)
+                if dead_mask is not None and dead_mask.any() and r_pos is not None:
+                    model.resample_dead_latents(r_pos, dead_mask, optimizer=optimizer)
 
             # --- NEW: STEP-LEVEL LOGGING ---
             global_step += 1
@@ -438,6 +483,11 @@ def _train_loop(
         if train_chunk_count > 0:
             for k, v in gpu_telemetry.items():
                 epoch_telemetry[k] = (v / train_chunk_count).item()
+            
+            # Program Sharpness (P_W): percentage of dictionary pruned away per cell
+            current_l0_val = epoch_telemetry.get('l0_avg', float(model.n_latents))
+            epoch_telemetry['p_w'] = (1.0 - (current_l0_val / float(model.n_latents))) * 100.0
+
             if ema_latent_freq is not None:
                 p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
                 epoch_telemetry['ent'] = -(p_norm * torch.log(p_norm + 1e-9)).sum().item()
@@ -469,10 +519,13 @@ def _train_loop(
             'max_activation': round(epoch_telemetry.get('max_act', 0.0), 2),
             'z_mag_mean': round(epoch_telemetry.get('z_mag_mean', 0.0), 4),
             'tracker': {
-                'alpha': round(getattr(tracker, 'alpha', cfg.alpha_start), 4),
-                'temp': round(getattr(tracker, 'temp', cfg.temp_start), 4),
-                'progress': round(tracker.get_progress(), 4)
+                'alpha': round(model.current_alpha, 4),
+                'temp': round(model.current_temp, 4),
+                'scale': round(model.current_scale, 4),
+                'progress': round(prog, 4),
+                'pressure': round(getattr(tracker, 'pressure', 0.0), 4)
             }
+
         }
         history.setdefault('autopsy_metrics', []).append(epoch_metrics)
 
@@ -495,6 +548,9 @@ def _train_loop(
             "tracker/progress": tracker.get_progress(),
         }
         logger.log_metrics(epoch, epoch_log)
+        
+        # Stream live model deep telemetry (SVD effective rank, σ_1, ambient absorption %) at epoch end
+        logger.log_model_telemetry(epoch, model, log_histograms=False)
 
         if composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
@@ -509,8 +565,12 @@ def _train_loop(
         if ((epoch + 1) % cfg.checkpoint_freq == 0 or epoch == cfg.epochs - 1) and not nan_detected:
             autopsy_dir = out_dir / "autopsy_checkpoints"
             autopsy_dir.mkdir(parents=True, exist_ok=True)
-            torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "metrics": epoch_metrics}, autopsy_dir / f"epoch_{(epoch+1):03d}.pt")
+            ckpt_path = autopsy_dir / f"epoch_{(epoch+1):03d}.pt"
+            torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "metrics": epoch_metrics}, ckpt_path)
             
+            # Execute automated offline checkpoint autopsy audit
+            logger.log_checkpoint_autopsy(epoch, str(ckpt_path))
+
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -540,17 +600,20 @@ def _train_loop(
             tracker.force_phase2(epoch, epoch_telemetry.get('l_rec', 0.0))
 
         was_phase_1 = (tracker.phase == 1)
-        is_done = tracker.step(epoch_telemetry, epoch)
+        current_val_loss = history['val_loss'][-1]
+        is_done = tracker.step(epoch_telemetry, epoch, val_loss=current_val_loss)
         
         if was_phase_1 and tracker.phase == 2:
             tqdm.write(
                 f"\n[↳] Phase 1 Complete at Epoch {epoch} (Baseline Rec: {tracker.p1_baseline_rec:.2f}). "
-                f"\n    Engaging Adaptive Loss-Gated Sparsification..."
+                f"\n    Engaging Adaptive Loss-Gated Sparsification across {tracker.total_epochs - tracker.p2_start_epoch} epochs..."
             )
             
         if is_done:
-            final_pw = epoch_telemetry.get('p_w', 0.0)
-            tqdm.write(f"\n[✓] Topic Sharpness (P_W) saturated at {final_pw:.2f}%. Terminating gracefully at Epoch {(epoch+1)}.")
+            tqdm.write(
+                f"\n[✓] Pareto Convergence Reached at Epoch {(epoch+1)}/{cfg.epochs} "
+                f"(Val Loss: {current_val_loss:.4f}, Squeeze Progress: {tracker.get_progress():.2%}). Terminating gracefully."
+            )
             break
     
     # End of epoch loop
