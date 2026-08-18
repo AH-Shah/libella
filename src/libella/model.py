@@ -118,36 +118,35 @@ class LibellaGNN(nn.Module):
             src = src.contiguous()
             dst = dst.contiguous()
 
-        # 1. Depth Disentanglement (Conserves total cell mass)
+        N = x_dense.size(0)
+
+        # 1. Depth Disentanglement
         cell_mass = torch.clamp(x_dense.norm(p=2, dim=-1, keepdim=True), min=1e-5)
         x_norm = x_dense / cell_mass
 
         h_id = self.id_enc(x_norm)
         h_0 = self.lin_appnp(self.ctx_enc(x_norm))
-        N = h_0.size(0)
 
-        # 2. Smooth Bilateral Edge Decay
+        # 2. Bilateral Edge Decay
         if len(src) > 0:
             with torch.no_grad():
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1)
             decay = torch.sigmoid(
-                (cos_sim - getattr(cfg, "edge_sim_threshold", 0.1))
-                * getattr(cfg, "edge_decay_slope", 10.0)
+                (cos_sim - getattr(cfg, "edge_sim_threshold", 0.60))
+                * getattr(cfg, "edge_decay_slope", 20.0)
             )
+            W_bil = edge_weights * decay
         else:
-            decay = torch.ones_like(edge_weights)
+            W_bil = edge_weights
 
-        W_bil = edge_weights * decay
-
-        # 3. K-Hop Spatial Message Passing Loop
+        # 3. K-Hop Spatial Message Passing Loop (FIXED GAT ATTENTION)
         alpha = (
-            torch.sigmoid(self.alpha_proj(h_0)) * getattr(cfg, "appnp_alpha_scale", 0.9)
-            + getattr(cfg, "appnp_alpha_offset", 0.05)
+            torch.sigmoid(self.alpha_proj(h_0)) * getattr(cfg, "appnp_alpha_scale", 0.85)
+            + getattr(cfg, "appnp_alpha_offset", 0.10)
         )
         inv_alpha = 1.0 - alpha
         h_0_scaled = h_0 * alpha
 
-        gat_temp_scale = 1.0 / (F.softplus(self.att_temp) + 1e-4)
         h_ctx = h_0
         for _ in range(self.k_hops):
             out = torch.zeros_like(h_ctx)
@@ -156,57 +155,68 @@ class LibellaGNN(nn.Module):
                 h_dst_proj = self.gat_w_dst(h_ctx)
                 edge_proj = self.gat_w_edge(W_bil.unsqueeze(1))
                 h_edge = h_src_proj[src] + h_dst_proj[dst] + edge_proj
+
+                # FIX 1: Use direct LeakyReLU output with learnable gain (DO NOT divide by sqrt(d))
                 e_raw = self.gat_a(F.leaky_relu(h_edge, negative_slope=0.2)).squeeze(-1)
-                # Scale by sqrt(d_k) rather than tiny softplus parameter
-                scale_dim = math.sqrt(self.hidden_dim)
-                alpha_att = scatter_softmax(e_raw / scale_dim, dst, N)
+                # Gain multiplier (e.g. 2.0) keeps softmax selective and derivatives healthy
+                alpha_att = scatter_softmax(e_raw * 2.0, dst, N)
+
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
                 out.index_add_(0, dst, msg)
 
             agg = F.silu(self.mp_update(out))
+            # Residual GAT connection preserves feature energy across hops
             h_ctx = agg * inv_alpha + h_0_scaled
 
-        # 4. Cross-Attention Highway
+        # 4. Cross-Attention Highway (FIXED COSINE SCALING & RESIDUAL)
         Q = self.q_proj(h_id)
         K = self.k_proj(h_ctx)
         V = self.v_proj(h_ctx)
 
         if len(src) > 0:
-            Q_scaled = Q / math.sqrt(self.hidden_dim)
-            cross_scores = (Q_scaled[dst] * K[src]).sum(dim=-1)
+            Q_norm = F.normalize(Q, p=2, dim=-1)
+            K_norm = F.normalize(K, p=2, dim=-1)
+            
+            # FIX 2: Multiply cosine similarity by sharp temperature scale (e.g. 4.0 to 10.0)
+            # Instead of dividing by sqrt(d), scale cosine range [-1, 1] -> [-4.0, +4.0]
+            cross_scores = (Q_norm[dst] * K_norm[src]).sum(dim=-1) * 4.0
             cross_att = scatter_softmax(cross_scores, dst, N)
+            
             pulled_msg = (V[src] * cross_att.unsqueeze(1)).contiguous()
             ctx_pulled = torch.zeros_like(Q)
             ctx_pulled.index_add_(0, dst, pulled_msg)
         else:
             ctx_pulled = V
 
-        # 5. Dual-Stream Feature Fusion
+        # 5. Dual-Stream Fusion with Residual Context Highway (FIX 3)
         h_id_norm = self.sp_norm(h_id)
-        ctx_norm = F.layer_norm(ctx_pulled, [self.hidden_dim])
+        # Add h_ctx residual directly so spatial features bypass cross-attention bottlenecks
+        ctx_combined = ctx_pulled + h_ctx
+        ctx_norm = F.layer_norm(ctx_combined, [self.hidden_dim])
+        
         gate_coeff = torch.sigmoid(self.context_gate(ctx_norm))
         h_final = (1.0 - 0.5 * gate_coeff) * h_id_norm + (1.0 + 0.5 * gate_coeff) * ctx_norm
-        h_norm = F.normalize(h_final, p=2, dim=-1)
 
         # 6. Latent Pre-Activations
-        z_mag = self.mag_enc(h_norm)
+        z_mag = self.mag_enc(h_final)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
         bio_sim = torch.mm(x_norm, w_dec_norm.t())
-        spatial_shift = self.gate_spatial_proj(h_norm)
+        spatial_shift = self.gate_spatial_proj(h_final)
 
+        # Baseline spatial warmup schedule
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
-        spatial_warmup = 0.10 + 0.90 * min(1.0, progress * 2.0)
+        spatial_warmup = 0.20 + 0.80 * min(1.0, progress * 2.0)
 
-        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))        
+        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
         pre_acts = raw_affinity * z_mag
 
-        # 7. Top-K Hard Sparsity Operator (L0 = EXACTLY k)
+        # 7. Top-K Hard Sparsity Operator
         target_k = getattr(self, "current_k", self.k)
         topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
         z_sparse = torch.zeros_like(pre_acts).scatter(-1, topk_indices, topk_vals)
 
         return z_sparse, pre_acts, cell_mass, z_mag
-
+        
     @torch.no_grad()
     def resample_dead_latents(
         self, 
