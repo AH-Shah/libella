@@ -284,13 +284,11 @@ def _train_loop(
             last_dead_mask = None
 
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
-                # Transfer contiguous data via Unified Memory DMA
                 x = batch["x"].to(device=device, non_blocking=True).contiguous()
                 
-                # MPS hardware operates at peak throughput with int32 indexing
-                idx_dtype = torch.int32 if device.type == "mps" else torch.int64
-                src = batch["src"].to(device=device, dtype=idx_dtype, non_blocking=True).contiguous()
-                dst = batch["dst"].to(device=device, dtype=idx_dtype, non_blocking=True).contiguous()
+                # PyTorch MPS index_add_ shaders strictly require torch.int64 (torch.long)
+                src = batch["src"].to(device=device, dtype=torch.int64, non_blocking=True).contiguous()
+                dst = batch["dst"].to(device=device, dtype=torch.int64, non_blocking=True).contiguous()
                 weights = batch["weights"].to(device=device, non_blocking=True).contiguous()
 
                 if model.training and src.numel() > 0:
@@ -303,12 +301,12 @@ def _train_loop(
 
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
 
-                # Set spatial warmup progress
+                # 1. Define progress and warmup state BEFORE forward/loss
                 prog = tracker.get_progress() if tracker.phase == 2 else 0.0
                 model.current_progress = prog
                 model.current_k = getattr(cfg, "topk_k", 3)
 
-                # 1. Forward Pass
+                # 2. Forward Pass
                 (
                     recon,
                     z,
@@ -323,14 +321,14 @@ def _train_loop(
                 last_r_pos = r_pos
                 last_dead_mask = dead_mask
 
-                train_idx = batch["train_core_idx"].to(device=device, dtype=idx_dtype, non_blocking=True)
+                train_idx = batch["train_core_idx"].to(device=device, dtype=torch.int64, non_blocking=True)
                 x_train = x[train_idx]
                 recon_train = recon[train_idx]
                 z_train = z[train_idx]
                 aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
                 r_norm_train = r_norm[train_idx] if r_norm is not None else None
 
-                # 2. Loss Calculation
+                # 3. Loss Calculation
                 loss_res = model.calc_loss(
                     recon_train,
                     x_train,
@@ -641,11 +639,12 @@ def _train_loop(
 
         epochs_remaining = total_epochs - epoch - 1
         force_window = getattr(cfg, "phase2_force_window", 10)
-        if tracker.phase == 1 and epochs_remaining <= force_window:
+        was_phase_1 = tracker.phase == 1
+
+        if was_phase_1 and epochs_remaining <= force_window:
             tqdm.write(f"\n[!] Approaching max epochs ({total_epochs}). Forcing Phase 2.")
             tracker.force_phase2(epoch, epoch_telemetry.get("l_rec", 0.0))
 
-        was_phase_1 = tracker.phase == 1
         current_val_loss = history["val_loss"][-1]
         is_done = tracker.step(epoch_telemetry, epoch, val_loss=current_val_loss)
 
