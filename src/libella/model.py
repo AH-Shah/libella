@@ -218,73 +218,97 @@ class LibellaGNN(nn.Module):
 
         return k_resample
 
-    def forward(
+    def encode(
         self,
         x_dense: torch.Tensor,
         src: torch.Tensor,
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        # 1. Spatial & Identity Encoding
-        z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
-        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        N = x_dense.size(0)
+        has_edges = src.numel() > 0
 
-        # 2. Baseline Decoupling (Clean GEMM: [N, n_latents] @ [n_latents, in_channels])
-        baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
-        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.35)
+        # 1. Bounds Guard & Stride Alignment for MPS Hardware Addressing
+        if has_edges:
+            src = src.to(dtype=torch.int64).contiguous()
+            dst = dst.to(dtype=torch.int64).contiguous()
+            edge_weights = edge_weights.to(dtype=torch.float32).contiguous()
+            
+            valid = (src >= 0) & (src < N) & (dst >= 0) & (dst < N)
+            if not valid.all():
+                src = src[valid]
+                dst = dst[valid]
+                edge_weights = edge_weights[valid]
+                has_edges = src.numel() > 0
 
-        comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
-        x_recon = comp_profile * cell_mass
+        # 2. Depth Disentanglement (Vectorized L2 Norm on ALU)
+        cell_mass = torch.clamp(
+            torch.linalg.vector_norm(x_dense, ord=2, dim=-1, keepdim=True), min=1e-5
+        )
+        x_norm = x_dense / cell_mass
 
-        aux_recon = None
-        r_norm = None
-        r_pos_ret = None
-        dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
+        # 3. Self Feature Extraction
+        h_self = self.self_enc(x_norm)
 
-        # 3. Auxiliary Loss & Dead Latent Tracking (Training Only)
-        if self.training:
+        # 4. Bilateral Edge Filtering & Symmetric Normalization (Hard Cutoff for Sharpness)
+        if has_edges:
             with torch.no_grad():
-                active_in_batch = (z > 1e-4).any(dim=0)
-                self.steps_since_active.add_(1)
-                self.steps_since_active.masked_fill_(active_in_batch, 0)
-                dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
+                cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
+                # Hard Bilateral Cutoff: Zero out edges across sharp transcriptomic boundaries (< 0.45)
+                edge_sim_thresh = float(getattr(cfg, "edge_sim_threshold", 0.45))
+                edge_mask = (cos_sim > edge_sim_thresh).to(dtype=x_dense.dtype)
+                decay = torch.sigmoid(
+                    (cos_sim - edge_sim_thresh) * getattr(cfg, "edge_decay_slope", 12.0)
+                ) * edge_mask
 
-            x_norm = F.normalize(x_dense, p=2, dim=-1)
-            x_recon_norm = F.normalize(F.relu(x_recon), p=2, dim=-1)
-            r_pos = F.relu(x_norm - x_recon_norm)
-            r_pos_ret = r_pos.detach()
-            r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
-            residual_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1).mean()
+                # Symmetric Laplacian normalization
+                deg = torch.zeros((N, 1), dtype=x_dense.dtype, device=x_dense.device)
+                deg.index_add_(0, dst, torch.ones((dst.size(0), 1), dtype=x_dense.dtype, device=x_dense.device))
+                edge_norm = torch.rsqrt(torch.clamp(deg[src], min=1.0)) * torch.rsqrt(torch.clamp(deg[dst], min=1.0))
 
-            # Exact dual-gate condition preserved
-            if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
-                dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
-                num_dead = dead_indices.numel()
-                k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
+            W_bil = edge_weights.unsqueeze(1) * decay
+            gate = torch.sigmoid(self.edge_gate(torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)))
 
-                w_dead = w_dec_norm[dead_indices]
-                # F.linear(X, W) maps directly to X @ W.T in MPS without materializing intermediate view tensors
-                aux_sim = F.linear(r_norm, w_dead)
-                topk_res = torch.topk(aux_sim, k=k_aux, dim=-1)
+            # Selective Graph Message Passing
+            h_sp = h_self
+            for _ in range(self.k_hops):
+                msg = self.spatial_lin(h_sp)[src] * gate * edge_norm
+                h_sp = h_sp + F.silu(torch.zeros_like(h_sp).index_add_(0, dst, msg))
+        else:
+            h_sp = h_self
 
-                dead_mag = z_mag[:, dead_indices]
-                topk_mag = torch.gather(dead_mag, -1, topk_res.indices)
+        # 5. APPNP Teleport Identity Anchor (85% Self-Identity + 15% Spatial Context)
+        alpha_teleport = float(getattr(cfg, "appnp_alpha", 0.85))
+        h_fused = F.layer_norm(
+            alpha_teleport * h_self + (1.0 - alpha_teleport) * h_sp, [self.hidden_dim]
+        )
 
-                z_aux_weights = F.softplus(topk_res.values, beta=1.0) * topk_mag
-                # In-place scatter on fresh zero allocation avoids extra copy kernels
-                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, z_aux_weights)
-                aux_recon = torch.mm(z_aux, w_dead)
+        # 6. Identity-Preserving Gated Projection & Bounded Spatial Modulation
+        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
+        # Direct linear projection: Cell's own transcriptomic fingerprint
+        bio_proj = F.linear(x_norm, w_dec_norm)
+        
+        # Spatial context acts as a high-frequency contrast modulator (bounded by tanh, NOT additive blur)
+        spatial_mod = torch.tanh(self.spatial_gate_head(h_sp))
+        progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
+        mod_strength = 0.20 * progress  # Max 20% spatial adjustment
 
-        return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag, r_pos_ret, dead_mask_ret
+        # Base activation strictly anchored in single-cell genes, refined by tissue contrast
+        raw_acts = F.relu(bio_proj * (1.0 + mod_strength * spatial_mod))
+
+        # 7. Top-K Hard Sparsity with Dynamic Energy Scale Recovery (Fixes R^2 Collapse)
+        target_k = getattr(self, "current_k", max(6, self.k))
+        topk_vals, topk_indices = torch.topk(raw_acts, k=target_k, dim=-1)
+        
+        # Scale active latents so ||z @ W|| matches unit energy of input x_norm
+        topk_energy = torch.clamp(torch.sum(topk_vals ** 2, dim=-1, keepdim=True), min=1e-4)
+        scale_factor = torch.rsqrt(topk_energy)
+        scaled_topk_vals = topk_vals * scale_factor
+
+        z_sparse = torch.zeros_like(raw_acts).scatter_(-1, topk_indices, scaled_topk_vals)
+
+        return z_sparse, raw_acts, cell_mass, scaled_topk_vals
+
 
     def calc_loss(
         self,
