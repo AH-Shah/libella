@@ -1,4 +1,4 @@
-"""Spatial Graph Neural Network architecture for Libella (V1 Sharpness Architecture - Mathematically Repaired)."""
+"""Spatial Graph Neural Network architecture for Libella (Top-K Hard Sparsity SAE)."""
 
 from __future__ import annotations
 
@@ -11,24 +11,8 @@ import torch.nn.functional as F
 from .config import cfg
 
 
-def scatter_softmax(src: torch.Tensor, index: torch.Tensor, dim_size: int) -> torch.Tensor:
-    """Numerically stable scatter softmax with score clamping."""
-    # Clamp extreme logits to prevent Dirac softmax saturation and NaN gradients
-    src = torch.clamp(src, min=-15.0, max=15.0)
-    
-    # Compute max per group for numerical stability
-    max_val = torch.full((dim_size,), float("-inf"), dtype=src.dtype, device=src.device)
-    max_val = max_val.scatter_reduce(0, index, src, reduce="amax", include_self=False)
-    
-    out = (src - max_val[index]).exp()
-    sum_val = torch.zeros((dim_size,), dtype=src.dtype, device=src.device)
-    sum_val.index_add_(0, index, out)
-    
-    return out / torch.clamp(sum_val[index], min=1e-6)
-
-
 class LibellaGNN(nn.Module):
-    """Core Libella Spatial GNN: GLU Identity + APPNP + GATv2 + Cross-Attention."""
+    """Core Libella Spatial GNN architecture with Top-K Hard Sparsity and Residual AuxK Revival."""
 
     def __init__(
         self,
@@ -41,83 +25,63 @@ class LibellaGNN(nn.Module):
         self.k_hops = getattr(cfg, "k_hops", 2)
         self.n_latents = n_metaprograms
         self.in_channels = in_channels
-        self.k = getattr(cfg, "topk_k", 3)
+        self.k = getattr(cfg, "topk_k", 6)
+        
 
-        # --- 1. Context & Identity Encoders ---
-        self.ctx_enc = nn.Sequential(
+        # 1. Identity Encoder (Self Signal)
+        self.self_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.SiLU(inplace=True),
-        )
-        self.lin_appnp = nn.Linear(self.hidden_dim, self.hidden_dim)
-
-        self.id_enc = nn.Sequential(
-            nn.Linear(in_channels, self.hidden_dim * 2),
-            nn.GLU(dim=-1),
-            nn.LayerNorm(self.hidden_dim),
-        )
-
-        # --- 2. Cross-Attention Projections with Linear-Gated Highway ---
-        self.q_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.cross_temp = nn.Parameter(torch.tensor(float(getattr(cfg, "cross_temp_init", -2.0))))
-
-        self.context_gate = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
+            nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
-        self.sp_norm = nn.LayerNorm(self.hidden_dim)
 
-        # --- 3. Dual-Stream Projections ---
-        self.mag_enc = nn.Sequential(
+        # 2. Directional Feature-Conditioned Spatial Filter
+        self.spatial_lin = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.edge_gate = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim + 1),
+            nn.Linear(self.hidden_dim + 1, self.hidden_dim),
+            nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.SiLU(inplace=True),
+        )
+
+        # 3. Output Streams
+        self.mag_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
             nn.Linear(self.hidden_dim, self.n_latents),
             nn.Softplus(beta=1.0),
         )
-
-        self.gate_spatial_proj = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(self.hidden_dim, self.n_latents),
+        self.spatial_gate_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.n_latents)
         )
         self.spatial_gain = nn.Parameter(
             torch.tensor(float(getattr(cfg, "spatial_gain_init", 1.0)))
         )
+        # Add a learnable encoder scale parameter:
+        self.enc_scale = nn.Parameter(torch.tensor(8.0))
 
-        # --- 4. Oblique Unit-Norm Decoder Dictionary ---
+        # 4. Decoder Dictionary
         if init_components is not None:
             dec_init = torch.tensor(init_components, dtype=torch.float32)
             if dec_init.shape != (self.n_latents, in_channels):
                 dec_init = torch.randn(self.n_latents, in_channels)
             dec_init = F.normalize(dec_init, p=2, dim=-1)
         else:
-            dec_init = F.normalize(torch.randn(self.n_latents, in_channels).abs() + 0.1, p=2, dim=-1)
+            dec_init = F.normalize(
+                torch.randn(self.n_latents, in_channels).abs() + 0.1, p=2, dim=-1
+            )
 
         self.decoder_weight = nn.Parameter(dec_init)
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
-        self.ambient_scale = nn.Parameter(torch.tensor(float(getattr(cfg, "ambient_scale_init", 0.50))))
+        self.ambient_scale = nn.Parameter(torch.tensor(getattr(cfg, "ambient_scale_init", 0.50)))
 
-        # Buffers and aux state tracking
+        # Buffers & Aux State Tracking
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
+        self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
         self.aux_k = getattr(cfg, "aux_k", 4)
         self.ortho_sample_size = getattr(cfg, "ortho_sample_size", min(256, self.n_latents))
-
-        self.alpha_proj = nn.Linear(self.hidden_dim, 1)
-        self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
-
-        # --- 5. Spatial GAT Components ---
-        self.gat_w_src = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.gat_w_dst = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.gat_w_edge = nn.Linear(1, self.hidden_dim, bias=True)
-        self.gat_a = nn.Linear(self.hidden_dim, 1, bias=False)
-        self.att_temp = nn.Parameter(torch.tensor(float(getattr(cfg, "att_temp_init", -2.0))))
-        self.mp_update = nn.Linear(self.hidden_dim, self.hidden_dim)
 
     def encode(
         self,
@@ -141,98 +105,61 @@ class LibellaGNN(nn.Module):
                 edge_weights = edge_weights[valid]
                 has_edges = src.numel() > 0
 
-        # 2. Depth Disentanglement
+        # 2. Depth Normalization (Conserves Total Cell Mass)
         cell_mass = torch.clamp(
             torch.linalg.vector_norm(x_dense, ord=2, dim=-1, keepdim=True), min=1e-5
         )
         x_norm = x_dense / cell_mass
 
-        h_id = self.id_enc(x_norm)
-        h_0 = self.lin_appnp(self.ctx_enc(x_norm))
+        # 3. Self Feature Extraction
+        h_self = self.self_enc(x_norm)
 
-        # 3. Bilateral Edge Decay (Hard Boundary Cutoff)
+        # 4. Bilateral Edge Filtering (Hard Cutoff for V1 Sharpness)
         if has_edges:
             with torch.no_grad():
-                cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1)
+                cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
+                # Hard Bilateral Cutoff: Zero out edges across sharp transcriptomic boundaries (< 0.45)
                 edge_sim_thresh = float(getattr(cfg, "edge_sim_threshold", 0.45))
                 edge_mask = (cos_sim > edge_sim_thresh).to(dtype=x_dense.dtype)
-                decay = torch.sigmoid((cos_sim - edge_sim_thresh) * getattr(cfg, "edge_decay_slope", 15.0)) * edge_mask
-            W_bil = edge_weights * decay
-        else:
-            W_bil = edge_weights
+                decay = torch.sigmoid(
+                    (cos_sim - edge_sim_thresh) * getattr(cfg, "edge_decay_slope", 15.0)
+                ) * edge_mask
 
-        # 4. K-Hop GATv2 Message Passing Loop with APPNP Teleport
-        alpha = (
-            torch.sigmoid(self.alpha_proj(h_0)) * getattr(cfg, "appnp_alpha_scale", 0.85)
-            + getattr(cfg, "appnp_alpha_offset", 0.10)
+                deg = torch.zeros((N, 1), dtype=x_dense.dtype, device=x_dense.device)
+                deg.index_add_(0, dst, torch.ones((dst.size(0), 1), dtype=x_dense.dtype, device=x_dense.device))
+                edge_norm = torch.rsqrt(torch.clamp(deg[src], min=1.0)) * torch.rsqrt(torch.clamp(deg[dst], min=1.0))
+
+            W_bil = edge_weights.unsqueeze(1) * decay
+            gate = torch.sigmoid(self.edge_gate(torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)))
+
+            h_sp = h_self
+            for _ in range(self.k_hops):
+                msg = self.spatial_lin(h_sp)[src] * gate * edge_norm
+                h_sp = h_sp + F.silu(torch.zeros_like(h_sp).index_add_(0, dst, msg))
+        else:
+            h_sp = h_self
+
+        # 5. APPNP Teleport Identity Anchor (85% Self + 15% Spatial Context)
+        alpha_teleport = float(getattr(cfg, "appnp_alpha", 0.85))
+        h_fused = F.layer_norm(
+            alpha_teleport * h_self + (1.0 - alpha_teleport) * h_sp, [self.hidden_dim]
         )
-        inv_alpha = 1.0 - alpha
-        h_0_scaled = h_0 * alpha
 
-        gat_temp_scale = torch.clamp(1.0 / (F.softplus(self.att_temp) + 1e-4), max=10.0)
-        h_ctx = h_0
-
-        for _ in range(self.k_hops):
-            out = torch.zeros_like(h_ctx)
-            if has_edges:
-                h_src_proj = self.gat_w_src(h_ctx)
-                h_dst_proj = self.gat_w_dst(h_ctx)
-                edge_proj = self.gat_w_edge(W_bil.unsqueeze(1))
-                h_edge = h_src_proj[src] + h_dst_proj[dst] + edge_proj
-
-                e_raw = self.gat_a(F.leaky_relu(h_edge, negative_slope=0.2)).squeeze(-1)
-                alpha_att = scatter_softmax(e_raw * gat_temp_scale, dst, N)
-
-                msg = h_ctx[src] * alpha_att.unsqueeze(1)
-                out.index_add_(0, dst, msg)
-
-            agg = F.silu(self.mp_update(out))
-            h_ctx = agg * inv_alpha + h_0_scaled
-
-        # 5. Cross-Attention Highway
-        Q = self.q_proj(h_id)
-        K = self.k_proj(h_ctx)
-        V = self.v_proj(h_ctx)
-
-        if has_edges:
-            Q_norm = F.normalize(Q, p=2, dim=-1)
-            K_norm = F.normalize(K, p=2, dim=-1)
-            cross_temp_scale = torch.clamp(1.0 / (F.softplus(self.cross_temp) + 1e-4), max=10.0)
-            cross_scores = (Q_norm[dst] * K_norm[src]).sum(dim=-1) * cross_temp_scale
-            cross_att = scatter_softmax(cross_scores, dst, N)
-            
-            pulled_msg = (V[src] * cross_att.unsqueeze(1)).contiguous()
-            ctx_pulled = torch.zeros_like(Q)
-            ctx_pulled.index_add_(0, dst, pulled_msg)
-        else:
-            ctx_pulled = V
-
-        # 6. Dual-Stream Feature Fusion
-        h_id_norm = self.sp_norm(h_id)
-        ctx_norm = F.layer_norm(ctx_pulled, [self.hidden_dim])
-        gate_coeff = torch.sigmoid(self.context_gate(ctx_norm))
-        h_final = (1.0 - 0.5 * gate_coeff) * h_id_norm + (1.0 + 0.5 * gate_coeff) * ctx_norm
-        h_norm = F.normalize(h_final, p=2, dim=-1)
-
-        # 7. Latent Pre-Activations (Clean Zero-Floor Formulation)
-        z_mag = self.mag_enc(h_norm)
+        # Scale the raw cosine similarity into real projection amplitudes:
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        bio_sim = F.linear(x_norm, w_dec_norm)
-        spatial_shift = self.gate_spatial_proj(h_norm)
+        bio_sim = F.linear(x_norm, w_dec_norm) * F.softplus(self.enc_scale)
+        spatial_logits = self.spatial_gate_head(h_fused)
 
-        progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
-        spatial_warmup = min(1.0, progress * 2.0)
+        raw_acts = F.relu(bio_sim + spatial_logits)
 
-        # Rectified affinity: Irrelevant latents land strictly at 0.0
-        raw_affinity = F.relu(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
-        pre_acts = raw_affinity * z_mag
+        # 7. Top-K Hard Sparsity
+        target_k = getattr(self, "current_k", max(6, self.k))
+        topk_vals, topk_indices = torch.topk(raw_acts, k=target_k, dim=-1)
+        
+        z_sparse = torch.zeros_like(raw_acts).scatter_(-1, topk_indices, topk_vals)
 
-        # 8. Top-K Hard Sparsity Operator
-        target_k = getattr(self, "current_k", self.k)
-        topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
-        z_sparse = torch.zeros_like(pre_acts).scatter_(-1, topk_indices, topk_vals)
-
-        return z_sparse, pre_acts, cell_mass, z_mag
+        # Return raw_acts as the last tuple item so telemetry tracking z_mag doesn't crash
+        return z_sparse, raw_acts, cell_mass, raw_acts
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -241,7 +168,7 @@ class LibellaGNN(nn.Module):
         dead_mask: torch.Tensor,
         optimizer: torch.optim.Optimizer | None = None,
     ) -> int:
-        """Resamples dead atoms with Gram-Schmidt orthogonalization against active dictionary."""
+        """Resamples dead atoms with Gram-Schmidt orthogonalization to prevent cloning."""
         if not dead_mask.any():
             return 0
 
@@ -256,6 +183,7 @@ class LibellaGNN(nn.Module):
         worst_cells = torch.topk(cell_res_energy, k=k_resample, dim=0).indices
         target_dead_ids = dead_indices[:k_resample]
 
+        # In-place noise injection to prevent allocation thrashing
         candidates = r_pos[worst_cells].clone()
         noise = torch.randn_like(candidates) * 0.02
         candidates = F.relu(candidates.add_(noise))
@@ -263,6 +191,7 @@ class LibellaGNN(nn.Module):
         healthy_mask = ~dead_mask
         if healthy_mask.any():
             w_healthy = F.normalize(self.decoder_weight.data[healthy_mask], p=2, dim=-1)
+            # Direct GEMM without explicit transpose view allocations
             proj = F.linear(candidates, w_healthy)
             candidates = F.relu(candidates - torch.mm(proj, w_healthy))
 
@@ -303,10 +232,11 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        # 1. Spatial & Identity Encoding
         z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        # Baseline Decoupling (Strict 15% Cap so Sparse Latents Reconstruct Signal)
+        # 2. Baseline Decoupling (Strict 15% Cap so Sparse Latents DO the reconstruction work)
         baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
         ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.15)
 
@@ -318,12 +248,13 @@ class LibellaGNN(nn.Module):
         r_pos_ret = None
         dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
 
+        # 3. Auxiliary Loss & Dead Latent Tracking (Training Only)
         if self.training:
             with torch.no_grad():
                 active_in_batch = (z > 1e-4).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
-                dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
+                dead_mask_ret = self.steps_since_active >= getattr(self, "dead_step_threshold", 20)
 
             x_norm = F.normalize(x_dense, p=2, dim=-1)
             x_recon_norm = F.normalize(F.relu(x_recon), p=2, dim=-1)
@@ -332,6 +263,7 @@ class LibellaGNN(nn.Module):
             r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
             residual_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1).mean()
 
+            # Exact dual-gate AuxK condition
             if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
                 dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
                 num_dead = dead_indices.numel()
@@ -341,15 +273,11 @@ class LibellaGNN(nn.Module):
                 aux_sim = F.relu(F.linear(r_norm, w_dead))
                 topk_res = torch.topk(aux_sim, k=k_aux, dim=-1)
 
-                dead_mag = z_mag[:, dead_indices]
-                topk_mag = torch.gather(dead_mag, -1, topk_res.indices)
-
-                z_aux_weights = topk_res.values * topk_mag
-                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, z_aux_weights)
+                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, topk_res.values)
                 aux_recon = torch.mm(z_aux, w_dead)
 
         return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag, r_pos_ret, dead_mask_ret
-
+        
     def calc_loss(
         self,
         recon_x: torch.Tensor,
@@ -366,11 +294,11 @@ class LibellaGNN(nn.Module):
         is_non_zero = x_true > 0
         num_pos = torch.clamp(is_non_zero.sum().to(dtype=x_true.dtype), min=1.0)
         num_zeros = (x_true == 0).sum().to(dtype=x_true.dtype)
-        current_dynamic_w = torch.clamp((num_zeros / num_pos).detach(), min=1.0, max=5.0)
+        current_dynamic_w = (num_zeros / num_pos).detach()
 
         if self.training:
             self.dynamic_w_ema.lerp_(
-                current_dynamic_w, weight=getattr(cfg, "dynamic_w_ema_weight", 0.05)
+                current_dynamic_w, weight=getattr(cfg, "dynamic_w_ema_weight", 0.10)
             )
 
         w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
@@ -378,14 +306,16 @@ class LibellaGNN(nn.Module):
         variance_weight = variance_weight / torch.clamp(variance_weight.mean(), min=1e-5)
 
         raw_delta = recon_x - x_true
-        asym_penalty = getattr(cfg, "asym_penalty_weight", 0.5)
+        asym_penalty = getattr(cfg, "asym_penalty_weight", 0.50)
         asym_factor = 1.0 + (is_non_zero.to(x_true.dtype) * asym_penalty) * (raw_delta < 0).to(x_true.dtype)
 
         scaled_delta = raw_delta * asym_factor
+
+        # Numerically stable, overflow-proof Log-Cosh implementation:
+        # log(cosh(u)) = |u| + softplus(-2|u|) - log(2)
         abs_delta = scaled_delta.abs()
         log_cosh_delta = abs_delta + F.softplus(-2.0 * abs_delta) - 0.6931471805599453
 
-        # Correct Per-Cell Scaling: Average over cells divided by sqrt(D)
         per_cell_loss = torch.sum(variance_weight * log_cosh_delta, dim=-1)
         l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
 
@@ -393,18 +323,18 @@ class LibellaGNN(nn.Module):
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
         off_diag = gram * self.ortho_mask
 
-        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.40)
+        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
         excess_corr = F.relu(off_diag - ortho_thresh)
         num_violating = torch.clamp((excess_corr > 0).sum().to(dtype=x_true.dtype), min=1.0)
         l_ortho_mean = excess_corr.pow(2).sum() / num_violating
 
         max_corr = off_diag.max()
-        l_ortho_max = F.relu(max_corr - 0.55).pow(2) * 50.0
+        l_ortho_max = F.relu(max_corr - 0.50).pow(2) * 50.0
         l_ortho = l_ortho_mean + l_ortho_max
 
         l_sparse = torch.tensor(0.0, device=x_true.device)
 
-        # 3. Normalized Residual Alignment (AuxK)
+        # 3. Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
             aux_error = (aux_recon - r_norm).pow(2).sum(dim=-1).mean()
@@ -412,8 +342,8 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        base_ortho = getattr(cfg, "ortho_weight", 0.50)
-        ortho_min = getattr(cfg, "ortho_min_scale", 0.20)
+        base_ortho = getattr(cfg, "ortho_weight", 8.0)
+        ortho_min = getattr(cfg, "ortho_min_scale", 0.50)
         current_ortho = base_ortho * (ortho_min + (1.0 - ortho_min) * progress)
         aux_weight = getattr(cfg, "aux_weight", 0.50)
 
@@ -423,43 +353,64 @@ class LibellaGNN(nn.Module):
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
-        """Harvests telemetry: parameter/gradient norms, SVD spectrum, effective rank, and correlation."""
+        """Harvests parameter/gradient norms and SVD spectrum with minimal host syncs."""
         stats: dict[str, float] = {}
-        total_g_norm_sq = 0.0
+        
+        # 1. Vectorized Parameter & Gradient Norm Extraction
+        param_items = list(self.named_parameters())
+        p_names = [name.replace(".", "/") for name, _ in param_items]
+        
+        # Calculate L2 norms on GPU
+        p_norms = torch.stack([torch.linalg.vector_norm(p.detach(), ord=2) for _, p in param_items])
+        
+        g_tensors = [p.grad.detach() for _, p in param_items if p.grad is not None]
+        g_indices = [i for i, (_, p) in enumerate(param_items) if p.grad is not None]
+        
+        if g_tensors:
+            g_norms = torch.stack([torch.linalg.vector_norm(g, ord=2) for g in g_tensors])
+            g_zero_pcts = torch.stack([(g == 0).float().mean() * 100.0 for g in g_tensors])
+            total_g_norm = torch.linalg.vector_norm(g_norms, ord=2)
+            
+            # Single host transfer for all gradient statistics
+            g_norms_host = g_norms.cpu().tolist()
+            g_zeros_host = g_zero_pcts.cpu().tolist()
+            stats["grad_norm/global_l2"] = total_g_norm.item()
+            
+            for idx, g_idx in enumerate(g_indices):
+                clean_name = p_names[g_idx]
+                stats[f"grad_norm/{clean_name}"] = g_norms_host[idx]
+                stats[f"grad_zeros/{clean_name}_pct"] = g_zeros_host[idx]
+        else:
+            stats["grad_norm/global_l2"] = 0.0
 
-        for name, param in self.named_parameters():
-            p_clean = name.replace(".", "/")
-            stats[f"param_norm/{p_clean}"] = float(torch.linalg.vector_norm(param.detach(), ord=2).item())
-            if param.grad is not None:
-                g_norm = float(torch.linalg.vector_norm(param.grad.detach(), ord=2).item())
-                total_g_norm_sq += g_norm**2
-                stats[f"grad_norm/{p_clean}"] = g_norm
-                stats[f"grad_zeros/{p_clean}_pct"] = float(
-                    (param.grad == 0).float().mean().item() * 100.0
-                )
+        p_norms_host = p_norms.cpu().tolist()
+        for idx, clean_name in enumerate(p_names):
+            stats[f"param_norm/{clean_name}"] = p_norms_host[idx]
 
-        stats["grad_norm/global_l2"] = total_g_norm_sq**0.5
-
+        # 2. Dictionary Cross-Correlation & Spectral Analysis
         if hasattr(self, "decoder_weight"):
             w = F.normalize(self.decoder_weight, p=2, dim=1)
             sim = torch.mm(w, w.t())
             off_diag_mask = ~torch.eye(w.size(0), dtype=torch.bool, device=w.device)
             off_diag_vals = sim.masked_select(off_diag_mask)
+            
             if off_diag_vals.numel() > 0:
-                stats["dict/max_cross_corr"] = float(off_diag_vals.max().item())
-                stats["dict/mean_cross_corr"] = float(off_diag_vals.abs().mean().item())
+                stats["dict/max_cross_corr"] = off_diag_vals.max().item()
+                stats["dict/mean_cross_corr"] = off_diag_vals.abs().mean().item()
 
+            # Offload SVD computation to CPU float32 without blocking the GPU stream
             w_cpu = w.detach().to(device="cpu", dtype=torch.float32)
             s = torch.linalg.svdvals(w_cpu)
             eff_rank = (s.sum() ** 2) / torch.clamp((s**2).sum(), min=1e-9)
-            stats["dict/effective_rank"] = float(eff_rank.item())
-            stats["dict/svd_sigma_1"] = float(s[0].item())
-            stats["dict/svd_sigma_2"] = float(s[1].item()) if s.numel() > 1 else 0.0
-            stats["dict/svd_sigma_3"] = float(s[2].item()) if s.numel() > 2 else 0.0
+            stats["dict/effective_rank"] = eff_rank.item()
+            stats["dict/svd_sigma_1"] = s[0].item()
+            stats["dict/svd_sigma_2"] = s[1].item() if s.numel() > 1 else 0.0
+            stats["dict/svd_sigma_3"] = s[2].item() if s.numel() > 2 else 0.0
 
+        # 3. Ambient Scale & Dead Latent Counters
         if hasattr(self, "ambient_scale"):
-            lr_mult = float(getattr(cfg, "ambient_lr_mult", 1.0))
-            max_cap = float(getattr(cfg, "ambient_max_cap", 0.15))
+            lr_mult = getattr(cfg, "ambient_lr_mult", 1.0)
+            max_cap = getattr(cfg, "ambient_max_cap", 0.35)
             amb_pct = torch.sigmoid(self.ambient_scale * lr_mult).item() * max_cap * 100.0
             stats["model/ambient_absorption_pct"] = amb_pct
 
