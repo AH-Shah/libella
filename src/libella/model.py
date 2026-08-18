@@ -37,8 +37,10 @@ class LibellaGNN(nn.Module):
         # 2. Directional Feature-Conditioned Spatial Filter
         self.spatial_lin = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.edge_gate = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim + 1),
             nn.Linear(self.hidden_dim + 1, self.hidden_dim),
-            nn.Sigmoid(),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
         # 3. Output Streams
@@ -120,7 +122,7 @@ class LibellaGNN(nn.Module):
 
             W_bil = edge_weights.unsqueeze(1) * decay
             gate_in = torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)
-            gate = self.edge_gate(gate_in)
+            gate = torch.sigmoid(self.edge_gate(gate_in))
 
             # 5. Selective Graph Message Passing (Autograd-Isolated per Hop)
             h_sp = h_self
