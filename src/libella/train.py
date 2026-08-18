@@ -344,8 +344,9 @@ def _train_loop(
                 base_sparse_val = loss_res[3]
                 base_aux_val = loss_res[4]
 
-                if math.isnan(final_train_loss) or math.isinf(final_train_loss):
-                    print(f"\n ↳ [!] NaN detected at Epoch {epoch}. Halting.")
+                if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
+                    print(f"\n ↳ [!] NaN/Inf loss detected at Epoch {epoch}, Step {step}. Halting.")
+                    nan_detected = True
                     break
 
                 (true_batch_loss / len(meta_meta)).backward()
