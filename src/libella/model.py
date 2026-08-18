@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 from .config import cfg
 from .utils import PhaseTracker, scatter_softmax
@@ -155,10 +156,10 @@ class LibellaGNN(nn.Module):
                 h_dst_proj = self.gat_w_dst(h_ctx)
                 edge_proj = self.gat_w_edge(W_bil.unsqueeze(1))
                 h_edge = h_src_proj[src] + h_dst_proj[dst] + edge_proj
-
                 e_raw = self.gat_a(F.leaky_relu(h_edge, negative_slope=0.2)).squeeze(-1)
-                alpha_att = scatter_softmax(e_raw * gat_temp_scale, dst, N)
-
+                # Scale by sqrt(d_k) rather than tiny softplus parameter
+                scale_dim = math.sqrt(self.hidden_dim)
+                alpha_att = scatter_softmax(e_raw / scale_dim, dst, N)
                 msg = h_ctx[src] * alpha_att.unsqueeze(1)
                 out.index_add_(0, dst, msg)
 
@@ -171,10 +172,8 @@ class LibellaGNN(nn.Module):
         V = self.v_proj(h_ctx)
 
         if len(src) > 0:
-            Q_norm = F.normalize(Q, p=2, dim=-1)
-            K_norm = F.normalize(K, p=2, dim=-1)
-            cross_temp_scale = 1.0 / (F.softplus(self.cross_temp) + 1e-4)
-            cross_scores = (Q_norm[dst] * K_norm[src]).sum(dim=-1) * cross_temp_scale
+            Q_scaled = Q / math.sqrt(self.hidden_dim)
+            cross_scores = (Q_scaled[dst] * K[src]).sum(dim=-1)
             cross_att = scatter_softmax(cross_scores, dst, N)
             pulled_msg = (V[src] * cross_att.unsqueeze(1)).contiguous()
             ctx_pulled = torch.zeros_like(Q)

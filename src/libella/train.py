@@ -170,13 +170,12 @@ def _init_model(
         if not any(k in n for k in ["decoder_", "ambient_scale", "att_temp", "cross_temp", "spatial_gain"])
     ]
 
-    # 2. Optimizer parameter groups
     lr_base = getattr(cfg, "lr_base", 1e-3)
     optimizer = torch.optim.AdamW([
-        {"params": base_params, "lr": lr_base, "weight_decay": getattr(cfg, "wd_base", 1e-4)},
-        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base), "weight_decay": 0.0},
+        {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},  # 2x LR for GNN
+        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0}, # 0.5x LR for Dictionary
         {"params": bias_ambient_params, "lr": lr_base * getattr(cfg, "ambient_lr_mult", 5.0), "weight_decay": 0.0},
-        {"params": temp_routing_params, "lr": getattr(cfg, "lr_temperature", lr_base), "weight_decay": 0.0},
+        {"params": temp_routing_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
     ])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=getattr(cfg, "epochs", 100), eta_min=getattr(cfg, "lr_min", 1e-6)
