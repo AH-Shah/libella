@@ -90,7 +90,7 @@ class LibellaGNN(nn.Module):
         N = x_dense.size(0)
         has_edges = src.numel() > 0
 
-        # 1. Bounds Guard & Alignment
+        # 1. Bounds Guard & Alignment for MPS
         if has_edges:
             src = src.to(dtype=torch.int64).contiguous()
             dst = dst.to(dtype=torch.int64).contiguous()
@@ -102,7 +102,7 @@ class LibellaGNN(nn.Module):
                 edge_weights = edge_weights[valid]
                 has_edges = src.numel() > 0
 
-        # 2. Depth Normalization
+        # 2. Depth Normalization (Conserves Total Cell Mass)
         cell_mass = torch.clamp(
             torch.linalg.vector_norm(x_dense, ord=2, dim=-1, keepdim=True), min=1e-5
         )
@@ -147,7 +147,7 @@ class LibellaGNN(nn.Module):
         bio_sim = F.linear(x_norm, w_dec_norm)
         spatial_logits = self.spatial_gate_head(h_fused)
 
-        # Clean ReLU floor. Network learns to scale spatial_logits to match reconstruction magnitude.
+        # Clean ReLU floor. Network backprop will scale spatial_logits naturally to reconstruct x_norm.
         raw_acts = F.relu(bio_sim + spatial_logits)
 
         # 7. Top-K Hard Sparsity
@@ -156,7 +156,7 @@ class LibellaGNN(nn.Module):
         
         z_sparse = torch.zeros_like(raw_acts).scatter_(-1, topk_indices, topk_vals)
 
-        # Return raw_acts as the last tuple item so telemetry doesn't crash on missing mag_head
+        # Return raw_acts as the last tuple item so telemetry tracking z_mag doesn't crash
         return z_sparse, raw_acts, cell_mass, raw_acts
 
     @torch.no_grad()
@@ -230,10 +230,11 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        # 1. Spatial & Identity Encoding
         z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        # Baseline Decoupling (Strict 15% Cap so Sparse Latents DO the work)
+        # 2. Baseline Decoupling (Strict 15% Cap so Sparse Latents DO the reconstruction work)
         baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
         ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.15)
 
@@ -245,7 +246,7 @@ class LibellaGNN(nn.Module):
         r_pos_ret = None
         dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
 
-        # Auxiliary Loss & Dead Latent Tracking
+        # 3. Auxiliary Loss & Dead Latent Tracking (Training Only)
         if self.training:
             with torch.no_grad():
                 active_in_batch = (z > 1e-4).any(dim=0)
