@@ -148,8 +148,9 @@ class LibellaGNN(nn.Module):
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         spatial_warmup = 0.20 + 0.80 * min(1.0, progress * 2.0)
 
-        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
-        pre_acts = raw_affinity * z_mag
+        # Clean Linear Pre-activation: Irrelevant latents land <= 0
+        raw_logits = bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift)
+        pre_acts = F.relu(raw_logits)
 
         # 8. Top-K Hard Sparsity
         target_k = getattr(self, "current_k", self.k)
