@@ -385,7 +385,7 @@ def _train_loop(
                 train_chunk_count += 1
                 del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, true_batch_loss
 
-                # Validation Evaluation
+                # --- Optimized Validation Evaluation ---
                 val_core_idx_cpu = batch.get("val_core_idx")
                 if val_core_idx_cpu is not None and val_core_idx_cpu.numel() > 0:
                     val_idx = val_core_idx_cpu.to(device=device, non_blocking=True)
@@ -404,16 +404,19 @@ def _train_loop(
                         raw_delta_val = val_recon - x_val
                         asym_penalty = getattr(cfg, "asym_penalty_weight", 0.5)
                         asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * asym_penalty) * (raw_delta_val < 0).to(x_val.dtype)
-                        delta_clamp = getattr(cfg, "delta_clamp", 30.0)
-                        scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-delta_clamp, max=delta_clamp)
+                        scaled_delta_val = raw_delta_val * asym_val
 
-                        per_cell_val = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)), dim=-1)
+                        # Numerically stable, overflow-proof softplus Log-Cosh (identical math)
+                        abs_delta_val = scaled_delta_val.abs()
+                        log_cosh_val = abs_delta_val + F.softplus(-2.0 * abs_delta_val) - 0.6931471805599453
+
+                        per_cell_val = torch.sum(variance_weight_val * log_cosh_val, dim=-1)
                         val_log_cosh = torch.mean(per_cell_val) / math.sqrt(x_val.shape[-1])
 
-                        val_loss_acc += val_log_cosh.detach()
+                        val_loss_acc += val_log_cosh
                         val_steps += 1
 
-                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
+                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, per_cell_val, log_cosh_val
 
                 del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm
 
