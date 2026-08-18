@@ -290,51 +290,34 @@ class LibellaGNN(nn.Module):
         ghost_weights: torch.Tensor | None = None,
         progress: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
-        is_non_zero = x_true > 0
-        num_pos = torch.clamp(is_non_zero.sum().to(dtype=x_true.dtype), min=1.0)
-        num_zeros = (x_true == 0).sum().to(dtype=x_true.dtype)
-        current_dynamic_w = (num_zeros / num_pos).detach()
+        # 1. Depth-Normalized Reconstruction (Eliminates the 1800-Loss Dropout Trap)
+        cell_mass = torch.clamp(
+            torch.linalg.vector_norm(x_true, ord=2, dim=-1, keepdim=True), min=1e-5
+        )
+        x_norm = x_true / cell_mass
+        recon_norm = recon_x / cell_mass
 
-        if self.training:
-            self.dynamic_w_ema.lerp_(
-                current_dynamic_w, weight=getattr(cfg, "dynamic_w_ema_weight", 0.10)
-            )
-
-        w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
-        variance_weight = w_mat * (1.0 + torch.log1p(x_true))
-        variance_weight = variance_weight / torch.clamp(variance_weight.mean(), min=1e-5)
-
-        raw_delta = recon_x - x_true
-        asym_penalty = getattr(cfg, "asym_penalty_weight", 0.50)
-        asym_factor = 1.0 + (is_non_zero.to(x_true.dtype) * asym_penalty) * (raw_delta < 0).to(x_true.dtype)
-
-        scaled_delta = raw_delta * asym_factor
-
-        # Numerically stable, overflow-proof Log-Cosh implementation:
-        # log(cosh(u)) = |u| + softplus(-2|u|) - log(2)
-        abs_delta = scaled_delta.abs()
-        log_cosh_delta = abs_delta + F.softplus(-2.0 * abs_delta) - 0.6931471805599453
-
-        per_cell_loss = torch.sum(variance_weight * log_cosh_delta, dim=-1)
-        l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
+        # Cosine / Normalized MSE loss directly targeting biological variance:
+        # Scale: Loss is 1.0 when z=0, and approaches 0.0 as reconstruction improves
+        mse_loss = F.mse_loss(recon_norm, x_norm, reduction="none").sum(dim=-1)
+        cos_sim = (recon_norm * x_norm).sum(dim=-1)
+        
+        # Combined Pearson-Cosine Reconstruction Objective
+        per_cell_recon = mse_loss + 2.0 * (1.0 - cos_sim)
+        l_recon = torch.mean(per_cell_recon)
 
         # 2. Strict Orthogonality Barrier
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
         off_diag = gram * self.ortho_mask
 
-        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
+        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.40)
         excess_corr = F.relu(off_diag - ortho_thresh)
-        num_violating = torch.clamp((excess_corr > 0).sum().to(dtype=x_true.dtype), min=1.0)
-        l_ortho_mean = excess_corr.pow(2).sum() / num_violating
+        num_violating = torch.clamp((excess_corr > 0).float().sum(), min=1.0)
+        l_ortho = excess_corr.pow(2).sum() / num_violating
 
-        max_corr = off_diag.max()
-        l_ortho_max = F.relu(max_corr - 0.50).pow(2) * 50.0
-        l_ortho = l_ortho_mean + l_ortho_max
-
+        # 3. Sparsity & Auxiliary Loss
         l_sparse = torch.tensor(0.0, device=x_true.device)
 
-        # 3. Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
             aux_error = (aux_recon - r_norm).pow(2).sum(dim=-1).mean()
@@ -342,12 +325,9 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        base_ortho = getattr(cfg, "ortho_weight", 8.0)
-        ortho_min = getattr(cfg, "ortho_min_scale", 0.50)
-        current_ortho = base_ortho * (ortho_min + (1.0 - ortho_min) * progress)
-        aux_weight = getattr(cfg, "aux_weight", 0.50)
-
-        total_loss = l_recon + (current_ortho * l_ortho) + (aux_weight * l_aux)
+        # 4. Total Loss Combination
+        base_ortho = getattr(cfg, "ortho_weight", 0.50)
+        total_loss = l_recon + (base_ortho * l_ortho) + (0.50 * l_aux)
 
         return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
 
