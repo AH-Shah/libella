@@ -88,12 +88,12 @@ from .config import cfg
 
 
 class PhaseTracker:
-    """Multi-Objective Adaptive Phase and Elastic Sparsity Governor.
+    """Coordinates training horizons, spatial warmup, and Pareto early stopping.
     
     Coordinates:
-      - Phase 1: Manifold discovery with guaranteed biological runway.
-      - Phase 2: Dynamic elastic Pareto squeeze governor.
-      - Centralized schedule generation (Alpha, Temperature, Scale, L1, Warmup).
+      - Phase 1: Unconstrained manifold alignment & biological discovery.
+      - Phase 2: Spatial routing consolidation & orthogonal regularization.
+      - Centralized schedule generation (spatial warmup, early stopping).
     """
 
     def __init__(
@@ -105,31 +105,34 @@ class PhaseTracker:
         self.total_epochs: int = max(1, total_epochs)
         self.rel_tolerance: float = rel_tolerance
 
-        # --- Phase 1 Horizons (Prevents premature exit at Epoch 3) ---
+        # --- Phase 1 Horizons ---
         self.min_p1_epochs: int = max(
-            getattr(cfg, "min_p1_epochs", 8),
-            int(self.total_epochs * getattr(cfg, "p1_min_ratio", 0.16))
+            getattr(cfg, "min_p1_epochs", 6),
+            int(self.total_epochs * getattr(cfg, "p1_min_ratio", 0.12)),
         )
         self.max_p1_epochs: int = max(
             self.min_p1_epochs + 2,
-            int(self.total_epochs * getattr(cfg, "p1_max_ratio", 0.30))
+            int(self.total_epochs * getattr(cfg, "p1_max_ratio", 0.25)),
         )
         self.p1_plateau_patience: int = 3
         self.p1_plateau_count: int = 0
 
         # --- Window & Horizon Sizing ---
-        self.cycle_window: int = max(3, int(self.total_epochs * getattr(cfg, "tracker_window_ratio", 0.08)))
-        self.patience_epochs: int = max(5, int(self.total_epochs * getattr(cfg, "patience_ratio", 0.12)))
+        self.cycle_window: int = max(
+            3, int(self.total_epochs * getattr(cfg, "tracker_window_ratio", 0.08))
+        )
+        self.patience_epochs: int = max(
+            5, int(self.total_epochs * getattr(cfg, "patience_ratio", 0.12))
+        )
 
         # --- Histories & Baselines ---
         self.rec_history: list[float] = []
         self.val_history: list[float] = []
-        self.l0_history: list[float] = []
 
         self.best_rec_loss: float = float("inf")
         self.best_val_loss: float = float("inf")
         self.best_composite_score: float = float("inf")
-        self.p1_baseline_rec: float | None = None
+        self.p1_baseline_rec: float = 0.0
         self.p2_start_epoch: int = 0
 
         # --- Dynamic Governor State ---
@@ -137,21 +140,13 @@ class PhaseTracker:
         self.breathing_cooldown: int = 0
         self.no_improve_count: int = 0
 
-        # Target Sparsity Range
-        self.target_l0_min: float = getattr(cfg, "target_l0_min", 4.0)
-        self.target_l0_max: float = getattr(cfg, "target_l0_max", 7.0)
-
-        # Telemetry Cache
+        # --- Schedule State ---
         self._progress: float = 0.0
-        self.alpha: float = getattr(cfg, "alpha_start", 1.15)
-        self.temp: float = getattr(cfg, "temp_start", 1.0)
-        self.scale: float = getattr(cfg, "scale_start", 2.0)
-        self.spatial_warmup: float = 0.0
-        self.sparsity_multiplier: float = getattr(cfg, "sparsity_min_scale", 0.05)
+        self.spatial_warmup: float = 0.10
 
     @staticmethod
     def _fit_ols(series: list[float]) -> tuple[float, float, float]:
-        """Calculates slope, mean, and residual standard deviation with zero-division guards."""
+        """Calculates trend slope, mean, and residual standard deviation."""
         n = len(series)
         if n < 3:
             return 0.0, float(series[-1]) if series else 0.0, 0.01
@@ -176,57 +171,46 @@ class PhaseTracker:
         """Returns smooth Cosine S-curve progress in [0.0, 1.0]."""
         if self.phase == 1:
             return 0.0
-        return 0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure))))
+        return float(0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure)))))
 
     def _update_schedules(self, epoch: int) -> None:
-        """Computes coordinated schedules across all model components."""
+        """Updates spatial warmup schedule based on phase and progress."""
         self._progress = self.get_progress()
 
-        # 1. Entmax Curvature Schedule (Smooth 1.15 -> 1.45 annealing)
-        a_start = getattr(cfg, "alpha_start", 1.15)
-        a_end = getattr(cfg, "alpha_end", 1.45)
-        self.alpha = float(a_start + (a_end - a_start) * (self._progress ** 1.0))
-
-        # 2. Gating Scale Schedule (Bounded 2.0 -> 8.0 to prevent 1-hot snapping)
-        s_start = getattr(cfg, "scale_start", 2.0)
-        s_end = getattr(cfg, "scale_end", 8.0)
-        self.scale = float(s_start + (s_end - s_start) * (self._progress ** 1.0))
-
-        # 3. Softmax Temperature Annealing (1.0 -> 0.10)
-        t_start = getattr(cfg, "temp_start", 1.0)
-        t_end = getattr(cfg, "temp_end", 0.10)
-        self.temp = float(t_start + (t_end - t_start) * self._progress)
-
-        # 4. Spatial Logit Warmup (Linear exploration during Phase 1 -> Full in Phase 2)
         if self.phase == 1:
-            self.spatial_warmup = min(1.0, float(epoch + 1) / max(1, self.min_p1_epochs))
+            # Baseline linear ramp from 0.10 to 0.50 during Phase 1 exploration
+            p1_fraction = min(1.0, float(epoch + 1) / max(1, self.min_p1_epochs))
+            self.spatial_warmup = 0.10 + 0.40 * p1_fraction
         else:
-            self.spatial_warmup = 1.0
+            # Smoothly transition from 0.50 to 1.0 based on S-curve progress
+            self.spatial_warmup = 0.50 + 0.50 * self._progress
 
-        # 5. Sparsity L1 Multiplier
-        s_min = getattr(cfg, "sparsity_min_scale", 0.05)
-        p_pow = getattr(cfg, "sparsity_prog_pow", 1.2)
-        self.sparsity_multiplier = float(s_min + (1.0 - s_min) * (self._progress ** p_pow))
+    def step(
+        self,
+        epoch_telemetry: dict[str, float],
+        epoch: int,
+        val_loss: float | None = None,
+    ) -> bool:
+        """Evaluates epoch telemetry, updates governor pressure, and checks early stopping.
 
-    def step(self, epoch_telemetry: dict[str, float], epoch: int, val_loss: float | None = None) -> bool:
-        """Evaluates epoch telemetry, adjusting governor pressure dynamically.
-        
         Returns:
-            bool: True if Pareto optimal convergence is reached (Early Stop).
+            bool: True if Pareto optimal convergence is reached (Early Termination).
         """
         current_rec = float(epoch_telemetry.get("l_rec", 0.0))
         current_val = float(val_loss if val_loss is not None else current_rec)
-        current_l0 = float(epoch_telemetry.get("l0_avg", float(getattr(cfg, "n_latents", 36))))
-        max_corr = float(epoch_telemetry.get("dict/max_cross_corr", epoch_telemetry.get("d_max_cross_corr", 0.0)))
+        max_corr = float(
+            epoch_telemetry.get(
+                "dict/max_cross_corr",
+                epoch_telemetry.get("d_max_cross_corr", 0.0),
+            )
+        )
 
         self.rec_history.append(current_rec)
         self.val_history.append(current_val)
-        self.l0_history.append(current_l0)
 
         if self.phase == 2 and current_rec < self.best_rec_loss:
             self.best_rec_loss = current_rec
 
-        # Maintain internal dynamic schedules
         self._update_schedules(epoch)
 
         if len(self.rec_history) < self.cycle_window:
@@ -236,19 +220,17 @@ class PhaseTracker:
         rec_slope, rec_mu, rec_sigma = self._fit_ols(window_rec)
 
         # =============================================================
-        # PHASE 1: Manifold Discovery with Guaranteed Biological Runway
+        # PHASE 1: Manifold Alignment & Plateau Discovery
         # =============================================================
         if self.phase == 1:
-            drop_tol = getattr(cfg, "p1_drop_tol", 0.012)
+            drop_tol = getattr(cfg, "p1_drop_tol", 0.010)
             relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
 
-            # Check for plateau
             if relative_drop_rate < drop_tol:
                 self.p1_plateau_count += 1
             else:
                 self.p1_plateau_count = 0
 
-            # Guard: Must satisfy MINIMUM Phase 1 runway before considering transition
             can_exit_min = epoch >= (self.min_p1_epochs - 1)
             hit_max_budget = epoch >= (self.max_p1_epochs - 1)
             sustained_plateau = self.p1_plateau_count >= self.p1_plateau_patience
@@ -259,37 +241,30 @@ class PhaseTracker:
             return False
 
         # =============================================================
-        # PHASE 2: Multi-Signal Elastic Squeeze Governor
+        # PHASE 2: Elastic Governor & Regularization Consolidation
         # =============================================================
         remaining_epochs = max(1, self.total_epochs - self.p2_start_epoch)
         base_step = 1.0 / remaining_epochs
 
-        # 1. Reconstruction Budget & Overshoot
         dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.0 * rec_sigma)
         loss_ceiling = self.best_rec_loss + dynamic_budget
         overshoot = current_rec - loss_ceiling
 
-        # 2. Multi-Objective Stress Checks
-        dict_stress = max_corr > 0.65  # Atoms starting to correlate
-        l0_too_fast = current_l0 < self.target_l0_min  # Overshot sparsity
+        # Atom correlation safety check
+        dict_stress = max_corr > getattr(cfg, "ortho_overlap_threshold", 0.35)
 
-        if overshoot > 0.0 or dict_stress or l0_too_fast:
-            # Fragile manifold: Proportional elastic release & breathing cooldown
-            severity = max(
-                min(2.0, overshoot / max(1e-5, dynamic_budget)),
-                1.5 if dict_stress else 0.5
-            )
-            self.pressure = max(0.02, self.pressure - (base_step * 1.5 * severity))
-            self.breathing_cooldown = max(2, int(self.cycle_window * 0.6))
+        if overshoot > 0.0 or dict_stress:
+            # Manifold stress: Apply proportional pressure release
+            severity = 1.5 if dict_stress else min(2.0, overshoot / max(1e-5, dynamic_budget))
+            self.pressure = max(0.0, self.pressure - (base_step * 1.0 * severity))
+            self.breathing_cooldown = max(1, int(self.cycle_window * 0.5))
         else:
             if self.breathing_cooldown > 0:
                 self.breathing_cooldown -= 1
             else:
-                # Stable manifold: Advance pressure at accelerated rate if L0 is high
-                speed_boost = 1.35 if current_l0 > self.target_l0_max else 1.0
-                self.pressure = min(1.0, self.pressure + (base_step * speed_boost))
+                # Stable training: Advance pressure monotonically
+                self.pressure = min(1.0, self.pressure + base_step)
 
-        # Re-update schedules with modified pressure
         self._update_schedules(epoch)
 
         # =============================================================
@@ -298,8 +273,9 @@ class PhaseTracker:
         min_progress = getattr(cfg, "min_stop_progress", 0.85)
         rel_tol = getattr(cfg, "early_stop_rel_tol", 1e-3)
 
-        if self._progress >= min_progress and current_l0 <= self.target_l0_max:
-            if (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss) > rel_tol:
+        if self._progress >= min_progress:
+            improvement = (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss)
+            if improvement > rel_tol:
                 self.best_val_loss = current_val
                 self.no_improve_count = 0
             else:
@@ -315,18 +291,18 @@ class PhaseTracker:
         return False
 
     def force_phase2(self, epoch: int, current_baseline: float) -> None:
-        """Transitions tracker from Discovery (Phase 1) to Pareto Squeeze (Phase 2)."""
+        """Transitions tracker from Discovery (Phase 1) to Consolidation (Phase 2)."""
         if self.phase == 1:
             self.phase = 2
             self.p2_start_epoch = epoch
-            self.p1_baseline_rec = current_baseline
-            self.best_rec_loss = current_baseline
+            self.p1_baseline_rec = float(current_baseline)
+            self.best_rec_loss = float(current_baseline)
             self.best_val_loss = float("inf")
             self.pressure = 0.0
             self.breathing_cooldown = 0
             self.no_improve_count = 0
             self._update_schedules(epoch)
-
+            
 class UnifiedLogger:
     """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
     def __init__(self, backend: str, run_name: str, log_dir: str):
