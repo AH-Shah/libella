@@ -311,19 +311,23 @@ class LibellaGNN(nn.Module):
         delta_clamp = getattr(cfg, "delta_clamp", 30.0)
         scaled_delta = torch.clamp(raw_delta * asym_factor, min=-delta_clamp, max=delta_clamp)
 
-        per_cell_loss = torch.sum(variance_weight * torch.log(torch.cosh(scaled_delta + 1e-6)), dim=-1)
+        # Numerically stable, zero-allocation log(cosh(u)) = |u| + softplus(-2|u|) - ln(2)
+        abs_delta = scaled_delta.abs()
+        log_cosh_val = abs_delta + F.softplus(-2.0 * abs_delta) - 0.6931471805599453
+
+        per_cell_loss = torch.sum(variance_weight * log_cosh_val, dim=-1)
         l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
 
-        # 2. Strict Orthogonality Barrier
+        # 2. Strict Orthogonality Barrier (In-place diagonal zeroing)
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
-        off_diag = gram * self.ortho_mask
+        gram.fill_diagonal_(0.0)
 
         ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
-        excess_corr = F.relu(off_diag - ortho_thresh)
+        excess_corr = F.relu(gram - ortho_thresh)
         num_violating = torch.clamp((excess_corr > 0).float().sum(), min=1.0)
         l_ortho_mean = excess_corr.pow(2).sum() / num_violating
 
-        max_corr = off_diag.max()
+        max_corr = gram.max()
         l_ortho_max = F.relu(max_corr - 0.50).pow(2) * 50.0
         l_ortho = l_ortho_mean + l_ortho_max
 
@@ -345,7 +349,7 @@ class LibellaGNN(nn.Module):
         total_loss = l_recon + (current_ortho * l_ortho) + (aux_weight * l_aux)
 
         return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
-
+        
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
         """Harvests parameter/gradient norms, SVD spectrum, effective rank, and correlation."""
