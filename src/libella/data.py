@@ -479,6 +479,7 @@ class SpatialBatcher:
 
         return {
             'x': x_tensor,
+            'adj': adj_sub,
             'src': src,
             'dst': dst,
             'weights': weights,

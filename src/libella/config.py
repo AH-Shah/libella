@@ -100,7 +100,7 @@ class RunConfig:
     lr_decoder: float = 1e-3
     lr_temperature: float = 1e-3
     lr_min: float = 1e-6
-    grad_clip_recon: float = 5.0
+    grad_clip_recon: float = 10.0
     grad_clip_spatial: float = 15.0
 
     # PhaseTracker & Early Stopping
