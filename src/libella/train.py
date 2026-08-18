@@ -421,7 +421,7 @@ def _train_loop(
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            # 1. Dual-Group Gradient Clipping
+            # 1. Dual-Group Gradient Clipping (Preserved Exact Thresholds)
             recon_keys = ("decoder_bias", "ambient_scale", "decoder_weight")
             recon_params = [
                 p for n, p in model.named_parameters()
@@ -441,21 +441,24 @@ def _train_loop(
                     spatial_params, max_norm=getattr(cfg, "grad_clip_spatial", 15.0)
                 )
 
-            # 2. Tangent-Space Projection on Unit Sphere
+            # 2. In-Place Tangent-Space Projection on Unit Sphere
             with torch.no_grad():
                 if hasattr(model, "decoder_weight") and model.decoder_weight.grad is not None:
-                    w = F.normalize(model.decoder_weight, p=2, dim=1)
+                    w = F.normalize(model.decoder_weight.data, p=2, dim=1)
                     grad = model.decoder_weight.grad
-                    proj_grad = grad - (grad * w).sum(dim=1, keepdim=True) * w
-                    model.decoder_weight.grad.copy_(proj_grad)
+                    # grad.sub_(...) computes grad - (grad * w).sum(dim=1, keepdim=True) * w in-place
+                    grad.sub_((grad * w).sum(dim=1, keepdim=True) * w)
 
-            # 3. Optimizer Step & Non-Negative Retraction
+            # 3. Optimizer Step
             optimizer.step()
 
+            # 4. In-Place Non-Negative Spherical Retraction
             with torch.no_grad():
                 if hasattr(model, "decoder_weight"):
-                    w_clamped = F.relu(model.decoder_weight)
-                    model.decoder_weight.copy_(F.normalize(w_clamped + 1e-8, p=2, dim=-1))
+                    w_data = model.decoder_weight.data
+                    w_data.clamp_min_(0.0)
+                    w_norm = torch.linalg.vector_norm(w_data + 1e-8, ord=2, dim=-1, keepdim=True)
+                    w_data.div_(w_norm)
 
                 if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
                     model.resample_dead_latents(last_r_pos, last_dead_mask, optimizer=optimizer)
