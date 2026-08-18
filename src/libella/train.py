@@ -152,7 +152,7 @@ def _init_model(
         n_metaprograms=n_latents,
     ).to(device)
 
-    # 1. Parameter grouping with dedicated baseline & decoder learning rates
+    # 1. Clean Parameter grouping
     bias_ambient_params = [
         p for n, p in model.named_parameters()
         if any(k in n for k in ["decoder_bias", "ambient_scale"])
@@ -161,21 +161,16 @@ def _init_model(
         p for n, p in model.named_parameters()
         if "decoder_weight" in n
     ]
-    temp_routing_params = [
-        p for n, p in model.named_parameters()
-        if any(k in n for k in ["att_temp", "cross_temp", "spatial_gain"])
-    ]
     base_params = [
         p for n, p in model.named_parameters()
-        if not any(k in n for k in ["decoder_", "ambient_scale", "att_temp", "cross_temp", "spatial_gain"])
+        if not any(k in n for k in ["decoder_", "ambient_scale"])
     ]
 
     lr_base = getattr(cfg, "lr_base", 1e-3)
     optimizer = torch.optim.AdamW([
-        {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},  # 2x LR for GNN
-        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0}, # 0.5x LR for Dictionary
+        {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},
+        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0},
         {"params": bias_ambient_params, "lr": lr_base * getattr(cfg, "ambient_lr_mult", 5.0), "weight_decay": 0.0},
-        {"params": temp_routing_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
     ])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=getattr(cfg, "epochs", 100), eta_min=getattr(cfg, "lr_min", 1e-6)
@@ -412,8 +407,8 @@ def _train_loop(
                         delta_clamp = getattr(cfg, "delta_clamp", 30.0)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-delta_clamp, max=delta_clamp)
 
-                        val_loss_sum = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
-                        val_log_cosh = val_loss_sum / max(1, x_val.numel())
+                        per_cell_val = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)), dim=-1)
+                        val_log_cosh = torch.mean(per_cell_val) / math.sqrt(x_val.shape[-1])
 
                         val_loss_acc += val_log_cosh.detach()
                         val_steps += 1
