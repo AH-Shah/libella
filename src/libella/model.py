@@ -196,9 +196,9 @@ class LibellaGNN(nn.Module):
         spatial_shift = self.gate_spatial_proj(h_norm)
 
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
-        spatial_warmup = min(1.0, progress * 2.0)
+        spatial_warmup = 0.10 + 0.90 * min(1.0, progress * 2.0)
 
-        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
+        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))        
         pre_acts = raw_affinity * z_mag
 
         # 7. Top-K Hard Sparsity Operator (L0 = EXACTLY k)
@@ -210,12 +210,11 @@ class LibellaGNN(nn.Module):
 
     @torch.no_grad()
     def resample_dead_latents(
-        self,
-        r_pos: torch.Tensor,
-        dead_mask: torch.Tensor,
-        optimizer: torch.optim.Optimizer | None = None,
+        self, 
+        r_pos: torch.Tensor, 
+        dead_mask: torch.Tensor, 
+        optimizer: torch.optim.Optimizer | None = None
     ) -> int:
-        """Resamples dead dictionary atoms directly to the highest unexplained positive cellular residuals."""
         if not dead_mask.any():
             return 0
 
@@ -223,6 +222,7 @@ class LibellaGNN(nn.Module):
         num_dead = dead_indices.numel()
         cell_res_energy = r_pos.norm(p=2, dim=-1)
 
+        # Select candidate cells with highest residual energy
         k_resample = min(num_dead, (cell_res_energy > 0.05).sum().item())
         if k_resample == 0:
             return 0
@@ -230,37 +230,42 @@ class LibellaGNN(nn.Module):
         worst_cells = torch.topk(cell_res_energy, k=k_resample, dim=0).indices
         target_dead_ids = dead_indices[:k_resample]
 
-        # 1. Re-seed dictionary weights to normalized single-cell residuals
-        new_atoms = F.normalize(r_pos[worst_cells], p=2, dim=-1)
+        # 1. Base candidate vectors from single-cell residuals
+        candidates = r_pos[worst_cells].clone()
+
+        # 2. Add small random noise to break symmetry / 1-hot collinearity
+        noise = torch.randn_like(candidates) * 0.02
+        candidates = F.relu(candidates + noise)
+
+        # 3. Project out components parallel to existing healthy dictionary atoms
+        healthy_mask = ~dead_mask
+        if healthy_mask.any():
+            w_healthy = F.normalize(self.decoder_weight.data[healthy_mask], p=2, dim=-1)
+            # Gram-Schmidt projection: v' = v - (v · u) u
+            proj = torch.mm(candidates, w_healthy.t()) # (k_resample, n_healthy)
+            candidates = candidates - torch.mm(proj, w_healthy)
+            candidates = F.relu(candidates) # Retain non-negativity
+
+        # 4. Final safety normalization (fallback to random non-negative if fully collapsed)
+        norms = candidates.norm(p=2, dim=-1, keepdim=True)
+        collapsed = (norms < 1e-4).squeeze(-1)
+        if collapsed.any():
+            candidates[collapsed] = F.relu(torch.randn(collapsed.sum(), candidates.size(-1), device=candidates.device))
+        
+        new_atoms = F.normalize(candidates, p=2, dim=-1)
         self.decoder_weight.data[target_dead_ids] = new_atoms
 
-        # 2. Reset projection biases for resurrected atoms
-        if hasattr(self, "gate_spatial_proj") and len(self.gate_spatial_proj) > 2:
-            if hasattr(self.gate_spatial_proj[2], "bias") and self.gate_spatial_proj[2].bias is not None:
-                self.gate_spatial_proj[2].bias.data[target_dead_ids] = 0.0
-        if hasattr(self, "mag_enc") and len(self.mag_enc) > 3:
-            if hasattr(self.mag_enc[3], "bias") and self.mag_enc[3].bias is not None:
-                self.mag_enc[3].bias.data[target_dead_ids] = 0.0
-
-        # 3. Reset dead counters
+        # Reset tracking state
         self.steps_since_active[target_dead_ids] = 0
 
-        # 4. Clear optimizer momentum buffers for the re-seeded slices
+        # Flush Adam momentum buffers for reset slices
         if optimizer is not None:
-            params_to_reset = [self.decoder_weight]
-            if hasattr(self, "gate_spatial_proj") and len(self.gate_spatial_proj) > 2:
-                params_to_reset.append(self.gate_spatial_proj[2].bias)
-            if hasattr(self, "mag_enc") and len(self.mag_enc) > 3:
-                params_to_reset.append(self.mag_enc[3].bias)
-
-            for param in params_to_reset:
-                if param is not None:
-                    state = optimizer.state.get(param, None)
-                    if state is not None:
-                        if "exp_avg" in state:
-                            state["exp_avg"][target_dead_ids] = 0.0
-                        if "exp_avg_sq" in state:
-                            state["exp_avg_sq"][target_dead_ids] = 0.0
+            state = optimizer.state.get(self.decoder_weight, None)
+            if state is not None:
+                if 'exp_avg' in state:
+                    state['exp_avg'][target_dead_ids] = 0.0
+                if 'exp_avg_sq' in state:
+                    state['exp_avg_sq'][target_dead_ids] = 0.0
 
         return k_resample
 
@@ -367,18 +372,23 @@ class LibellaGNN(nn.Module):
             variance_weight * torch.log(torch.cosh(scaled_delta + 1e-6))
         ) / max(1, x_true.numel())
 
-        # 2. Strict 200x Max-Ortho Barrier (Penalizes Overlapping Metaprograms)
+        # In calc_loss():
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
         off_diag = gram * self.ortho_mask
 
-        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.35)
+        ortho_thresh = getattr(cfg, 'ortho_overlap_threshold', 0.30)
         excess_corr = F.relu(off_diag - ortho_thresh)
+
+        # Mean violation loss
         num_violating = torch.clamp((excess_corr > 0).float().sum(), min=1.0)
         l_ortho_mean = excess_corr.pow(2).sum() / num_violating
 
-        max_corr = off_diag.max()
-        l_ortho_max = F.relu(max_corr - 0.50).pow(2) * 200.0
-        l_ortho = l_ortho_mean + l_ortho_max
+        # Soft log-barrier instead of hard (max - 0.5)^2 * 200
+        # -log(1 - x) smoothly approaches infinity as correlation approaches 0.95
+        max_corr = torch.clamp(off_diag.max(), max=0.8)
+        l_ortho_barrier = -torch.log(1.0 - max_corr + 1e-5)
+
+        l_ortho = l_ortho_mean + 0.5 * l_ortho_barrier
 
         # 3. Top-K Sparsity (Exact L0 enforced; auxiliary regularization remains 0.0)
         l_sparse = torch.tensor(0.0, device=x_true.device)

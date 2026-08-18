@@ -463,7 +463,6 @@ def _train_loop(
                     w_clamped = F.relu(model.decoder_weight)
                     model.decoder_weight.copy_(F.normalize(w_clamped + 1e-8, p=2, dim=-1))
 
-                # Resample dormant latents using residual mass
                 if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
                     model.resample_dead_latents(last_r_pos, last_dead_mask, optimizer=optimizer)
 
