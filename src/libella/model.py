@@ -90,12 +90,11 @@ class LibellaGNN(nn.Module):
         N = x_dense.size(0)
         has_edges = src.numel() > 0
 
-        # 1. Bounds Guard & Stride Alignment for MPS Hardware Addressing
+        # 1. Bounds Guard & Alignment
         if has_edges:
             src = src.to(dtype=torch.int64).contiguous()
             dst = dst.to(dtype=torch.int64).contiguous()
             edge_weights = edge_weights.to(dtype=torch.float32).contiguous()
-            
             valid = (src >= 0) & (src < N) & (dst >= 0) & (dst < N)
             if not valid.all():
                 src = src[valid]
@@ -103,7 +102,7 @@ class LibellaGNN(nn.Module):
                 edge_weights = edge_weights[valid]
                 has_edges = src.numel() > 0
 
-        # 2. Depth Disentanglement (Vectorized L2 Norm on ALU)
+        # 2. Depth Normalization
         cell_mass = torch.clamp(
             torch.linalg.vector_norm(x_dense, ord=2, dim=-1, keepdim=True), min=1e-5
         )
@@ -112,7 +111,7 @@ class LibellaGNN(nn.Module):
         # 3. Self Feature Extraction
         h_self = self.self_enc(x_norm)
 
-        # 4. Bilateral Edge Filtering & Symmetric Normalization (Hard Cutoff for Sharpness)
+        # 4. Bilateral Edge Filtering (Hard Cutoff for V1 Sharpness)
         if has_edges:
             with torch.no_grad():
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
@@ -120,10 +119,9 @@ class LibellaGNN(nn.Module):
                 edge_sim_thresh = float(getattr(cfg, "edge_sim_threshold", 0.45))
                 edge_mask = (cos_sim > edge_sim_thresh).to(dtype=x_dense.dtype)
                 decay = torch.sigmoid(
-                    (cos_sim - edge_sim_thresh) * getattr(cfg, "edge_decay_slope", 12.0)
+                    (cos_sim - edge_sim_thresh) * getattr(cfg, "edge_decay_slope", 15.0)
                 ) * edge_mask
 
-                # Symmetric Laplacian normalization
                 deg = torch.zeros((N, 1), dtype=x_dense.dtype, device=x_dense.device)
                 deg.index_add_(0, dst, torch.ones((dst.size(0), 1), dtype=x_dense.dtype, device=x_dense.device))
                 edge_norm = torch.rsqrt(torch.clamp(deg[src], min=1.0)) * torch.rsqrt(torch.clamp(deg[dst], min=1.0))
@@ -131,7 +129,6 @@ class LibellaGNN(nn.Module):
             W_bil = edge_weights.unsqueeze(1) * decay
             gate = torch.sigmoid(self.edge_gate(torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)))
 
-            # Selective Graph Message Passing
             h_sp = h_self
             for _ in range(self.k_hops):
                 msg = self.spatial_lin(h_sp)[src] * gate * edge_norm
@@ -139,37 +136,28 @@ class LibellaGNN(nn.Module):
         else:
             h_sp = h_self
 
-        # 5. APPNP Teleport Identity Anchor (85% Self-Identity + 15% Spatial Context)
+        # 5. APPNP Teleport Identity Anchor (85% Self + 15% Spatial Context)
         alpha_teleport = float(getattr(cfg, "appnp_alpha", 0.85))
         h_fused = F.layer_norm(
             alpha_teleport * h_self + (1.0 - alpha_teleport) * h_sp, [self.hidden_dim]
         )
 
-        # 6. Identity-Preserving Gated Projection & Bounded Spatial Modulation
+        # 6. Direct Latent Prediction (Unbounded for Magnitude Growth)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        # Direct linear projection: Cell's own transcriptomic fingerprint
-        bio_proj = F.linear(x_norm, w_dec_norm)
-        
-        # Spatial context acts as a high-frequency contrast modulator (bounded by tanh, NOT additive blur)
-        spatial_mod = torch.tanh(self.spatial_gate_head(h_sp))
-        progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
-        mod_strength = 0.20 * progress  # Max 20% spatial adjustment
+        bio_sim = F.linear(x_norm, w_dec_norm)
+        spatial_logits = self.spatial_gate_head(h_fused)
 
-        # Base activation strictly anchored in single-cell genes, refined by tissue contrast
-        raw_acts = F.relu(bio_proj * (1.0 + mod_strength * spatial_mod))
+        # Clean ReLU floor. Network learns to scale spatial_logits to match reconstruction magnitude.
+        raw_acts = F.relu(bio_sim + spatial_logits)
 
-        # 7. Top-K Hard Sparsity with Dynamic Energy Scale Recovery (Fixes R^2 Collapse)
+        # 7. Top-K Hard Sparsity
         target_k = getattr(self, "current_k", max(6, self.k))
         topk_vals, topk_indices = torch.topk(raw_acts, k=target_k, dim=-1)
         
-        # Scale active latents so ||z @ W|| matches unit energy of input x_norm
-        topk_energy = torch.clamp(torch.sum(topk_vals ** 2, dim=-1, keepdim=True), min=1e-4)
-        scale_factor = torch.rsqrt(topk_energy)
-        scaled_topk_vals = topk_vals * scale_factor
+        z_sparse = torch.zeros_like(raw_acts).scatter_(-1, topk_indices, topk_vals)
 
-        z_sparse = torch.zeros_like(raw_acts).scatter_(-1, topk_indices, scaled_topk_vals)
-
-        return z_sparse, raw_acts, cell_mass, scaled_topk_vals
+        # Return raw_acts as the last tuple item so telemetry doesn't crash on missing mag_head
+        return z_sparse, raw_acts, cell_mass, raw_acts
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -242,11 +230,10 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        # 1. Spatial & Identity Encoding
         z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        # 2. Baseline Decoupling (Strict 15% Cap so Sparse Latents Reconstruct Signal)
+        # Baseline Decoupling (Strict 15% Cap so Sparse Latents DO the work)
         baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
         ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.15)
 
@@ -258,13 +245,13 @@ class LibellaGNN(nn.Module):
         r_pos_ret = None
         dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
 
-        # 3. Auxiliary Loss & Dead Latent Tracking (Training Only)
+        # Auxiliary Loss & Dead Latent Tracking
         if self.training:
             with torch.no_grad():
                 active_in_batch = (z > 1e-4).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
-                dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
+                dead_mask_ret = self.steps_since_active >= getattr(self, "dead_step_threshold", 20)
 
             x_norm = F.normalize(x_dense, p=2, dim=-1)
             x_recon_norm = F.normalize(F.relu(x_recon), p=2, dim=-1)
@@ -283,14 +270,11 @@ class LibellaGNN(nn.Module):
                 aux_sim = F.relu(F.linear(r_norm, w_dead))
                 topk_res = torch.topk(aux_sim, k=k_aux, dim=-1)
 
-                topk_aux_energy = torch.clamp(torch.sum(topk_res.values ** 2, dim=-1, keepdim=True), min=1e-4)
-                z_aux_weights = topk_res.values * torch.rsqrt(topk_aux_energy)
-
-                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, z_aux_weights)
+                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, topk_res.values)
                 aux_recon = torch.mm(z_aux, w_dead)
 
         return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag, r_pos_ret, dead_mask_ret
-
+        
     def calc_loss(
         self,
         recon_x: torch.Tensor,
