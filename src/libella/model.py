@@ -127,14 +127,12 @@ class LibellaGNN(nn.Module):
             # 5. Selective Graph Message Passing (Autograd-Isolated per Hop)
             h_sp = h_self
             for _ in range(self.k_hops):
-                h_proj = self.spatial_lin(h_sp)
-                msg = h_proj[src] * gate * edge_norm
-                
-                # Fresh tensor allocation per hop preserves Autograd graph history for backward pass
-                agg = torch.zeros_like(h_sp).index_add_(0, dst, msg)
-                h_sp = h_sp + F.silu(agg)
+                msg = self.spatial_lin(h_sp)[src] * gate * edge_norm
+                h_sp = h_sp + F.silu(torch.zeros_like(h_sp).index_add_(0, dst, msg))
         else:
             h_sp = h_self
+
+
 
         # 6. Fusion of Self + Spatial Context
         h_fused = F.layer_norm(h_self + h_sp, [self.hidden_dim])
