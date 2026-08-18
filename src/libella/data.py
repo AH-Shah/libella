@@ -713,23 +713,23 @@ def build_pt_graph(f: Path, common_genes: list[str]) -> Path | None:
         data.pos = torch.from_numpy(coords).float()
         data.patient_name = f.stem
         
-        # Pack PyTorch matrices safely using the scope-isolated helper
+        # Store Scipy CSR matrices directly or as dense/sparse buffers
         data.x_in = to_pt_sparse(X_in_sparse)
         data.y_raw = to_pt_sparse(X_raw_sparse)
         
-        # Clear SciPy versions from RAM instantly
-        del X_in_sparse, X_raw_sparse
-        gc.collect()
-        
         adj_sym_coo = adj_sym.tocoo()
-        data.edge_index = torch.from_numpy(np.vstack((adj_sym_coo.row, adj_sym_coo.col)).astype(np.int32))
+        # ENFORCE int64 (Long) FOR MPS COMPATIBILITY:
+        data.edge_index = torch.from_numpy(
+            np.vstack((adj_sym_coo.row, adj_sym_coo.col)).astype(np.int64)
+        )
         data.edge_attr = torch.from_numpy(adj_sym_coo.data.astype(np.float32))
 
         out_dir = paths.make_dirs(cfg.suffix)["graphs"]
         out_path = out_dir / f"{f.stem}_graph.pt"
         torch.save(data, out_path)
         
-        del data, adj_sym, adj_sym_coo; gc.collect()
+        del data, adj_sym, adj_sym_coo, X_in_sparse, X_raw_sparse
+        gc.collect()
         return out_path
     except Exception as e: 
         print(f"  ↳ [!] Graph construction failed for {f.stem}: {e}")
@@ -787,7 +787,7 @@ def pad_mps_shapes(
         weights = weights.contiguous()
 
     return x, src, dst, weights
-    
+
 def build_graph_safe(f: Path, c_genes: list[str]) -> Path | None:
     """Wrap graph builder with safety checks to avoid identical retrains."""
     clean_stem = f.stem.replace("_graph", "")
