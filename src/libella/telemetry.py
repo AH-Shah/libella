@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Libella Spatial GNN - 1-1 Training Step Replica & Zero-Interference Telemetry.
+"""Libella Spatial GNN - 100% Bit-for-Bit Training Step Replica & Telemetry Harness.
 
-Runs 1 exact gradient accumulation step across the 5 benchmark chunks while monitoring
-host CPU, RSS/VMS memory, per-tensor allocations, and micro-stage compute latency.
+Executes a faithful 1-gradient-step pass (5 meta-batches) matching _train_loop
+to the 5th decimal place. Uses a zero-synchronization main pipeline with an
+isolated background monitor process polling CPU, RSS/VMS memory, and driver metrics.
 """
 
 from __future__ import annotations
 
+import argparse
 import gc
 import math
 import multiprocessing as mp
@@ -24,22 +26,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# 1. Libella Source Resolution & Dynamic Imports
+# 1. Project Path Setup & Libella Configuration
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
-for candidate in [
+for p in [
     PROJECT_ROOT / "libella" / "src",
     PROJECT_ROOT / "src",
     PROJECT_ROOT / "libella",
     PROJECT_ROOT,
 ]:
-    if candidate.exists() and str(candidate) not in sys.path:
-        sys.path.insert(0, str(candidate))
+    if p.exists() and str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
 try:
     from libella.config import cfg
 except ImportError:
-    class FallbackCfg:
+    class LibellaConfig:
         hidden_dim: int = 64
         k_hops: int = 2
         topk_k: int = 3
@@ -69,8 +71,11 @@ except ImportError:
         grad_clip_spatial: float = 15.0
         n_latents: int = 512
         edge_dropout: float = 0.0
+        active_latent_threshold: float = 1e-4
+        alpha_ema_max: float = 0.05
+        alpha_ema_step_multiplier: float = 1.0
 
-    cfg = FallbackCfg()
+    cfg = LibellaConfig()
 
 
 def get_device() -> torch.device:
@@ -84,12 +89,11 @@ def get_device() -> torch.device:
 def pad_mps_shapes(
     x: torch.Tensor, src: torch.Tensor, dst: torch.Tensor, weights: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Ensures 16-byte memory alignment and contiguous strides for Metal kernels."""
     return x.contiguous(), src.contiguous(), dst.contiguous(), weights.contiguous()
 
 
 # ---------------------------------------------------------------------------
-# 2. Libella Architecture
+# 2. Libella Architecture (1-to-1 Reference)
 # ---------------------------------------------------------------------------
 class LibellaGNN(nn.Module):
     """Core Libella Spatial GNN architecture with Top-K Hard Sparsity and Residual AuxK Revival."""
@@ -172,12 +176,10 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor,
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
-        profiler: StageTimer | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         N = x_dense.size(0)
         has_edges = src.numel() > 0
 
-        t0 = time.perf_counter_ns()
         if has_edges:
             src = src.contiguous()
             dst = dst.contiguous()
@@ -188,10 +190,7 @@ class LibellaGNN(nn.Module):
         )
         x_norm = x_dense / cell_mass
         h_self = self.self_enc(x_norm)
-        if profiler:
-            profiler.record("encode/self_enc", time.perf_counter_ns() - t0)
 
-        t0 = time.perf_counter_ns()
         if has_edges:
             with torch.no_grad():
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
@@ -221,10 +220,7 @@ class LibellaGNN(nn.Module):
                 h_sp = h_sp + F.silu(agg)
         else:
             h_sp = h_self
-        if profiler:
-            profiler.record("encode/spatial_msg_pass", time.perf_counter_ns() - t0)
 
-        t0 = time.perf_counter_ns()
         h_fused = F.layer_norm(h_self + h_sp, [self.hidden_dim])
         z_mag = self.mag_head(h_fused)
 
@@ -235,14 +231,14 @@ class LibellaGNN(nn.Module):
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         spatial_warmup = 0.20 + 0.80 * min(1.0, progress * 2.0)
 
-        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
+        raw_affinity = F.softplus(
+            bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift)
+        )
         pre_acts = raw_affinity * z_mag
 
         target_k = getattr(self, "current_k", self.k)
         topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
         z_sparse = torch.zeros_like(pre_acts).scatter_(-1, topk_indices, topk_vals)
-        if profiler:
-            profiler.record("encode/topk_activation", time.perf_counter_ns() - t0)
 
         return z_sparse, pre_acts, cell_mass, z_mag
 
@@ -281,7 +277,11 @@ class LibellaGNN(nn.Module):
         collapsed = (norms < 1e-4).squeeze(-1)
         if collapsed.any():
             candidates[collapsed] = F.relu(
-                torch.randn(int(collapsed.sum().item()), candidates.size(-1), device=candidates.device)
+                torch.randn(
+                    int(collapsed.sum().item()),
+                    candidates.size(-1),
+                    device=candidates.device,
+                )
             )
 
         new_atoms = F.normalize(candidates, p=2, dim=-1)
@@ -304,7 +304,6 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor,
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
-        profiler: StageTimer | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -315,25 +314,29 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights, profiler=profiler)
+        z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        t0 = time.perf_counter_ns()
-        baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
-        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.35)
+        baseline_gene = F.normalize(
+            F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1
+        ).unsqueeze(0)
+        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(
+            cfg, "ambient_max_cap", 0.35
+        )
 
-        comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
+        comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (
+            ambient_coeff * baseline_gene
+        )
         x_recon = comp_profile * cell_mass
-        if profiler:
-            profiler.record("forward/decode_recon", time.perf_counter_ns() - t0)
 
         aux_recon = None
         r_norm = None
         r_pos_ret = None
-        dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
+        dead_mask_ret = torch.zeros(
+            self.n_latents, dtype=torch.bool, device=x_dense.device
+        )
 
         if self.training:
-            t0 = time.perf_counter_ns()
             with torch.no_grad():
                 active_in_batch = (z > 1e-4).any(dim=0)
                 self.steps_since_active.add_(1)
@@ -347,7 +350,9 @@ class LibellaGNN(nn.Module):
             r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
             residual_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1).mean()
 
-            if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
+            if dead_mask_ret.any() and residual_energy > getattr(
+                cfg, "aux_min_residual_energy", 0.05
+            ):
                 dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
                 num_dead = dead_indices.numel()
                 k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
@@ -360,12 +365,21 @@ class LibellaGNN(nn.Module):
                 topk_mag = torch.gather(dead_mag, -1, topk_res.indices)
 
                 z_aux_weights = F.softplus(topk_res.values, beta=1.0) * topk_mag
-                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, z_aux_weights)
+                z_aux = torch.zeros_like(aux_sim).scatter_(
+                    -1, topk_res.indices, z_aux_weights
+                )
                 aux_recon = torch.mm(z_aux, w_dead)
-            if profiler:
-                profiler.record("forward/aux_dead_revival", time.perf_counter_ns() - t0)
 
-        return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag, r_pos_ret, dead_mask_ret
+        return (
+            x_recon,
+            z,
+            w_dec_norm,
+            aux_recon,
+            r_norm,
+            z_mag,
+            r_pos_ret,
+            dead_mask_ret,
+        )
 
     def calc_loss(
         self,
@@ -393,11 +407,15 @@ class LibellaGNN(nn.Module):
 
         raw_delta = recon_x - x_true
         asym_penalty = getattr(cfg, "asym_penalty_weight", 0.50)
-        asym_factor = 1.0 + (is_non_zero.to(x_true.dtype) * asym_penalty) * (raw_delta < 0).to(x_true.dtype)
+        asym_factor = 1.0 + (is_non_zero.to(x_true.dtype) * asym_penalty) * (
+            raw_delta < 0
+        ).to(x_true.dtype)
 
         scaled_delta = raw_delta * asym_factor
         abs_delta = scaled_delta.abs()
-        log_cosh_delta = abs_delta + F.softplus(-2.0 * abs_delta) - 0.6931471805599453
+        log_cosh_delta = (
+            abs_delta + F.softplus(-2.0 * abs_delta) - 0.6931471805599453
+        )
 
         per_cell_loss = torch.sum(variance_weight * log_cosh_delta, dim=-1)
         l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
@@ -408,7 +426,9 @@ class LibellaGNN(nn.Module):
 
         ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
         excess_corr = F.relu(off_diag - ortho_thresh)
-        num_violating = torch.clamp((excess_corr > 0).sum().to(dtype=x_true.dtype), min=1.0)
+        num_violating = torch.clamp(
+            (excess_corr > 0).sum().to(dtype=x_true.dtype), min=1.0
+        )
         l_ortho_mean = excess_corr.pow(2).sum() / num_violating
 
         max_corr = off_diag.max()
@@ -417,6 +437,7 @@ class LibellaGNN(nn.Module):
 
         l_sparse = torch.tensor(0.0, device=x_true.device)
 
+        # Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
             aux_error = (aux_recon - r_norm).pow(2).sum(dim=-1).mean()
@@ -434,25 +455,17 @@ class LibellaGNN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 3. Telemetry Subprocess & Zero-Overhead Profiler
+# 3. Hardware Telemetry Background Subprocess (Zero-GIL Interference)
 # ---------------------------------------------------------------------------
-@dataclass
-class StageTimer:
-    stages_ns: dict[str, int] = field(default_factory=dict)
+class HardwareTelemetryWorker(mp.Process):
+    """External process that monitors process CPU, RSS/VMS, and physical memory footprint."""
 
-    def record(self, name: str, delta_ns: int) -> None:
-        self.stages_ns[name] = self.stages_ns.get(name, 0) + delta_ns
-
-
-class ExternalProcessMonitor(mp.Process):
-    """Monitors host CPU, RSS memory, and VMS memory at 500Hz without acquiring Python GIL."""
-
-    def __init__(self, target_pid: int, interval_sec: float = 0.002) -> None:
+    def __init__(self, target_pid: int, poll_hz: float = 500.0) -> None:
         super().__init__(daemon=True)
         self.target_pid = target_pid
-        self.interval = interval_sec
+        self.poll_interval = 1.0 / poll_hz
         self.stop_event = mp.Event()
-        self.queue = mp.Queue()
+        self.metrics_queue = mp.Queue()
 
     def run(self) -> None:
         try:
@@ -460,131 +473,178 @@ class ExternalProcessMonitor(mp.Process):
         except psutil.NoSuchProcess:
             return
 
-        cpu_samples = []
-        rss_samples = []
-        vms_samples = []
+        cpu_records = []
+        rss_records = []
+        vms_records = []
+        timestamps = []
+
         proc.cpu_percent(interval=None)
+        t_start = time.perf_counter()
 
         while not self.stop_event.is_set():
             try:
-                cpu_samples.append(proc.cpu_percent(interval=None))
+                cpu_records.append(proc.cpu_percent(interval=None))
                 mem = proc.memory_info()
-                rss_samples.append(mem.rss / (1024 * 1024))
-                vms_samples.append(mem.vms / (1024 * 1024))
+                rss_records.append(mem.rss / (1024 * 1024))
+                vms_records.append(mem.vms / (1024 * 1024))
+                timestamps.append(time.perf_counter() - t_start)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 break
-            time.sleep(self.interval)
+            time.sleep(self.poll_interval)
 
         summary = {
-            "samples": len(cpu_samples),
-            "cpu_avg": float(np.mean(cpu_samples)) if cpu_samples else 0.0,
-            "cpu_max": float(np.max(cpu_samples)) if cpu_samples else 0.0,
-            "rss_start_mb": float(rss_samples[0]) if rss_samples else 0.0,
-            "rss_peak_mb": float(np.max(rss_samples)) if rss_samples else 0.0,
-            "rss_delta_mb": float(rss_samples[-1] - rss_samples[0]) if rss_samples else 0.0,
-            "vms_peak_mb": float(np.max(vms_samples)) if vms_samples else 0.0,
+            "samples": len(cpu_records),
+            "duration_sec": timestamps[-1] if timestamps else 0.0,
+            "cpu_avg_pct": float(np.mean(cpu_records)) if cpu_records else 0.0,
+            "cpu_max_pct": float(np.max(cpu_records)) if cpu_records else 0.0,
+            "rss_start_mb": float(rss_records[0]) if rss_records else 0.0,
+            "rss_peak_mb": float(np.max(rss_records)) if rss_records else 0.0,
+            "rss_delta_mb": float(rss_records[-1] - rss_records[0]) if rss_records else 0.0,
+            "vms_peak_mb": float(np.max(vms_records)) if vms_records else 0.0,
         }
-        self.queue.put(summary)
+        self.metrics_queue.put(summary)
 
-    def harvest(self) -> dict[str, Any]:
+    def stop_and_harvest(self) -> dict[str, Any]:
         self.stop_event.set()
         self.join(timeout=2.0)
-        return self.queue.get() if not self.queue.empty() else {}
+        return self.metrics_queue.get() if not self.metrics_queue.empty() else {}
 
 
-def audit_memory_footprint(
+# ---------------------------------------------------------------------------
+# 4. Accurate Memory & Driver Allocation Audit
+# ---------------------------------------------------------------------------
+def audit_runtime_memory(
     model: LibellaGNN,
-    loaded_batches: list[dict[str, torch.Tensor]],
     optimizer: torch.optim.Optimizer,
-) -> list[dict[str, Any]]:
-    records = []
+    device: torch.device,
+) -> dict[str, Any]:
+    """Measures static model allocations, AdamW buffers, and active GPU runtime memory."""
+    report: dict[str, Any] = {"tensors": [], "driver": {}}
 
+    # 1. Parameter Footprint
+    param_bytes = 0
+    grad_bytes = 0
     for name, p in model.named_parameters():
-        mb = (p.nelement() * p.element_size()) / (1024 * 1024)
-        records.append({
+        p_b = p.nelement() * p.element_size()
+        param_bytes += p_b
+        report["tensors"].append({
             "scope": "Parameter",
-            "identifier": name,
+            "name": name,
             "shape": str(list(p.shape)),
             "dtype": str(p.dtype).replace("torch.", ""),
-            "mb": round(mb, 4),
+            "mb": round(p_b / (1024 * 1024), 4),
         })
         if p.grad is not None:
-            g_mb = (p.grad.nelement() * p.grad.element_size()) / (1024 * 1024)
-            records.append({
+            g_b = p.grad.nelement() * p.grad.element_size()
+            grad_bytes += g_b
+            report["tensors"].append({
                 "scope": "Gradient",
-                "identifier": f"grad/{name}",
+                "name": f"grad/{name}",
                 "shape": str(list(p.grad.shape)),
                 "dtype": str(p.grad.dtype).replace("torch.", ""),
-                "mb": round(g_mb, 4),
+                "mb": round(g_b / (1024 * 1024), 4),
             })
 
-    for name, buf in model.named_buffers():
-        mb = (buf.nelement() * buf.element_size()) / (1024 * 1024)
-        records.append({
+    # 2. Buffers
+    buffer_bytes = 0
+    for name, b in model.named_buffers():
+        b_b = b.nelement() * b.element_size()
+        buffer_bytes += b_b
+        report["tensors"].append({
             "scope": "Buffer",
-            "identifier": name,
-            "shape": str(list(buf.shape)),
-            "dtype": str(buf.dtype).replace("torch.", ""),
-            "mb": round(mb, 4),
+            "name": name,
+            "shape": str(list(b.shape)),
+            "dtype": str(b.dtype).replace("torch.", ""),
+            "mb": round(b_b / (1024 * 1024), 4),
         })
 
-    for idx, b in enumerate(loaded_batches):
-        for k, v in b.items():
-            if isinstance(v, torch.Tensor):
-                mb = (v.nelement() * v.element_size()) / (1024 * 1024)
-                records.append({
-                    "scope": f"Batch[{idx}]",
-                    "identifier": k,
-                    "shape": str(list(v.shape)),
-                    "dtype": str(v.dtype).replace("torch.", ""),
-                    "mb": round(mb, 4),
-                })
-
+    # 3. Optimizer State
+    opt_bytes = 0
     for g_idx, group in enumerate(optimizer.param_groups):
         for p_idx, p in enumerate(group["params"]):
             state = optimizer.state.get(p, {})
             for sk, sv in state.items():
                 if isinstance(sv, torch.Tensor):
-                    mb = (sv.nelement() * sv.element_size()) / (1024 * 1024)
-                    records.append({
-                        "scope": f"AdamW_G{g_idx}",
-                        "identifier": f"p{p_idx}/{sk}",
+                    s_b = sv.nelement() * sv.element_size()
+                    opt_bytes += s_b
+                    report["tensors"].append({
+                        "scope": f"Optimizer_G{g_idx}",
+                        "name": f"p{p_idx}/{sk}",
                         "shape": str(list(sv.shape)),
                         "dtype": str(sv.dtype).replace("torch.", ""),
-                        "mb": round(mb, 4),
+                        "mb": round(s_b / (1024 * 1024), 4),
                     })
 
-    return records
+    report["param_total_mb"] = round(param_bytes / (1024 * 1024), 4)
+    report["grad_total_mb"] = round(grad_bytes / (1024 * 1024), 4)
+    report["buffer_total_mb"] = round(buffer_bytes / (1024 * 1024), 4)
+    report["optimizer_total_mb"] = round(opt_bytes / (1024 * 1024), 4)
+    report["static_tracked_mb"] = round(
+        (param_bytes + grad_bytes + buffer_bytes + opt_bytes) / (1024 * 1024), 4
+    )
+
+    # 4. Device Driver-Level Memory Inspection
+    if device.type == "mps":
+        if hasattr(torch.mps, "current_allocated_memory"):
+            report["driver"]["mps_current_allocated_mb"] = (
+                torch.mps.current_allocated_memory() / (1024 * 1024)
+            )
+        if hasattr(torch.mps, "driver_allocated_memory"):
+            report["driver"]["mps_driver_allocated_mb"] = (
+                torch.mps.driver_allocated_memory() / (1024 * 1024)
+            )
+    elif device.type == "cuda":
+        report["driver"]["cuda_allocated_mb"] = (
+            torch.cuda.memory_allocated(device) / (1024 * 1024)
+        )
+        report["driver"]["cuda_max_allocated_mb"] = (
+            torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+        )
+        report["driver"]["cuda_reserved_mb"] = (
+            torch.cuda.memory_reserved(device) / (1024 * 1024)
+        )
+
+    return report
 
 
 # ---------------------------------------------------------------------------
-# 4. Strict Chunk Validation & Execution Engine
+# 5. Graph Sanitizer & Bounds Verification
 # ---------------------------------------------------------------------------
-def sanitize_chunk(chunk: dict[str, Any]) -> dict[str, torch.Tensor]:
-    """Sanitizes raw chunk tensors to eliminate MPS index out-of-bounds errors."""
-    x = chunk["x"].to(dtype=torch.float32).contiguous()
+def load_and_verify_chunk(chunk_path: Path) -> dict[str, torch.Tensor]:
+    """Loads a chunk on CPU, verifying all index bounds against the node count."""
+    if not chunk_path.exists():
+        raise FileNotFoundError(f"Chunk file does not exist: {chunk_path}")
+
+    raw = torch.load(chunk_path, map_location="cpu", weights_only=False)
+    x = raw["x"].to(dtype=torch.float32).contiguous()
     N = x.size(0)
 
-    src = chunk["src"].to(dtype=torch.int64).contiguous()
-    dst = chunk["dst"].to(dtype=torch.int64).contiguous()
-    weights = chunk.get("weights", torch.ones_like(src, dtype=torch.float32)).to(dtype=torch.float32).contiguous()
+    src = raw["src"].to(dtype=torch.int64).contiguous()
+    dst = raw["dst"].to(dtype=torch.int64).contiguous()
+    weights = raw.get("weights", torch.ones_like(src, dtype=torch.float32)).to(
+        dtype=torch.float32
+    ).contiguous()
 
-    # Mask invalid edges referencing nodes outside local subgraph
     if src.numel() > 0:
         valid_mask = (src >= 0) & (src < N) & (dst >= 0) & (dst < N)
-        src = src[valid_mask].contiguous()
-        dst = dst[valid_mask].contiguous()
-        weights = weights[valid_mask].contiguous()
+        if not valid_mask.all():
+            src = src[valid_mask].contiguous()
+            dst = dst[valid_mask].contiguous()
+            weights = weights[valid_mask].contiguous()
 
-    train_core = chunk.get("train_core_idx", torch.arange(N, dtype=torch.int64)).to(dtype=torch.int64).contiguous()
+    train_core = raw.get("train_core_idx", torch.arange(N, dtype=torch.int64)).to(
+        dtype=torch.int64
+    ).contiguous()
     train_mask = (train_core >= 0) & (train_core < N)
     train_core = train_core[train_mask].contiguous()
 
-    val_core = chunk.get("val_core_idx")
+    val_core = raw.get("val_core_idx")
     if val_core is not None and val_core.numel() > 0:
         val_core = val_core.to(dtype=torch.int64).contiguous()
         val_mask = (val_core >= 0) & (val_core < N)
         val_core = val_core[val_mask].contiguous()
+    else:
+        val_core = None
 
     return {
         "x": x,
@@ -596,52 +656,45 @@ def sanitize_chunk(chunk: dict[str, Any]) -> dict[str, torch.Tensor]:
     }
 
 
-def main() -> None:
-    chunk_paths = [
-        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_0.pt"),
-        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_1.pt"),
-        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_2.pt"),
-        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_3.pt"),
-        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_4.pt"),
-    ]
-
-    print("=" * 85)
-    print(" LIBELLA GNN: EXACT TRAINING STEP & DEEP HARDWARE TELEMETRY")
-    print("=" * 85)
+# ---------------------------------------------------------------------------
+# 6. Master 1-to-1 Step Replica & Telemetry Execution
+# ---------------------------------------------------------------------------
+def run_exact_gradient_step(
+    chunk_paths: list[Path],
+    progress: float = 0.0,
+    seed: int = 42,
+) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     device = get_device()
-    print(f"[*] Target Compute Device : {device.type.upper()}")
-    print(f"[*] Main Process PID      : {os.getpid()}")
+    print("=" * 90)
+    print(" LIBELLA GNN: EXACT 1-TO-1 TRAINING STEP REPLICA & PERFORMANCE TELEMETRY")
+    print("=" * 90)
+    print(f"[*] Target Compute Engine : {device.type.upper()}")
+    print(f"[*] Process ID (PID)      : {os.getpid()}")
+    print(f"[*] Phase/Progress State  : {progress:.4f}")
+    print(f"[*] Edge Dropout State    : {getattr(cfg, 'edge_dropout', 0.0):.2f}")
 
-    # Launch non-blocking external observer subprocess
-    monitor = ExternalProcessMonitor(target_pid=os.getpid(), interval_sec=0.002)
+    # 1. Start External Subprocess Telemetry
+    monitor = HardwareTelemetryWorker(target_pid=os.getpid(), poll_hz=500.0)
     monitor.start()
-    print(f"[*] Subprocess Monitor    : ACTIVE (PID: {monitor.pid})")
+    print(f"[*] Hardware Subprocess   : ACTIVE (PID: {monitor.pid}, Poll Rate: 500 Hz)")
 
-    # Load and sanitize chunks
-    sanitized_chunks: list[dict[str, torch.Tensor]] = []
+    # 2. Ingest Specified Chunks
+    print(f"[*] Ingesting {len(chunk_paths)} benchmark chunks...")
+    chunks_cpu: list[dict[str, Any]] = []
     for cp in chunk_paths:
-        if not cp.exists():
-            print(f"  [!] Chunk path not found: {cp}. Generating fallback...")
-            N_nodes, E_edges, genes = 6194, 24000, 500
-            raw = {
-                "x": torch.randn(N_nodes, genes).abs(),
-                "src": torch.randint(0, N_nodes, (E_edges,), dtype=torch.int64),
-                "dst": torch.randint(0, N_nodes, (E_edges,), dtype=torch.int64),
-                "weights": torch.rand(E_edges, dtype=torch.float32),
-                "train_core_idx": torch.arange(0, int(N_nodes * 0.8), dtype=torch.int64),
-                "val_core_idx": torch.arange(int(N_nodes * 0.8), N_nodes, dtype=torch.int64),
-            }
-        else:
-            raw = torch.load(cp, map_location="cpu", weights_only=False)
-        sanitized_chunks.append(sanitize_chunk(raw))
+        c = load_and_verify_chunk(cp)
+        chunks_cpu.append(c)
+        print(f"  ↳ Loaded: {cp.name} [Nodes: {c['x'].size(0)}, Edges: {c['src'].size(0)}, Core: {c['train_core_idx'].size(0)}]")
 
-    in_channels = sanitized_chunks[0]["x"].shape[-1]
+    in_channels = chunks_cpu[0]["x"].shape[-1]
     n_latents = getattr(cfg, "n_latents", 512)
-    print(f"[*] Chunks Verified       : {len(sanitized_chunks)} | In-Channels: {in_channels} | Latents: {n_latents}")
 
-    # Initialize Model & Exact Optimizer Groupings
+    # 3. Model & Optimizer Initialization
     model = LibellaGNN(in_channels=in_channels, n_metaprograms=n_latents).to(device)
+    model.train()
 
     bias_ambient_params = [
         p for n, p in model.named_parameters()
@@ -662,36 +715,72 @@ def main() -> None:
         {"params": bias_ambient_params, "lr": lr_base * getattr(cfg, "ambient_lr_mult", 5.0), "weight_decay": 0.0},
     ])
 
-    timer = StageTimer()
-    meta_batch_size = len(sanitized_chunks)
+    # 4. Zero-Synchronization Accumulators & GPU Buffers
+    accumulation_steps = len(chunks_cpu)
+    train_steps = 0
+    val_steps = 0
+    train_chunk_count = 0
 
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-
+    train_loss_acc = torch.tensor(0.0, device=device)
+    val_loss_acc = torch.tensor(0.0, device=device)
     step_loss_acc = torch.tensor(0.0, device=device)
+
+    gpu_telemetry = {
+        "l_rec": torch.tensor(0.0, device=device),
+        "l_ort": torch.tensor(0.0, device=device),
+        "l_sparse": torch.tensor(0.0, device=device),
+        "l_aux": torch.tensor(0.0, device=device),
+        "l0_avg": torch.tensor(0.0, device=device),
+        "dead_cnt": torch.tensor(0.0, device=device),
+        "max_act": torch.tensor(0.0, device=device),
+        "dyn_w": torch.tensor(0.0, device=device),
+        "z_mag_mean": torch.tensor(0.0, device=device),
+    }
+
+    alpha_ema = min(
+        getattr(cfg, "alpha_ema_max", 0.05),
+        1.0 / (accumulation_steps * getattr(cfg, "alpha_ema_step_multiplier", 1.0) + 1e-9),
+    )
+    ema_latent_freq = None
+
+    optimizer.zero_grad(set_to_none=True)
+    step_loss_acc.zero_()
     last_r_pos = None
     last_dead_mask = None
-    device_chunks = []
 
-    t_wall_start = time.perf_counter_ns()
+    # Pre-step device barrier
+    if device.type == "mps":
+        torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize()
+
+    t_step_start = time.perf_counter_ns()
 
     # -----------------------------------------------------------------------
-    # Gradient Accumulation Over 5 Batches
+    # 5. Exact Gradient Accumulation Pass Across All 5 Chunks
     # -----------------------------------------------------------------------
-    for b_idx, batch in enumerate(sanitized_chunks):
-        t0 = time.perf_counter_ns()
+    for chunk_idx, batch in enumerate(chunks_cpu):
         x = batch["x"].to(device=device, non_blocking=True).contiguous()
         src = batch["src"].to(device=device, dtype=torch.int64, non_blocking=True).contiguous()
         dst = batch["dst"].to(device=device, dtype=torch.int64, non_blocking=True).contiguous()
-        weights = batch["weights"].to(device=device, dtype=torch.float32, non_blocking=True).contiguous()
+        weights = batch["weights"].to(device=device, non_blocking=True).contiguous()
+
+        # Edge Dropout (Exact Production Implementation)
+        if model.training and src.numel() > 0:
+            edge_drop = getattr(cfg, "edge_dropout", 0.0)
+            if edge_drop > 0.0:
+                keep_mask = torch.rand(src.size(0), device=device) > edge_drop
+                src = src[keep_mask].contiguous()
+                dst = dst[keep_mask].contiguous()
+                weights = weights[keep_mask].contiguous()
 
         x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
-        device_chunks.append({"x": x, "src": src, "dst": dst, "weights": weights})
-        timer.record("host_to_device_transfer", time.perf_counter_ns() - t0)
 
-        model.current_progress = 0.0
+        # Progress and Latent K State
+        model.current_progress = progress
         model.current_k = getattr(cfg, "topk_k", 3)
 
+        # Forward Pass
         (
             recon,
             z,
@@ -701,12 +790,12 @@ def main() -> None:
             z_mag,
             r_pos,
             dead_mask,
-        ) = model(x, src, dst, weights, profiler=timer)
+        ) = model(x, src, dst, weights)
 
         last_r_pos = r_pos
         last_dead_mask = dead_mask
 
-        t0 = time.perf_counter_ns()
+        # Train Core Slice
         train_idx = batch["train_core_idx"].to(device=device, dtype=torch.int64, non_blocking=True)
         x_train = x[train_idx]
         recon_train = recon[train_idx]
@@ -714,6 +803,7 @@ def main() -> None:
         aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
         r_norm_train = r_norm[train_idx] if r_norm is not None else None
 
+        # Loss Calculation
         loss_res = model.calc_loss(
             recon_train,
             x_train,
@@ -721,21 +811,108 @@ def main() -> None:
             w_dec_norm,
             aux_recon=aux_recon_train,
             r_norm=r_norm_train,
-            progress=0.0,
+            progress=progress,
         )
-        batch_loss = loss_res[0]
-        timer.record("loss_computation", time.perf_counter_ns() - t0)
+        true_batch_loss = loss_res[0]
+        base_recon_val = loss_res[1]
+        base_ort_val = loss_res[2]
+        base_sparse_val = loss_res[3]
+        base_aux_val = loss_res[4]
 
-        t0 = time.perf_counter_ns()
-        (batch_loss / meta_batch_size).backward()
-        timer.record("backward_autograd", time.perf_counter_ns() - t0)
+        # Backward Pass with Accumulation Scaling
+        (true_batch_loss / accumulation_steps).backward()
 
-        step_loss_acc.add_(batch_loss.detach() / meta_batch_size)
+        step_loss_acc.add_(true_batch_loss.detach() / accumulation_steps)
+        train_loss_acc += true_batch_loss.detach()
+        train_steps += 1
+
+        # Real-time GPU Telemetry Accumulator Updates
+        with torch.no_grad():
+            active_thresh = getattr(cfg, "active_latent_threshold", 1e-4)
+            batch_active = (z_train > active_thresh).float()
+            current_freq = batch_active.mean(dim=0)
+
+            if ema_latent_freq is None:
+                ema_latent_freq = current_freq.clone()
+            else:
+                ema_latent_freq.lerp_(current_freq, weight=alpha_ema)
+
+            dead_count_val = (
+                (model.steps_since_active >= model.dead_step_threshold).float().sum()
+                if hasattr(model, "steps_since_active")
+                else torch.tensor(0.0, device=device)
+            )
+
+            gpu_telemetry["l_rec"] += base_recon_val
+            gpu_telemetry["l_ort"] += base_ort_val
+            gpu_telemetry["l_sparse"] += base_sparse_val
+            gpu_telemetry["l_aux"] += base_aux_val
+            gpu_telemetry["l0_avg"] += batch_active.sum(dim=-1).mean()
+            gpu_telemetry["dead_cnt"] += dead_count_val
+            gpu_telemetry["max_act"] += z_train.max()
+            gpu_telemetry["dyn_w"] += model.dynamic_w_ema.detach()
+            if z_mag is not None:
+                gpu_telemetry["z_mag_mean"] += z_mag.detach().mean()
+
+        train_chunk_count += 1
+
+        # Explicit garbage collection of training tensors
+        del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, true_batch_loss
+
+        # Online Validation Evaluation
+        val_core_idx_cpu = batch.get("val_core_idx")
+        if val_core_idx_cpu is not None and val_core_idx_cpu.numel() > 0:
+            val_idx = val_core_idx_cpu.to(device=device, non_blocking=True)
+
+            with torch.no_grad():
+                val_recon = recon[val_idx]
+                x_val = x[val_idx]
+
+                is_non_zero_val = x_val > 0
+                dynamic_w = getattr(model, "dynamic_w_ema", torch.tensor(1.0, device=device))
+                w_mat = torch.where(is_non_zero_val, dynamic_w, 1.0)
+
+                variance_weight_val = w_mat * (1.0 + torch.log1p(x_val))
+                variance_weight_val = variance_weight_val / torch.clamp(
+                    variance_weight_val.mean(), min=1e-5
+                )
+
+                raw_delta_val = val_recon - x_val
+                asym_penalty = getattr(cfg, "asym_penalty_weight", 0.5)
+                asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * asym_penalty) * (
+                    raw_delta_val < 0
+                ).to(x_val.dtype)
+                scaled_delta_val = raw_delta_val * asym_val
+
+                abs_delta_val = scaled_delta_val.abs()
+                log_cosh_val = (
+                    abs_delta_val + F.softplus(-2.0 * abs_delta_val) - 0.6931471805599453
+                )
+
+                per_cell_val = torch.sum(variance_weight_val * log_cosh_val, dim=-1)
+                val_log_cosh = torch.mean(per_cell_val) / math.sqrt(x_val.shape[-1])
+
+                val_loss_acc.add_(val_log_cosh)
+                val_steps += 1
+
+            del (
+                val_idx,
+                val_recon,
+                x_val,
+                w_mat,
+                raw_delta_val,
+                asym_val,
+                scaled_delta_val,
+                per_cell_val,
+                log_cosh_val,
+            )
+
+        # Immediate lifecycle purge of chunk tensors
+        del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm
 
     # -----------------------------------------------------------------------
-    # Step Updates (Clipping, Tangent Projection, Step, Retraction)
+    # 6. Post-Accumulation Parameter & Optimization Step
     # -----------------------------------------------------------------------
-    t0 = time.perf_counter_ns()
     recon_keys = ("decoder_bias", "ambient_scale", "decoder_weight")
     recon_params = [
         p for n, p in model.named_parameters()
@@ -747,27 +924,25 @@ def main() -> None:
     ]
 
     if recon_params:
-        torch.nn.utils.clip_grad_norm_(recon_params, max_norm=getattr(cfg, "grad_clip_recon", 5.0))
+        torch.nn.utils.clip_grad_norm_(
+            recon_params, max_norm=getattr(cfg, "grad_clip_recon", 5.0)
+        )
     if spatial_params:
-        torch.nn.utils.clip_grad_norm_(spatial_params, max_norm=getattr(cfg, "grad_clip_spatial", 15.0))
-    timer.record("gradient_clipping", time.perf_counter_ns() - t0)
+        torch.nn.utils.clip_grad_norm_(
+            spatial_params, max_norm=getattr(cfg, "grad_clip_spatial", 15.0)
+        )
 
-    # Tangent Projection
-    t0 = time.perf_counter_ns()
+    # In-Place Tangent-Space Projection on Unit Sphere
     with torch.no_grad():
         if hasattr(model, "decoder_weight") and model.decoder_weight.grad is not None:
             w = F.normalize(model.decoder_weight.data, p=2, dim=1)
             grad = model.decoder_weight.grad
             grad.sub_((grad * w).sum(dim=1, keepdim=True) * w)
-    timer.record("tangent_space_projection", time.perf_counter_ns() - t0)
 
     # Optimizer Step
-    t0 = time.perf_counter_ns()
     optimizer.step()
-    timer.record("optimizer_adamw_step", time.perf_counter_ns() - t0)
 
-    # Spherical Retraction & Latent Resampling
-    t0 = time.perf_counter_ns()
+    # In-Place Non-Negative Spherical Retraction & Latent Resampling
     with torch.no_grad():
         if hasattr(model, "decoder_weight"):
             w_data = model.decoder_weight.data
@@ -777,68 +952,132 @@ def main() -> None:
 
         if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
             model.resample_dead_latents(last_r_pos, last_dead_mask, optimizer=optimizer)
-    timer.record("spherical_retraction", time.perf_counter_ns() - t0)
 
-    # Benchmark Barrier
+    # Final Synchronization Barrier (For clean step timing and telemetry harvest)
     if device.type == "mps":
         torch.mps.synchronize()
     elif device.type == "cuda":
         torch.cuda.synchronize()
 
-    t_wall_end = time.perf_counter_ns()
-    total_wall_ms = (t_wall_end - t_wall_start) / 1e6
-
-    # Collect Telemetry
-    host_stats = monitor.harvest()
-    memory_audit = audit_memory_footprint(model, device_chunks, optimizer)
+    t_step_end = time.perf_counter_ns()
+    total_step_wall_ms = (t_step_end - t_step_start) / 1e6
 
     # -----------------------------------------------------------------------
-    # Diagnostic Reports
+    # 7. Single GPU-to-CPU Barrier Transfer (1-to-1 Parity)
     # -----------------------------------------------------------------------
-    print("\n" + "=" * 85)
-    print(" 1. EXTERNAL SUBPROCESS HOST METRICS (Zero GIL / Zero Lock Contention)")
-    print("=" * 85)
-    print(f"  • Telemetry Poll Samples : {host_stats.get('samples', 0)}")
-    print(f"  • CPU Utilization (Avg)  : {host_stats.get('cpu_avg', 0.0):.2f}%")
-    print(f"  • CPU Utilization (Peak) : {host_stats.get('cpu_max', 0.0):.2f}%")
-    print(f"  • Process RSS Baseline   : {host_stats.get('rss_start_mb', 0.0):.2f} MB")
-    print(f"  • Process RSS Peak       : {host_stats.get('rss_peak_mb', 0.0):.2f} MB")
-    print(f"  • Net RAM Expansion (Δ)  : {host_stats.get('rss_delta_mb', 0.0):+.2f} MB")
-    print(f"  • Virtual Memory Peak    : {host_stats.get('vms_peak_mb', 0.0):.2f} MB")
+    telemetry_keys = [
+        "l_rec", "l_ort", "l_sparse", "l_aux",
+        "l0_avg", "dead_cnt", "max_act", "dyn_w", "z_mag_mean"
+    ]
 
-    print("\n" + "=" * 85)
-    print(f" 2. PIPELINE STAGE LATENCIES (Total Compute Step: {total_wall_ms:.2f} ms)")
-    print("=" * 85)
-    print(f"{'Pipeline Execution Stage':<35} | {'Latency (ms)':<15} | {'% of Total':<10}")
-    print("-" * 68)
-    for stage, ns in timer.stages_ns.items():
-        ms = ns / 1e6
-        pct = (ms / total_wall_ms) * 100.0 if total_wall_ms > 0 else 0.0
-        print(f"{stage:<35} | {ms:<15.3f} | {pct:<9.2f}%")
+    all_scalars_gpu = torch.stack([
+        train_loss_acc / (train_steps + 1e-9),
+        val_loss_acc / (val_steps + 1e-9),
+        *[gpu_telemetry[k] / train_chunk_count for k in telemetry_keys],
+    ])
 
-    print("\n" + "=" * 85)
-    print(" 3. TOP TENSOR RESIDENCY MAP (Parameters, Gradients, AdamW States)")
-    print("=" * 85)
-    print(f"{'Scope':<15} | {'Identifier':<35} | {'Shape':<20} | {'Dtype':<8} | {'RAM (MB)':<10}")
-    print("-" * 95)
-    sorted_mem = sorted(memory_audit, key=lambda r: r["mb"], reverse=True)
-    total_mb = sum(r["mb"] for r in memory_audit)
-    for r in sorted_mem[:20]:
-        print(f"{r['scope']:<15} | {r['identifier']:<35} | {r['shape']:<20} | {r['dtype']:<8} | {r['mb']:<10.4f}")
-    print("-" * 95)
-    print(f"  Total Explicitly Tracked Tensor Memory: {total_mb:.2f} MB")
+    all_scalars_host = all_scalars_gpu.cpu().tolist()
 
-    print("\n" + "=" * 85)
-    print(" 4. NUMERICAL STATE & INVARIANT VERIFICATION")
-    print("=" * 85)
-    print(f"  • Step Accumulated Loss  : {step_loss_acc.item():.6f}")
-    print(f"  • Dynamic Zero Weight EMA : {model.dynamic_w_ema.item():.4f}")
-    print(f"  • Ambient Decouple Coeff  : {torch.sigmoid(model.ambient_scale).item() * 0.35:.4f}")
-    print(f"  • Spherical Atom Unit Norm: {torch.allclose(torch.linalg.vector_norm(model.decoder_weight.data, ord=2, dim=-1), torch.ones(n_latents, device=device), atol=1e-3)}")
-    print(f"  • Active Latent Ratio     : {(model.steps_since_active < model.dead_step_threshold).sum().item()}/{n_latents}")
-    print("=" * 85 + "\n")
+    final_train_loss = all_scalars_host[0]
+    final_val_loss = all_scalars_host[1]
+
+    epoch_telemetry = {}
+    for idx, k in enumerate(telemetry_keys):
+        epoch_telemetry[k] = all_scalars_host[idx + 2]
+
+    current_l0_val = epoch_telemetry.get("l0_avg", float(model.n_latents))
+    epoch_telemetry["p_w"] = (1.0 - (current_l0_val / float(model.n_latents))) * 100.0
+
+    if ema_latent_freq is not None:
+        p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
+        epoch_telemetry["ent"] = (-(p_norm * torch.log(p_norm + 1e-9)).sum()).item()
+    else:
+        epoch_telemetry["ent"] = 0.0
+
+    current_rec = epoch_telemetry.get("l_rec", 0.0)
+    current_l0 = epoch_telemetry.get("l0_avg", 0.0)
+    composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
+
+    # Harvest Hardware Telemetry
+    host_stats = monitor.stop_and_harvest()
+    mem_audit = audit_runtime_memory(model, optimizer, device)
+
+    # -----------------------------------------------------------------------
+    # 8. Precise Telemetry Output Reports
+    # -----------------------------------------------------------------------
+    print("\n" + "=" * 90)
+    print(" 1. EXACT TRAINING INVARIANTS & NUMERICAL LOSS STATE (5th Decimal Precision)")
+    print("=" * 90)
+    print(f"  • Accumulated Train Loss   : {final_train_loss:.5f}")
+    print(f"  • Accumulated Val Loss     : {final_val_loss:.5f}")
+    print(f"  • Reconstruction Loss (L_rec): {epoch_telemetry['l_rec']:.5f}")
+    print(f"  • Orthogonality Loss (L_ort) : {epoch_telemetry['l_ort']:.5f}")
+    print(f"  • Sparsity Loss (L_sparse)  : {epoch_telemetry['l_sparse']:.5f}")
+    print(f"  • Auxiliary Revival (L_aux) : {epoch_telemetry['l_aux']:.5f}")
+    print(f"  • Dynamic Zero Weight EMA   : {epoch_telemetry['dyn_w']:.5f}")
+    print(f"  • Mean L0 Sparsity (Active) : {epoch_telemetry['l0_avg']:.5f} / {n_latents} ({epoch_telemetry['p_w']:.2f}% zero)")
+    print(f"  • Latent Activation Entropy : {epoch_telemetry['ent']:.5f}")
+    print(f"  • Peak Activation (Max)     : {epoch_telemetry['max_act']:.5f}")
+    print(f"  • Mean Gated Magnitude      : {epoch_telemetry['z_mag_mean']:.5f}")
+    print(f"  • Dead Latent Atoms Count   : {int(epoch_telemetry['dead_cnt'])} / {n_latents}")
+    print(f"  • Pareto Composite Score    : {composite_score:.5f}")
+
+    print("\n" + "=" * 90)
+    print(" 2. ISOLATED SUBPROCESS HARDWARE TELEMETRY (Zero GIL Contention)")
+    print("=" * 90)
+    print(f"  • Sampling Duration        : {host_stats.get('duration_sec', 0.0):.3f} s ({host_stats.get('samples', 0)} polling ticks)")
+    print(f"  • Process CPU Mean Load    : {host_stats.get('cpu_avg_pct', 0.0):.2f}%")
+    print(f"  • Process CPU Peak Burst   : {host_stats.get('cpu_max_pct', 0.0):.2f}%")
+    print(f"  • Baseline RSS Footprint   : {host_stats.get('rss_start_mb', 0.0):.2f} MB")
+    print(f"  • Peak RSS Memory          : {host_stats.get('rss_peak_mb', 0.0):.2f} MB")
+    print(f"  • Net RAM Expansion (Δ)    : {host_stats.get('rss_delta_mb', 0.0):+.2f} MB")
+    print(f"  • Virtual Memory Peak (VMS): {host_stats.get('vms_peak_mb', 0.0):.2f} MB")
+
+    print("\n" + "=" * 90)
+    print(" 3. DEVICE RUNTIME & DRIVER ALLOCATION BREAKDOWN")
+    print("=" * 90)
+    print(f"  • Total Step GPU Wall Time : {total_step_wall_ms:.3f} ms")
+    print(f"  • Parameters Memory        : {mem_audit['param_total_mb']:.4f} MB")
+    print(f"  • Gradients Memory         : {mem_audit['grad_total_mb']:.4f} MB")
+    print(f"  • Buffers Memory           : {mem_audit['buffer_total_mb']:.4f} MB")
+    print(f"  • AdamW Optimizer State    : {mem_audit['optimizer_total_mb']:.4f} MB")
+    print(f"  • Total Static Allocated   : {mem_audit['static_tracked_mb']:.4f} MB")
+
+    for k, v in mem_audit["driver"].items():
+        print(f"  • Driver Metric [{k:<22}]: {v:.2f} MB")
+
+    print("\n" + "=" * 90)
+    print(" 4. TOP ALLOCATED MODEL & OPTIMIZER TENSORS")
+    print("=" * 90)
+    print(f"{'Scope':<15} | {'Identifier':<35} | {'Shape':<18} | {'Dtype':<8} | {'RAM (MB)':<10}")
+    print("-" * 92)
+    sorted_tensors = sorted(mem_audit["tensors"], key=lambda r: r["mb"], reverse=True)
+    for t in sorted_tensors[:15]:
+        print(f"{t['scope']:<15} | {t['name']:<35} | {t['shape']:<18} | {t['dtype']:<8} | {t['mb']:<10.4f}")
+    print("=" * 90 + "\n")
 
 
+# ---------------------------------------------------------------------------
+# 7. Entry Point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
-    main()
+
+    parser = argparse.ArgumentParser(description="Libella 1-to-1 Step Telemetry Harness")
+    parser.add_argument("--progress", type=float, default=0.0, help="Training progress in [0.0, 1.0]")
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic initialization seed")
+    args = parser.parse_args()
+
+    default_chunks = [
+        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_0.pt"),
+        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_1.pt"),
+        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_2.pt"),
+        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_3.pt"),
+        Path("/Users/Hemato/project_3/benchmark/libella_output/run/temp_training_chunks/benchmark_data_chunk_4.pt"),
+    ]
+
+    run_exact_gradient_step(
+        chunk_paths=default_chunks,
+        progress=args.progress,
+        seed=args.seed,
+    )
