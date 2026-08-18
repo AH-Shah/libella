@@ -153,7 +153,7 @@ class LibellaGNN(nn.Module):
         z_sparse = torch.zeros_like(pre_acts).scatter(-1, topk_indices, topk_vals)
 
         return z_sparse, pre_acts, cell_mass, z_mag
-
+    
     @torch.no_grad()
     def resample_dead_latents(
         self,
