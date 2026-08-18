@@ -148,14 +148,20 @@ class LibellaGNN(nn.Module):
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         spatial_warmup = 0.20 + 0.80 * min(1.0, progress * 2.0)
 
-        # Clean Linear Pre-activation: Irrelevant latents land <= 0
-        raw_logits = bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift)
-        pre_acts = F.relu(raw_logits)
+        # Gated Affinity: irrelevant latents land strictly <= 0
+        raw_affinity = F.relu(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
 
-        # 8. Top-K Hard Sparsity
+        # 5. Top-K Selection with Learned Magnitude Scaling
         target_k = getattr(self, "current_k", self.k)
-        topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
-        z_sparse = torch.zeros_like(pre_acts).scatter_(-1, topk_indices, topk_vals)
+        _, topk_indices = torch.topk(raw_affinity, k=target_k, dim=-1)
+
+        # Gather magnitudes only for the winning top-k latents
+        topk_affinity = torch.gather(raw_affinity, -1, topk_indices)
+        topk_mag = torch.gather(z_mag, -1, topk_indices)
+        topk_acts = topk_affinity * topk_mag
+
+        z_sparse = torch.zeros_like(raw_affinity).scatter_(-1, topk_indices, topk_acts)
+        pre_acts = raw_affinity * z_mag
 
         return z_sparse, pre_acts, cell_mass, z_mag
     
