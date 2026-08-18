@@ -743,11 +743,11 @@ def pad_mps_shapes(
     node_bucket: int | None = None, 
     edge_bucket: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Calculate optimal buckets and pad graph shapes for PyTorch MPS."""
+    """Pad graph tensors with strict int64 index alignment for Apple Silicon MPS."""
     if node_bucket is None or edge_bucket is None:
-        if cfg.k_hops <= 1:
+        if getattr(cfg, "k_hops", 2) <= 1:
             n_max = cfg.batch_size * 2
-        elif cfg.k_hops == 2:
+        elif getattr(cfg, "k_hops", 2) == 2:
             n_max = cfg.batch_size * 4
         else:
             n_max = cfg.batch_size * 8
@@ -759,32 +759,35 @@ def pad_mps_shapes(
     N = x.size(0)
     E = src.size(0)
 
-    # Calculate padded sizes (rounding up to nearest bucket)
+    # Calculate padded bucket sizes
     N_pad = ((N + node_bucket - 1) // node_bucket) * node_bucket
-    E_pad = ((E + edge_bucket - 1) // edge_bucket) * edge_bucket
+    E_pad = (((E + edge_bucket - 1) // edge_bucket) * edge_bucket) if E > 0 else 0
 
-    # If we need to pad edges, we MUST guarantee at least one dummy node exists 
-    # for the dummy edges to safely point to.
+    # Ensure at least 1 dummy node exists if we are padding edges
     if E_pad > E and N_pad == N:
         N_pad += node_bucket 
 
-    # 1. Pad Nodes (with zeros)
+    # 1. Pad Nodes (fill dummy nodes with 0)
     if N_pad > N:
-        x_dummy = torch.zeros(N_pad - N, x.size(1), dtype=x.dtype, device=x.device)
-        x = torch.cat([x, x_dummy], dim=0)
+        x_dummy = torch.zeros((N_pad - N, x.size(1)), dtype=x.dtype, device=x.device)
+        x = torch.cat([x, x_dummy], dim=0).contiguous()
 
-    # 2. Pad Edges (Dummy edges pointing from Dummy Node -> Dummy Node with weight 0)
+    # 2. Pad Edges (route dummy edges strictly to dummy node N with weight 0)
     if E_pad > E:
-        # N is the index of the FIRST dummy node. We route all fake math through it.
-        dummy_idx = torch.full((E_pad - E,), N, dtype=src.dtype, device=src.device)
+        dummy_node_idx = N  # Points safely to the first padded dummy node
+        dummy_idx = torch.full((E_pad - E,), dummy_node_idx, dtype=torch.int64, device=src.device)
         dummy_w = torch.zeros(E_pad - E, dtype=weights.dtype, device=weights.device)
 
-        src = torch.cat([src, dummy_idx], dim=0)
-        dst = torch.cat([dst, dummy_idx], dim=0)
-        weights = torch.cat([weights, dummy_w], dim=0)
+        src = torch.cat([src.to(dtype=torch.int64), dummy_idx], dim=0).contiguous()
+        dst = torch.cat([dst.to(dtype=torch.int64), dummy_idx], dim=0).contiguous()
+        weights = torch.cat([weights, dummy_w], dim=0).contiguous()
+    else:
+        src = src.to(dtype=torch.int64).contiguous()
+        dst = dst.to(dtype=torch.int64).contiguous()
+        weights = weights.contiguous()
 
     return x, src, dst, weights
-
+    
 def build_graph_safe(f: Path, c_genes: list[str]) -> Path | None:
     """Wrap graph builder with safety checks to avoid identical retrains."""
     clean_stem = f.stem.replace("_graph", "")
