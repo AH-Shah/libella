@@ -344,8 +344,8 @@ def _train_loop(
                 base_sparse_val = loss_res[3]
                 base_aux_val = loss_res[4]
 
-                if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
-                    nan_detected = True
+                if math.isnan(final_train_loss) or math.isinf(final_train_loss):
+                    print(f"\n ↳ [!] NaN detected at Epoch {epoch}. Halting.")
                     break
 
                 (true_batch_loss / len(meta_meta)).backward()
@@ -495,22 +495,30 @@ def _train_loop(
             ]
 
             # 1. Stack 2 loss accumulators + 9 telemetry scalars into 1 GPU vector
-            all_scalars_gpu = torch.stack([
-                train_loss_acc / (train_steps + 1e-9),
-                val_loss_acc / (val_steps + 1e-9),
-                *[gpu_telemetry[k] / train_chunk_count for k in telemetry_keys],
-            ])
+        all_scalars_gpu = torch.stack([
+            train_loss_acc / (train_steps + 1e-9),
+            val_loss_acc / (val_steps + 1e-9),
+            *[gpu_telemetry[k] / train_chunk_count for k in telemetry_keys],
+        ])
 
-            # 2. Exactly ONE synchronous Metal transfer across Unified Memory
-            all_scalars_host = all_scalars_gpu.cpu().tolist()
+        # 2. Exactly ONE synchronous Metal transfer across Unified Memory
+        all_scalars_host = all_scalars_gpu.cpu().tolist()
 
-            # 3. Unpack losses into history
-            history["train_loss"].append(all_scalars_host[0])
-            history["val_loss"].append(all_scalars_host[1])
+        final_train_loss = all_scalars_host[0]
+        final_val_loss = all_scalars_host[1]
 
-            # 4. Unpack metrics into dictionary
-            for idx, k in enumerate(telemetry_keys):
-                epoch_telemetry[k] = all_scalars_host[idx + 2]
+        # 3. Check for numerical instability before history logging
+        if math.isnan(final_train_loss) or math.isinf(final_train_loss):
+            print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
+            break
+
+        # 4. Unpack losses into history
+        history["train_loss"].append(final_train_loss)
+        history["val_loss"].append(final_val_loss)
+
+        # 5. Unpack metrics into dictionary
+        for idx, k in enumerate(telemetry_keys):
+            epoch_telemetry[k] = all_scalars_host[idx + 2]
 
             current_l0_val = epoch_telemetry.get("l0_avg", float(model.n_latents))
             epoch_telemetry["p_w"] = (1.0 - (current_l0_val / float(model.n_latents))) * 100.0
