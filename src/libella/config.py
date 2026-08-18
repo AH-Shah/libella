@@ -39,7 +39,7 @@ class RunConfig:
     k_hops: int = 2
     n_prior_lineages: int = 30
     n_dict_components: int = 100
-    n_latents: int | None = 36
+    n_latents: int | None = 256
     extra_topics: int = 0
 
     # Training & Batches
@@ -69,7 +69,7 @@ class RunConfig:
     spatial_gain_init: float = 2.5
 
     # Top-K Sparsity & Latent Dynamics
-    topk_k: int = 6
+    topk_k: int = 24
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
