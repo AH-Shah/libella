@@ -117,20 +117,18 @@ class LibellaGNN(nn.Module):
                 # Symmetric Laplacian normalization
                 deg = torch.zeros((N, 1), dtype=x_dense.dtype, device=x_dense.device)
                 deg.index_add_(0, dst, torch.ones((dst.size(0), 1), dtype=x_dense.dtype, device=x_dense.device))
-                norm_inv_sqrt = torch.rsqrt(torch.clamp(deg, min=1.0))
-                edge_norm = norm_inv_sqrt[src] * norm_inv_sqrt[dst]
+                edge_norm = torch.rsqrt(torch.clamp(deg[src], min=1.0)) * torch.rsqrt(torch.clamp(deg[dst], min=1.0))
 
             W_bil = edge_weights.unsqueeze(1) * decay
-            gate_in = torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)
-            gate = torch.sigmoid(self.edge_gate(gate_in))
+            gate = torch.sigmoid(self.edge_gate(torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)))
 
-            # 5. Selective Graph Message Passing (Autograd-Isolated per Hop)
             h_sp = h_self
             for _ in range(self.k_hops):
                 msg = self.spatial_lin(h_sp)[src] * gate * edge_norm
                 h_sp = h_sp + F.silu(torch.zeros_like(h_sp).index_add_(0, dst, msg))
         else:
             h_sp = h_self
+
 
 
 
