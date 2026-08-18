@@ -92,11 +92,11 @@ def build_spatial_graph(
     cos_sim = np.zeros(len(src), dtype=np.float32)
     
 
-    chunk_size = cfg.chunk_size 
+    batch_size = cfg.batch_size 
     idx_pointer = 0
     
-    for i in range(0, N, chunk_size):
-        end = min(i + chunk_size, N)
+    for i in range(0, N, batch_size):
+        end = min(i + batch_size, N)
         n_chunk = end - i
         
         # 1. Source cells (No redundancy) -> Shape: (n_chunk, G)

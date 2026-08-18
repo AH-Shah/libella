@@ -52,7 +52,6 @@ class RunConfig:
     # Graph & Data
     k_neighbors: int = 11
     moran_k: int = 7
-    chunk_size: int = 2000
     feature_cap: int = 50_000
     top_n_genes: int = 2000
     max_cells_per_sample: int = 1_000_000
