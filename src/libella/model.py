@@ -85,21 +85,26 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if len(src) > 0:
+        N = x_dense.size(0)
+        has_edges = src.numel() > 0
+
+        # 1. Stride Alignment for MPS Hardware Addressing
+        if has_edges:
             src = src.contiguous()
             dst = dst.contiguous()
+            edge_weights = edge_weights.contiguous()
 
-        N = x_dense.size(0)
-
-        # 1. Depth Disentanglement
-        cell_mass = torch.clamp(x_dense.norm(p=2, dim=-1, keepdim=True), min=1e-5)
+        # 2. Depth Disentanglement (Vectorized L2 Norm on Metal ALU)
+        cell_mass = torch.clamp(
+            torch.linalg.vector_norm(x_dense, ord=2, dim=-1, keepdim=True), min=1e-5
+        )
         x_norm = x_dense / cell_mass
 
-        # 2. Self Feature Extraction
+        # 3. Self Feature Extraction
         h_self = self.self_enc(x_norm)
 
-        # 3. Bilateral Edge Filtering & Symmetric Normalization
-        if len(src) > 0:
+        # 4. Bilateral Edge Filtering & Symmetric Normalization
+        if has_edges:
             with torch.no_grad():
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
                 decay = torch.sigmoid(
@@ -108,37 +113,36 @@ class LibellaGNN(nn.Module):
                 )
 
                 # Symmetric Laplacian normalization
-                deg = torch.zeros((N, 1), device=x_dense.device)
-                deg.index_add_(0, dst, torch.ones((len(dst), 1), device=x_dense.device))
-                norm_inv_sqrt = 1.0 / torch.clamp(deg.sqrt(), min=1.0)
+                deg = torch.zeros((N, 1), dtype=x_dense.dtype, device=x_dense.device)
+                deg.index_add_(0, dst, torch.ones((dst.size(0), 1), dtype=x_dense.dtype, device=x_dense.device))
+                norm_inv_sqrt = torch.rsqrt(torch.clamp(deg, min=1.0))
                 edge_norm = norm_inv_sqrt[src] * norm_inv_sqrt[dst]
 
             W_bil = edge_weights.unsqueeze(1) * decay
-
-            # Feature-aware directional gate
             gate_in = torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)
             gate = self.edge_gate(gate_in)
 
-            # 4. Selective Graph Message Passing
+            # 5. Selective Graph Message Passing (Autograd-Isolated per Hop)
             h_sp = h_self
             for _ in range(self.k_hops):
                 h_proj = self.spatial_lin(h_sp)
                 msg = h_proj[src] * gate * edge_norm
-                agg = torch.zeros_like(h_sp)
-                agg.index_add_(0, dst, msg)
-
+                
+                # Fresh tensor allocation per hop preserves Autograd graph history for backward pass
+                agg = torch.zeros_like(h_sp).index_add_(0, dst, msg)
                 h_sp = h_sp + F.silu(agg)
         else:
             h_sp = h_self
 
-        # 5. Fusion of Self + Spatial Context
+        # 6. Fusion of Self + Spatial Context
         h_fused = F.layer_norm(h_self + h_sp, [self.hidden_dim])
 
-        # 6. Unconstrained Magnitude & Spatial Gating Shifts
+        # 7. Unconstrained Magnitude & Spatial Gating Shifts
         z_mag = self.mag_head(h_fused)
 
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        bio_sim = torch.mm(x_norm, w_dec_norm.t())
+        # Direct GEMM without explicit transpose view allocations
+        bio_sim = F.linear(x_norm, w_dec_norm)
         spatial_shift = self.spatial_gate_head(h_sp)
 
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
@@ -147,10 +151,10 @@ class LibellaGNN(nn.Module):
         raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
         pre_acts = raw_affinity * z_mag
 
-        # 7. Top-K Hard Sparsity
+        # 8. Top-K Hard Sparsity
         target_k = getattr(self, "current_k", self.k)
         topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
-        z_sparse = torch.zeros_like(pre_acts).scatter(-1, topk_indices, topk_vals)
+        z_sparse = torch.zeros_like(pre_acts).scatter_(-1, topk_indices, topk_vals)
 
         return z_sparse, pre_acts, cell_mass, z_mag
     
