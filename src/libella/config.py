@@ -69,7 +69,7 @@ class RunConfig:
     spatial_gain_init: float = 2.5
 
     # Top-K Sparsity & Latent Dynamics
-    topk_k: int = 3
+    topk_k: int = 6
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0

@@ -25,7 +25,7 @@ class LibellaGNN(nn.Module):
         self.k_hops = getattr(cfg, "k_hops", 2)
         self.n_latents = n_metaprograms
         self.in_channels = in_channels
-        self.k = getattr(cfg, "topk_k", 3)
+        self.k = getattr(cfg, "topk_k", 6)
 
         # 1. Identity Encoder (Self Signal)
         self.self_enc = nn.Sequential(
