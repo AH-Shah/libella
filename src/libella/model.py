@@ -171,7 +171,7 @@ class LibellaGNN(nn.Module):
 
         dead_indices = torch.nonzero(dead_mask).squeeze(-1)
         num_dead = dead_indices.numel()
-        cell_res_energy = r_pos.norm(p=2, dim=-1)
+        cell_res_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1)
 
         k_resample = min(num_dead, (cell_res_energy > 0.05).sum().item())
         if k_resample == 0:
@@ -180,22 +180,23 @@ class LibellaGNN(nn.Module):
         worst_cells = torch.topk(cell_res_energy, k=k_resample, dim=0).indices
         target_dead_ids = dead_indices[:k_resample]
 
+        # In-place noise injection to prevent allocation thrashing
         candidates = r_pos[worst_cells].clone()
         noise = torch.randn_like(candidates) * 0.02
-        candidates = F.relu(candidates + noise)
+        candidates = F.relu(candidates.add_(noise))
 
         healthy_mask = ~dead_mask
         if healthy_mask.any():
             w_healthy = F.normalize(self.decoder_weight.data[healthy_mask], p=2, dim=-1)
-            proj = torch.mm(candidates, w_healthy.t())
-            candidates = candidates - torch.mm(proj, w_healthy)
-            candidates = F.relu(candidates)
+            # Direct GEMM without explicit transpose view allocations
+            proj = F.linear(candidates, w_healthy)
+            candidates = F.relu(candidates - torch.mm(proj, w_healthy))
 
-        norms = candidates.norm(p=2, dim=-1, keepdim=True)
+        norms = torch.linalg.vector_norm(candidates, ord=2, dim=-1, keepdim=True)
         collapsed = (norms < 1e-4).squeeze(-1)
         if collapsed.any():
             candidates[collapsed] = F.relu(
-                torch.randn(collapsed.sum(), candidates.size(-1), device=candidates.device)
+                torch.randn(int(collapsed.sum().item()), candidates.size(-1), device=candidates.device)
             )
 
         new_atoms = F.normalize(candidates, p=2, dim=-1)
@@ -211,7 +212,7 @@ class LibellaGNN(nn.Module):
                     state["exp_avg_sq"][target_dead_ids] = 0.0
 
         return k_resample
-
+        
     def forward(
         self,
         x_dense: torch.Tensor,
@@ -352,7 +353,7 @@ class LibellaGNN(nn.Module):
         total_loss = l_recon + (current_ortho * l_ortho) + (aux_weight * l_aux)
 
         return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
-        
+
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
         """Harvests parameter/gradient norms, SVD spectrum, effective rank, and correlation."""
