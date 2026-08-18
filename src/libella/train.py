@@ -413,7 +413,7 @@ def _train_loop(
                         per_cell_val = torch.sum(variance_weight_val * log_cosh_val, dim=-1)
                         val_log_cosh = torch.mean(per_cell_val) / math.sqrt(x_val.shape[-1])
 
-                        val_loss_acc += val_log_cosh
+                        val_loss_acc.add_(val_log_cosh)
                         val_steps += 1
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, per_cell_val, log_cosh_val
