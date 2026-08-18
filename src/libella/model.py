@@ -90,144 +90,6 @@ class LibellaGNN(nn.Module):
         N = x_dense.size(0)
         has_edges = src.numel() > 0
 
-        # 1. Stride Alignment for MPS Hardware Addressing
-        if has_edges:
-            src = src.contiguous()
-            dst = dst.contiguous()
-            edge_weights = edge_weights.contiguous()
-
-        # 2. Depth Disentanglement (Vectorized L2 Norm on Metal ALU)
-        cell_mass = torch.clamp(
-            torch.linalg.vector_norm(x_dense, ord=2, dim=-1, keepdim=True), min=1e-5
-        )
-        x_norm = x_dense / cell_mass
-
-        # 3. Self Feature Extraction
-        h_self = self.self_enc(x_norm)
-
-        # 4. Bilateral Edge Filtering & Symmetric Normalization
-        if has_edges:
-            with torch.no_grad():
-                cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
-                decay = torch.sigmoid(
-                    (cos_sim - getattr(cfg, "edge_sim_threshold", 0.50))
-                    * getattr(cfg, "edge_decay_slope", 15.0)
-                )
-
-                # Symmetric Laplacian normalization
-                deg = torch.zeros((N, 1), dtype=x_dense.dtype, device=x_dense.device)
-                deg.index_add_(0, dst, torch.ones((dst.size(0), 1), dtype=x_dense.dtype, device=x_dense.device))
-                edge_norm = torch.rsqrt(torch.clamp(deg[src], min=1.0)) * torch.rsqrt(torch.clamp(deg[dst], min=1.0))
-
-            W_bil = edge_weights.unsqueeze(1) * decay
-            gate = torch.sigmoid(self.edge_gate(torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)))
-
-            h_sp = h_self
-            for _ in range(self.k_hops):
-                msg = self.spatial_lin(h_sp)[src] * gate * edge_norm
-                h_sp = h_sp + F.silu(torch.zeros_like(h_sp).index_add_(0, dst, msg))
-        else:
-            h_sp = h_self
-
-
-
-
-        # 6. Fusion of Self + Spatial Context
-        h_fused = F.layer_norm(h_self + h_sp, [self.hidden_dim])
-
-        # 7. Unconstrained Magnitude & Spatial Gating Shifts
-        z_mag = self.mag_head(h_fused)
-
-        # 4. Gating (True Zero-Floor)
-        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        bio_sim = F.linear(x_norm, w_dec_norm)
-        spatial_shift = self.spatial_gate_head(h_sp)
-
-        progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
-        spatial_warmup = 0.20 + 0.80 * min(1.0, progress * 2.0)
-
-        # Gated Affinity: irrelevant latents land strictly <= 0
-        raw_affinity = F.relu(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
-
-        # 5. Top-K Selection with Learned Magnitude Scaling
-        target_k = getattr(self, "current_k", self.k)
-        _, topk_indices = torch.topk(raw_affinity, k=target_k, dim=-1)
-
-        # Gather magnitudes only for the winning top-k latents
-        topk_affinity = torch.gather(raw_affinity, -1, topk_indices)
-        topk_mag = torch.gather(z_mag, -1, topk_indices)
-        topk_acts = topk_affinity * topk_mag
-
-        z_sparse = torch.zeros_like(raw_affinity).scatter_(-1, topk_indices, topk_acts)
-        pre_acts = raw_affinity * z_mag
-
-        return z_sparse, pre_acts, cell_mass, z_mag
-    
-    @torch.no_grad()
-    def resample_dead_latents(
-        self,
-        r_pos: torch.Tensor,
-        dead_mask: torch.Tensor,
-        optimizer: torch.optim.Optimizer | None = None,
-    ) -> int:
-        """Resamples dead atoms with Gram-Schmidt orthogonalization to prevent cloning."""
-        if not dead_mask.any():
-            return 0
-
-        dead_indices = torch.nonzero(dead_mask).squeeze(-1)
-        num_dead = dead_indices.numel()
-        cell_res_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1)
-
-        k_resample = min(num_dead, (cell_res_energy > 0.05).sum().item())
-        if k_resample == 0:
-            return 0
-
-        worst_cells = torch.topk(cell_res_energy, k=k_resample, dim=0).indices
-        target_dead_ids = dead_indices[:k_resample]
-
-        # In-place noise injection to prevent allocation thrashing
-        candidates = r_pos[worst_cells].clone()
-        noise = torch.randn_like(candidates) * 0.02
-        candidates = F.relu(candidates.add_(noise))
-
-        healthy_mask = ~dead_mask
-        if healthy_mask.any():
-            w_healthy = F.normalize(self.decoder_weight.data[healthy_mask], p=2, dim=-1)
-            # Direct GEMM without explicit transpose view allocations
-            proj = F.linear(candidates, w_healthy)
-            candidates = F.relu(candidates - torch.mm(proj, w_healthy))
-
-        norms = torch.linalg.vector_norm(candidates, ord=2, dim=-1, keepdim=True)
-        collapsed = (norms < 1e-4).squeeze(-1)
-        if collapsed.any():
-            candidates[collapsed] = F.relu(
-                torch.randn(int(collapsed.sum().item()), candidates.size(-1), device=candidates.device)
-            )
-
-        new_atoms = F.normalize(candidates, p=2, dim=-1)
-        self.decoder_weight.data[target_dead_ids] = new_atoms
-        self.steps_since_active[target_dead_ids] = 0
-
-        if optimizer is not None:
-            state = optimizer.state.get(self.decoder_weight, None)
-            if state is not None:
-                if "exp_avg" in state:
-                    state["exp_avg"][target_dead_ids] = 0.0
-                if "exp_avg_sq" in state:
-                    state["exp_avg_sq"][target_dead_ids] = 0.0
-
-        return k_resample
-
-    def encode(
-        self,
-        x_dense: torch.Tensor,
-        src: torch.Tensor,
-        dst: torch.Tensor,
-        edge_weights: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        N = x_dense.size(0)
-        has_edges = src.numel() > 0
-
         # 1. Bounds Guard & Stride Alignment for MPS Hardware Addressing
         if has_edges:
             src = src.to(dtype=torch.int64).contiguous()
@@ -309,6 +171,125 @@ class LibellaGNN(nn.Module):
 
         return z_sparse, raw_acts, cell_mass, scaled_topk_vals
 
+    @torch.no_grad()
+    def resample_dead_latents(
+        self,
+        r_pos: torch.Tensor,
+        dead_mask: torch.Tensor,
+        optimizer: torch.optim.Optimizer | None = None,
+    ) -> int:
+        """Resamples dead atoms with Gram-Schmidt orthogonalization to prevent cloning."""
+        if not dead_mask.any():
+            return 0
+
+        dead_indices = torch.nonzero(dead_mask).squeeze(-1)
+        num_dead = dead_indices.numel()
+        cell_res_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1)
+
+        k_resample = min(num_dead, (cell_res_energy > 0.05).sum().item())
+        if k_resample == 0:
+            return 0
+
+        worst_cells = torch.topk(cell_res_energy, k=k_resample, dim=0).indices
+        target_dead_ids = dead_indices[:k_resample]
+
+        # In-place noise injection to prevent allocation thrashing
+        candidates = r_pos[worst_cells].clone()
+        noise = torch.randn_like(candidates) * 0.02
+        candidates = F.relu(candidates.add_(noise))
+
+        healthy_mask = ~dead_mask
+        if healthy_mask.any():
+            w_healthy = F.normalize(self.decoder_weight.data[healthy_mask], p=2, dim=-1)
+            # Direct GEMM without explicit transpose view allocations
+            proj = F.linear(candidates, w_healthy)
+            candidates = F.relu(candidates - torch.mm(proj, w_healthy))
+
+        norms = torch.linalg.vector_norm(candidates, ord=2, dim=-1, keepdim=True)
+        collapsed = (norms < 1e-4).squeeze(-1)
+        if collapsed.any():
+            candidates[collapsed] = F.relu(
+                torch.randn(int(collapsed.sum().item()), candidates.size(-1), device=candidates.device)
+            )
+
+        new_atoms = F.normalize(candidates, p=2, dim=-1)
+        self.decoder_weight.data[target_dead_ids] = new_atoms
+        self.steps_since_active[target_dead_ids] = 0
+
+        if optimizer is not None:
+            state = optimizer.state.get(self.decoder_weight, None)
+            if state is not None:
+                if "exp_avg" in state:
+                    state["exp_avg"][target_dead_ids] = 0.0
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"][target_dead_ids] = 0.0
+
+        return k_resample
+
+    def forward(
+        self,
+        x_dense: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        edge_weights: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        # 1. Spatial & Identity Encoding
+        z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
+        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
+
+        # 2. Baseline Decoupling (Strict 15% Cap so Sparse Latents Reconstruct Signal)
+        baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
+        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.15)
+
+        comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
+        x_recon = comp_profile * cell_mass
+
+        aux_recon = None
+        r_norm = None
+        r_pos_ret = None
+        dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
+
+        # 3. Auxiliary Loss & Dead Latent Tracking (Training Only)
+        if self.training:
+            with torch.no_grad():
+                active_in_batch = (z > 1e-4).any(dim=0)
+                self.steps_since_active.add_(1)
+                self.steps_since_active.masked_fill_(active_in_batch, 0)
+                dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
+
+            x_norm = F.normalize(x_dense, p=2, dim=-1)
+            x_recon_norm = F.normalize(F.relu(x_recon), p=2, dim=-1)
+            r_pos = F.relu(x_norm - x_recon_norm)
+            r_pos_ret = r_pos.detach()
+            r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
+            residual_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1).mean()
+
+            # Exact dual-gate AuxK condition
+            if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
+                dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
+                num_dead = dead_indices.numel()
+                k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
+
+                w_dead = w_dec_norm[dead_indices]
+                aux_sim = F.relu(F.linear(r_norm, w_dead))
+                topk_res = torch.topk(aux_sim, k=k_aux, dim=-1)
+
+                topk_aux_energy = torch.clamp(torch.sum(topk_res.values ** 2, dim=-1, keepdim=True), min=1e-4)
+                z_aux_weights = topk_res.values * torch.rsqrt(topk_aux_energy)
+
+                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, z_aux_weights)
+                aux_recon = torch.mm(z_aux, w_dead)
+
+        return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag, r_pos_ret, dead_mask_ret
 
     def calc_loss(
         self,
