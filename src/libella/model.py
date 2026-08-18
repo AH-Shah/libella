@@ -85,7 +85,7 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if len(src) > 0:
+        if src.numel() > 0 and not src.is_contiguous():
             src = src.contiguous()
             dst = dst.contiguous()
 
@@ -99,8 +99,9 @@ class LibellaGNN(nn.Module):
         h_self = self.self_enc(x_norm)
 
         # 3. Bilateral Edge Filtering & Symmetric Normalization
-        if len(src) > 0:
+        if src.numel() > 0:
             with torch.no_grad():
+                # Direct dot product without materializing full broadcasted intermediates
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
                 decay = torch.sigmoid(
                     (cos_sim - getattr(cfg, "edge_sim_threshold", 0.50))
@@ -108,8 +109,8 @@ class LibellaGNN(nn.Module):
                 )
 
                 # Symmetric Laplacian normalization
-                deg = torch.zeros((N, 1), device=x_dense.device)
-                deg.index_add_(0, dst, torch.ones((len(dst), 1), device=x_dense.device))
+                deg = torch.zeros((N, 1), device=x_dense.device, dtype=x_dense.dtype)
+                deg.index_add_(0, dst, torch.ones((dst.size(0), 1), device=x_dense.device, dtype=x_dense.dtype))
                 norm_inv_sqrt = 1.0 / torch.clamp(deg.sqrt(), min=1.0)
                 edge_norm = norm_inv_sqrt[src] * norm_inv_sqrt[dst]
 
@@ -119,14 +120,17 @@ class LibellaGNN(nn.Module):
             gate_in = torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)
             gate = self.edge_gate(gate_in)
 
-            # 4. Selective Graph Message Passing
+            # Pre-fuse static edge modulator across hops to save kernel launches
+            static_edge_mod = gate * edge_norm
+
+            # 4. Selective Graph Message Passing with buffer reuse
             h_sp = h_self
+            agg = torch.empty((N, self.hidden_dim), device=x_dense.device, dtype=x_dense.dtype)
             for _ in range(self.k_hops):
                 h_proj = self.spatial_lin(h_sp)
-                msg = h_proj[src] * gate * edge_norm
-                agg = torch.zeros_like(h_sp)
+                msg = h_proj[src] * static_edge_mod
+                agg.zero_()
                 agg.index_add_(0, dst, msg)
-
                 h_sp = h_sp + F.silu(agg)
         else:
             h_sp = h_self
@@ -150,7 +154,9 @@ class LibellaGNN(nn.Module):
         # 7. Top-K Hard Sparsity
         target_k = getattr(self, "current_k", self.k)
         topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
-        z_sparse = torch.zeros_like(pre_acts).scatter(-1, topk_indices, topk_vals)
+        z_sparse = torch.zeros(pre_acts.shape, dtype=pre_acts.dtype, device=pre_acts.device).scatter(
+            -1, topk_indices, topk_vals
+        )
 
         return z_sparse, pre_acts, cell_mass, z_mag
 
