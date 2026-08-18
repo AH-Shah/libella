@@ -228,10 +228,11 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
+        # 1. Spatial & Identity Encoding
         z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        # Baseline Decoupling
+        # 2. Baseline Decoupling (Clean GEMM: [N, n_latents] @ [n_latents, in_channels])
         baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
         ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.35)
 
@@ -243,6 +244,7 @@ class LibellaGNN(nn.Module):
         r_pos_ret = None
         dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
 
+        # 3. Auxiliary Loss & Dead Latent Tracking (Training Only)
         if self.training:
             with torch.no_grad():
                 active_in_batch = (z > 1e-4).any(dim=0)
@@ -255,26 +257,29 @@ class LibellaGNN(nn.Module):
             r_pos = F.relu(x_norm - x_recon_norm)
             r_pos_ret = r_pos.detach()
             r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
-            residual_energy = r_pos.norm(p=2, dim=-1).mean()
+            residual_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1).mean()
 
+            # Exact dual-gate condition preserved
             if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
                 dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
                 num_dead = dead_indices.numel()
                 k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
 
                 w_dead = w_dec_norm[dead_indices]
-                aux_sim = torch.mm(r_norm, w_dead.t())
+                # F.linear(X, W) maps directly to X @ W.T in MPS without materializing intermediate view tensors
+                aux_sim = F.linear(r_norm, w_dead)
                 topk_res = torch.topk(aux_sim, k=k_aux, dim=-1)
 
                 dead_mag = z_mag[:, dead_indices]
                 topk_mag = torch.gather(dead_mag, -1, topk_res.indices)
 
                 z_aux_weights = F.softplus(topk_res.values, beta=1.0) * topk_mag
-                z_aux = torch.zeros_like(aux_sim).scatter(-1, topk_res.indices, z_aux_weights)
+                # In-place scatter on fresh zero allocation avoids extra copy kernels
+                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, z_aux_weights)
                 aux_recon = torch.mm(z_aux, w_dead)
 
         return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag, r_pos_ret, dead_mask_ret
-
+        
     def calc_loss(
         self,
         recon_x: torch.Tensor,
