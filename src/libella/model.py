@@ -212,7 +212,7 @@ class LibellaGNN(nn.Module):
                     state["exp_avg_sq"][target_dead_ids] = 0.0
 
         return k_resample
-        
+
     def forward(
         self,
         x_dense: torch.Tensor,
@@ -356,34 +356,53 @@ class LibellaGNN(nn.Module):
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
-        """Harvests parameter/gradient norms, SVD spectrum, effective rank, and correlation."""
+        """Harvests parameter/gradient norms and SVD spectrum with minimal host syncs."""
         stats: dict[str, float] = {}
-        total_g_norm_sq = 0.0
+        
+        # 1. Vectorized Parameter & Gradient Norm Extraction
+        param_items = list(self.named_parameters())
+        p_names = [name.replace(".", "/") for name, _ in param_items]
+        
+        # Calculate L2 norms on GPU
+        p_norms = torch.stack([torch.linalg.vector_norm(p.detach(), ord=2) for _, p in param_items])
+        
+        g_tensors = [p.grad.detach() for _, p in param_items if p.grad is not None]
+        g_indices = [i for i, (_, p) in enumerate(param_items) if p.grad is not None]
+        
+        if g_tensors:
+            g_norms = torch.stack([torch.linalg.vector_norm(g, ord=2) for g in g_tensors])
+            g_zero_pcts = torch.stack([(g == 0).float().mean() * 100.0 for g in g_tensors])
+            total_g_norm = torch.linalg.vector_norm(g_norms, ord=2)
+            
+            # Single host transfer for all gradient statistics
+            g_norms_host = g_norms.cpu().tolist()
+            g_zeros_host = g_zero_pcts.cpu().tolist()
+            stats["grad_norm/global_l2"] = total_g_norm.item()
+            
+            for idx, g_idx in enumerate(g_indices):
+                clean_name = p_names[g_idx]
+                stats[f"grad_norm/{clean_name}"] = g_norms_host[idx]
+                stats[f"grad_zeros/{clean_name}_pct"] = g_zeros_host[idx]
+        else:
+            stats["grad_norm/global_l2"] = 0.0
 
-        for name, param in self.named_parameters():
-            p_clean = name.replace(".", "/")
-            stats[f"param_norm/{p_clean}"] = param.detach().norm(2).item()
-            if param.grad is not None:
-                g_norm = param.grad.detach().norm(2).item()
-                total_g_norm_sq += g_norm**2
-                stats[f"grad_norm/{p_clean}"] = g_norm
-                stats[f"grad_zeros/{p_clean}_pct"] = (
-                    (param.grad == 0).float().mean().item() * 100.0
-                )
+        p_norms_host = p_norms.cpu().tolist()
+        for idx, clean_name in enumerate(p_names):
+            stats[f"param_norm/{clean_name}"] = p_norms_host[idx]
 
-        stats["grad_norm/global_l2"] = total_g_norm_sq**0.5
-
+        # 2. Dictionary Cross-Correlation & Spectral Analysis
         if hasattr(self, "decoder_weight"):
             w = F.normalize(self.decoder_weight, p=2, dim=1)
-
             sim = torch.mm(w, w.t())
             off_diag_mask = ~torch.eye(w.size(0), dtype=torch.bool, device=w.device)
             off_diag_vals = sim.masked_select(off_diag_mask)
+            
             if off_diag_vals.numel() > 0:
                 stats["dict/max_cross_corr"] = off_diag_vals.max().item()
                 stats["dict/mean_cross_corr"] = off_diag_vals.abs().mean().item()
 
-            w_cpu = w.detach().cpu()
+            # Offload SVD computation to CPU float32 without blocking the GPU stream
+            w_cpu = w.detach().to(device="cpu", dtype=torch.float32)
             s = torch.linalg.svdvals(w_cpu)
             eff_rank = (s.sum() ** 2) / torch.clamp((s**2).sum(), min=1e-9)
             stats["dict/effective_rank"] = eff_rank.item()
@@ -391,6 +410,7 @@ class LibellaGNN(nn.Module):
             stats["dict/svd_sigma_2"] = s[1].item() if s.numel() > 1 else 0.0
             stats["dict/svd_sigma_3"] = s[2].item() if s.numel() > 2 else 0.0
 
+        # 3. Ambient Scale & Dead Latent Counters
         if hasattr(self, "ambient_scale"):
             lr_mult = getattr(cfg, "ambient_lr_mult", 1.0)
             max_cap = getattr(cfg, "ambient_max_cap", 0.35)

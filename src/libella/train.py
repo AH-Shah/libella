@@ -1,6 +1,7 @@
 """Model training loops and orchestrators for the Spatial Ecotype GNN."""
 from __future__ import annotations
-
+import os
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 import gc
 import math
 from collections.abc import Iterator
@@ -245,6 +246,7 @@ def _train_loop(
 
     tqdm.write("\n[*] Training Loop Initialized...")
 
+    step_loss_acc = torch.tensor(0.0, device=device)
     for epoch in tqdm(range(start_epoch, total_epochs), desc="Training", leave=False):
         model.train()
         train_steps, val_steps = 0, 0
@@ -277,29 +279,29 @@ def _train_loop(
 
         for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
             optimizer.zero_grad(set_to_none=True)
-            current_step_loss = 0.0
+            step_loss_acc.zero_()
             last_r_pos = None
             last_dead_mask = None
 
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
-                x = batch["x"].to(device=device, non_blocking=True)
-                src = batch["src"].to(device=device, non_blocking=True)
-                dst = batch["dst"].to(device=device, non_blocking=True)
-                weights = batch["weights"].to(device=device, non_blocking=True)
+                # Transfer contiguous data via Unified Memory DMA
+                x = batch["x"].to(device=device, non_blocking=True).contiguous()
+                
+                # MPS hardware operates at peak throughput with int32 indexing
+                idx_dtype = torch.int32 if device.type == "mps" else torch.int64
+                src = batch["src"].to(device=device, dtype=idx_dtype, non_blocking=True).contiguous()
+                dst = batch["dst"].to(device=device, dtype=idx_dtype, non_blocking=True).contiguous()
+                weights = batch["weights"].to(device=device, non_blocking=True).contiguous()
 
-                if model.training and len(src) > 0:
+                if model.training and src.numel() > 0:
                     edge_drop = getattr(cfg, "edge_dropout", 0.0)
                     if edge_drop > 0.0:
                         keep_mask = torch.rand(src.size(0), device=device) > edge_drop
-                        src = src[keep_mask]
-                        dst = dst[keep_mask]
-                        weights = weights[keep_mask]
+                        src = src[keep_mask].contiguous()
+                        dst = dst[keep_mask].contiguous()
+                        weights = weights[keep_mask].contiguous()
 
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
-
-                if device.type != "mps":
-                    src = src.to(torch.int64)
-                    dst = dst.to(torch.int64)
 
                 # Set spatial warmup progress
                 prog = tracker.get_progress() if tracker.phase == 2 else 0.0
@@ -321,7 +323,7 @@ def _train_loop(
                 last_r_pos = r_pos
                 last_dead_mask = dead_mask
 
-                train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
+                train_idx = batch["train_core_idx"].to(device=device, dtype=idx_dtype, non_blocking=True)
                 x_train = x[train_idx]
                 recon_train = recon[train_idx]
                 z_train = z[train_idx]
@@ -350,7 +352,8 @@ def _train_loop(
 
                 (true_batch_loss / len(meta_meta)).backward()
 
-                current_step_loss += true_batch_loss.detach().item() / len(meta_meta)
+                # Asynchronous GPU accumulation (Zero Host Sync)
+                step_loss_acc.add_(true_batch_loss.detach() / len(meta_meta))
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
 
@@ -470,7 +473,7 @@ def _train_loop(
             step_freq = getattr(cfg, "telemetry_step_freq", 0)
             if step_freq > 0 and (global_step % step_freq == 0):
                 step_metrics = {
-                    "step/batch_loss": current_step_loss,
+                    "step/batch_loss": step_loss_acc.item(),  # <-- Syncs ONLY when logging triggers
                     "step/lr": optimizer.param_groups[0]["lr"],
                     **logger.get_memory_metrics(device),
                 }
@@ -483,27 +486,50 @@ def _train_loop(
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
             break
 
-        # Epoch Synchronization
-        history["train_loss"].append((train_loss_acc / (train_steps + 1e-9)).item())
-        history["val_loss"].append((val_loss_acc / (val_steps + 1e-9)).item())
-
+        # --- REPLACEMENT: Single GPU-to-CPU Barrier ---
         scheduler.step()
-        gc.collect()
 
-        # Telemetry Resolution
         epoch_telemetry = {}
         if train_chunk_count > 0:
-            for k, v in gpu_telemetry.items():
-                epoch_telemetry[k] = (v / train_chunk_count).item()
+            telemetry_keys = [
+                "l_rec", "l_ort", "l_sparse", "l_aux",
+                "l0_avg", "dead_cnt", "max_act", "dyn_w", "z_mag_mean"
+            ]
+
+            # 1. Stack 2 loss accumulators + 9 telemetry scalars into 1 GPU vector
+            all_scalars_gpu = torch.stack([
+                train_loss_acc / (train_steps + 1e-9),
+                val_loss_acc / (val_steps + 1e-9),
+                *[gpu_telemetry[k] / train_chunk_count for k in telemetry_keys],
+            ])
+
+            # 2. Exactly ONE synchronous Metal transfer across Unified Memory
+            all_scalars_host = all_scalars_gpu.cpu().tolist()
+
+            # 3. Unpack losses into history
+            history["train_loss"].append(all_scalars_host[0])
+            history["val_loss"].append(all_scalars_host[1])
+
+            # 4. Unpack metrics into dictionary
+            for idx, k in enumerate(telemetry_keys):
+                epoch_telemetry[k] = all_scalars_host[idx + 2]
 
             current_l0_val = epoch_telemetry.get("l0_avg", float(model.n_latents))
             epoch_telemetry["p_w"] = (1.0 - (current_l0_val / float(model.n_latents))) * 100.0
 
             if ema_latent_freq is not None:
                 p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
-                epoch_telemetry["ent"] = -(p_norm * torch.log(p_norm + 1e-9)).sum().item()
+                epoch_telemetry["ent"] = (-(p_norm * torch.log(p_norm + 1e-9)).sum()).item()
             else:
                 epoch_telemetry["ent"] = 0.0
+        else:
+            # Fallback for empty epoch
+            losses = torch.stack([
+                train_loss_acc / (train_steps + 1e-9),
+                val_loss_acc / (val_steps + 1e-9)
+            ]).cpu().tolist()
+            history["train_loss"].append(losses[0])
+            history["val_loss"].append(losses[1])
 
         current_lr = round(optimizer.param_groups[0]["lr"], 6)
         current_rec = epoch_telemetry.get("l_rec", float("inf"))
@@ -555,12 +581,17 @@ def _train_loop(
         logger.log_metrics(epoch, epoch_log)
         logger.log_model_telemetry(epoch, model, log_histograms=False)
 
+        # --- Optimized Asynchronous Checkpointing ---
         if composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
+            
+            # Non-blocking copy of state dict directly to CPU to avoid Metal serialization locks
+            cpu_state_dict = {k: v.detach().to(device="cpu", non_blocking=True) for k, v in model.state_dict().items()}
+            
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": cpu_state_dict,
                     "best_composite_score": best_composite_score,
                     "metrics": epoch_metrics,
                     "history": history,
@@ -573,8 +604,11 @@ def _train_loop(
             autopsy_dir = out_dir / "autopsy_checkpoints"
             autopsy_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = autopsy_dir / f"epoch_{(epoch+1):03d}.pt"
+            
+            cpu_state_dict = {k: v.detach().to(device="cpu", non_blocking=True) for k, v in model.state_dict().items()}
+            
             torch.save(
-                {"epoch": epoch, "model_state_dict": model.state_dict(), "metrics": epoch_metrics},
+                {"epoch": epoch, "model_state_dict": cpu_state_dict, "metrics": epoch_metrics},
                 ckpt_path,
             )
 
@@ -583,7 +617,7 @@ def _train_loop(
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": cpu_state_dict,
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "best_composite_score": best_composite_score,
