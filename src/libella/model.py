@@ -167,15 +167,16 @@ class LibellaGNN(nn.Module):
         dead_mask: torch.Tensor,
         optimizer: torch.optim.Optimizer | None = None,
     ) -> int:
-        """Resamples dead atoms with Gram-Schmidt orthogonalization to prevent cloning."""
-        if not dead_mask.any():
-            return 0
-
+        """Resamples dead atoms with Gram-Schmidt projection without CPU sync stalls."""
         dead_indices = torch.nonzero(dead_mask).squeeze(-1)
         num_dead = dead_indices.numel()
-        cell_res_energy = r_pos.norm(p=2, dim=-1)
+        if num_dead == 0:
+            return 0
 
-        k_resample = min(num_dead, (cell_res_energy > 0.05).sum().item())
+        cell_res_energy = r_pos.norm(p=2, dim=-1)
+        valid_res_mask = cell_res_energy > 0.05
+        num_valid_res = int(valid_res_mask.sum())
+        k_resample = min(num_dead, num_valid_res)
         if k_resample == 0:
             return 0
 
@@ -187,7 +188,7 @@ class LibellaGNN(nn.Module):
         candidates = F.relu(candidates + noise)
 
         healthy_mask = ~dead_mask
-        if healthy_mask.any():
+        if healthy_mask.sum() > 0:
             w_healthy = F.normalize(self.decoder_weight.data[healthy_mask], p=2, dim=-1)
             proj = torch.mm(candidates, w_healthy.t())
             candidates = candidates - torch.mm(proj, w_healthy)
@@ -195,9 +196,9 @@ class LibellaGNN(nn.Module):
 
         norms = candidates.norm(p=2, dim=-1, keepdim=True)
         collapsed = (norms < 1e-4).squeeze(-1)
-        if collapsed.any():
+        if collapsed.sum() > 0:
             candidates[collapsed] = F.relu(
-                torch.randn(collapsed.sum(), candidates.size(-1), device=candidates.device)
+                torch.randn(int(collapsed.sum()), candidates.size(-1), device=candidates.device)
             )
 
         new_atoms = F.normalize(candidates, p=2, dim=-1)
