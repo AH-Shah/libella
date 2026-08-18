@@ -445,7 +445,7 @@ class SpatialBatcher:
         return len(self.chunks)
         
     def get_chunk(self, chunk_idx: int) -> dict[str, Any]:
-        """Dynamically expands K-Hop halo and produces LOCAL indices within [0, N_sub-1]."""
+        """Dynamically expands K-Hop halo and returns complete graph & metadata payload."""
         core_idx = self.chunks[chunk_idx]
         active_mask = np.zeros(self.n_cells, dtype=np.float32)
         active_mask[core_idx] = 1.0
@@ -454,37 +454,47 @@ class SpatialBatcher:
             active_mask = (self.adj.dot(active_mask) > 0).astype(np.float32)
         
         subgraph_nodes = np.where(active_mask > 0)[0]
-        N_sub = len(subgraph_nodes)
         global_to_local = {global_idx: local_idx for local_idx, global_idx in enumerate(subgraph_nodes)}
         
-        # Local core indices (strictly bounded within [0, N_sub - 1])
+        # Local core indices (strictly bounded within [0, len(subgraph_nodes) - 1])
         local_core_idx = np.array([global_to_local[idx] for idx in core_idx], dtype=np.int64)
         
-        # Extract train and val local core indices
+        # Slice local masks and indices
+        sub_train_mask = self.train_mask[subgraph_nodes]
+        sub_val_mask = self.val_mask[subgraph_nodes]
         is_train_core = self.train_mask[core_idx]
+        
         train_core_idx = torch.from_numpy(local_core_idx[is_train_core]).to(dtype=torch.int64)
         val_core_idx = torch.from_numpy(local_core_idx[~is_train_core]).to(dtype=torch.int64)
 
-        # Slice subgraph adjacency and convert to local int64 COO edges
-        adj_sub = self.adj[subgraph_nodes, :][:, subgraph_nodes].tocoo()
-        src = torch.from_numpy(adj_sub.row.astype(np.int64))
-        dst = torch.from_numpy(adj_sub.col.astype(np.int64))
-        weights = torch.from_numpy(adj_sub.data.astype(np.float32))
+        # Slice subgraph adjacency and extract COO edge lists
+        adj_sub = self.adj[subgraph_nodes, :][:, subgraph_nodes]
+        adj_sub_coo = adj_sub.tocoo()
+        src = torch.from_numpy(adj_sub_coo.row.astype(np.int64))
+        dst = torch.from_numpy(adj_sub_coo.col.astype(np.int64))
+        weights = torch.from_numpy(adj_sub_coo.data.astype(np.float32))
 
-        # Convert sparse cell features to Dense Float32 Tensor for the sub-batch
+        # Convert sparse cell features to Dense Float32 Tensor
         x_dense = self.X[subgraph_nodes]
         if sp.issparse(x_dense):
             x_dense = x_dense.toarray()
         x_tensor = torch.from_numpy(x_dense).to(dtype=torch.float32)
 
         return {
+            # Model execution tensors
             'x': x_tensor,
-            'adj': adj_sub,
             'src': src,
             'dst': dst,
             'weights': weights,
             'train_core_idx': train_core_idx,
             'val_core_idx': val_core_idx,
+            
+            # Metadata & legacy cache keys
+            'adj': adj_sub,
+            'local_core_idx': local_core_idx,
+            'orig_core_idx': core_idx,
+            'train_mask': sub_train_mask,
+            'val_mask': sub_val_mask,
             'coords': torch.from_numpy(self.coords[subgraph_nodes]).float(),
             'patient_name': getattr(self, 'patient_name', 'Unknown')
         }
