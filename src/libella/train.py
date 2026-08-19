@@ -264,7 +264,6 @@ def _train_loop(
             "l_ort": torch.tensor(0.0, device=device),
             "l_sparse": torch.tensor(0.0, device=device),
             "l_aux": torch.tensor(0.0, device=device),
-            "l_disp": torch.tensor(0.0, device=device),
             "l_sharp": torch.tensor(0.0, device=device),
             "l0_avg": torch.tensor(0.0, device=device),
             "dead_cnt": torch.tensor(0.0, device=device),
@@ -355,8 +354,7 @@ def _train_loop(
                 base_ort_val = loss_res[2]
                 base_sparse_val = loss_res[3]
                 base_aux_val = loss_res[4]
-                base_disp_val = loss_res[5]
-                base_sharp_val = loss_res[6]
+                base_sharp_val = loss_res[5]
 
                 if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
                     nan_detected = True
@@ -370,7 +368,7 @@ def _train_loop(
 
                 # 3. GPU Telemetry Tracking
                 with torch.no_grad():
-                    active_thresh = getattr(cfg, "active_latent_threshold", 1e-4)
+                    active_thresh = getattr(cfg, "active_latent_threshold", 1e-2)
                     batch_active = (z_train > active_thresh).float()
                     current_freq = batch_active.mean(dim=0)
 
@@ -389,7 +387,6 @@ def _train_loop(
                     gpu_telemetry["l_ort"] += base_ort_val
                     gpu_telemetry["l_sparse"] += base_sparse_val
                     gpu_telemetry["l_aux"] += base_aux_val
-                    gpu_telemetry["l_disp"] += base_disp_val
                     gpu_telemetry["l_sharp"] += base_sharp_val
                     gpu_telemetry["l0_avg"] += batch_active.sum(dim=-1).mean()
                     gpu_telemetry["dead_cnt"] += dead_count_val
@@ -531,7 +528,6 @@ def _train_loop(
                 "ort": round(epoch_telemetry.get("l_ort", 0.0), 4),
                 "sparse": round(epoch_telemetry.get("l_sparse", 0.0), 4),
                 "aux": round(epoch_telemetry.get("l_aux", 0.0), 4),
-                "disp": round(epoch_telemetry.get("l_disp", 0.0), 4),
                 "sharp": round(epoch_telemetry.get("l_sharp", 0.0), 4),
                 "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
             },
@@ -558,7 +554,6 @@ def _train_loop(
             "loss/ort": epoch_telemetry.get("l_ort", 0.0),
             "loss/sparse": epoch_telemetry.get("l_sparse", 0.0),
             "loss/aux": epoch_telemetry.get("l_aux", 0.0),
-            "loss/disp": epoch_telemetry.get("l_disp", 0.0),
             "loss/sharp": epoch_telemetry.get("l_sharp", 0.0),
             "loss/dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
             "sae/l0_avg": current_l0,

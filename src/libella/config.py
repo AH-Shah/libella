@@ -60,19 +60,18 @@ class RunConfig:
 
     # GNN Physics & Message Passing
     train_noise: float = 0.05
-    edge_dropout: float = 0.15
-    edge_sim_threshold: float = 0.60
+    edge_dropout: float = 0.1
+    edge_sim_threshold: float = 0.65
     edge_decay_slope: float = 20.0
     appnp_alpha_scale: float = 0.85
     appnp_alpha_offset: float = 0.10
     att_temp_init: float = -2.0
     cross_temp_init: float = -2.0
     spatial_gain_init: float = 2.0
-    disp_weight: float = 3
     sharp_weight: float = 10
 
     # Top-K Sparsity & Latent Dynamics
-    topk_k: int = 24
+    topk_k: int = 40
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
@@ -87,7 +86,7 @@ class RunConfig:
     # Ambient Baseline Decoupling
     ambient_scale_init: float = 0.50
     ambient_lr_mult: float = 5.0
-    ambient_max_cap: float = 0.15
+    ambient_max_cap: float = 0.0
 
     # Asymmetric Reconstruction & Orthogonality
     delta_clamp: float = 30.0
@@ -111,7 +110,7 @@ class RunConfig:
     p1_drop_tol: float = 0.010
     tracker_window_ratio: float = 0.08
     patience_ratio: float = 0.12
-    min_stop_progress: float = 0.85
+    min_stop_progress: float = 0.5
     early_stop_rel_tol: float = 1e-3
     phase2_force_window: int = 20
     checkpoint_freq: int = 10

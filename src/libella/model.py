@@ -157,10 +157,11 @@ class LibellaGNN(nn.Module):
         spatial_warmup = 0.20 + 0.80 * progress
         
         # Force the maximum spatial multiplier to be 0.5 (GNN can never overwrite biology)
-        leashed_gain = torch.sigmoid(self.spatial_gain) 
+        unleashed_gain = F.softplus(self.spatial_gain)
+
 
         # Combine perfectly scaled signals
-        raw_affinity = bio_sim + (leashed_gain * spatial_warmup * spatial_shift)
+        raw_affinity = bio_sim + (unleashed_gain * spatial_warmup * spatial_shift)
         
         # Shift up and multiply by magnitude
         pre_acts = F.relu(raw_affinity) * z_mag
@@ -258,7 +259,6 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor | None,
     ]:
         z, pre_acts, cell_mass, z_mag, decay, _, _ = self.encode(
             x_dense, src, dst, edge_weights
@@ -279,7 +279,7 @@ class LibellaGNN(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                active_in_batch = (z > 1e-4).any(dim=0)
+                active_in_batch = (z > 1e-2).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
                 dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
@@ -383,13 +383,6 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-
-        # 4. Population Feature Dispersion (Anti-Monopoly)
-        z_prob = z / torch.clamp(z.sum(dim=-1, keepdim=True), min=1e-5)
-        batch_usage = z_prob.mean(dim=0)
-        target_uniform = 1.0 / self.n_latents
-        l_disp = (batch_usage - target_uniform).pow(2).sum() * (self.n_latents ** 2)
-
         # 5. Boundary Contrastive Sharpening (Delta Boost)
         l_sharp = torch.tensor(0.0, device=x_true.device)
         if src is not None and len(src) > 0 and edge_decay is not None:
@@ -397,29 +390,36 @@ class LibellaGNN(nn.Module):
             z_unit = F.normalize(latent_source + 1e-6, p=2, dim=-1)
             edge_latent_sim = (z_unit[src] * z_unit[dst]).sum(dim=-1, keepdim=True)
 
-            boundary_mask = (edge_decay < 0.4).float()
-            internal_mask = (edge_decay > 0.6).float()
+            boundary_mask = (edge_decay < 0.40).float()
+            internal_mask = (edge_decay > 0.60).float()
 
-            num_boundary = torch.clamp(boundary_mask.sum(), min=1.0)
-            num_internal = torch.clamp(internal_mask.sum(), min=1.0)
+            n_boundary = boundary_mask.sum()
+            n_internal = internal_mask.sum()
 
-            sim_boundary = (edge_latent_sim * boundary_mask).sum() / num_boundary
-            sim_internal = (edge_latent_sim * internal_mask).sum() / num_internal
+            l_boundary = (
+                F.relu(((edge_latent_sim * boundary_mask).sum() / torch.clamp(n_boundary, min=1.0)) - 0.20)
+                if n_boundary > 0
+                else torch.tensor(0.0, device=x_true.device)
+            )
 
-            l_sharp = F.relu(sim_boundary - 0.20) + F.relu(0.80 - sim_internal)
+            l_internal = (
+                F.relu(0.80 - ((edge_latent_sim * internal_mask).sum() / torch.clamp(n_internal, min=1.0)))
+                if n_internal > 0
+                else torch.tensor(0.0, device=x_true.device)
+            )
+
+            l_sharp = l_boundary + l_internal
 
         base_ortho = getattr(cfg, "ortho_weight", 8.0)
         ortho_min = getattr(cfg, "ortho_min_scale", 0.50)
         current_ortho = base_ortho * (ortho_min + (1.0 - ortho_min) * progress)
         aux_weight = getattr(cfg, "aux_weight", 0.50)
-        disp_weight = getattr(cfg, "disp_weight", 1.0)
         sharp_weight = getattr(cfg, "sharp_weight", 10)
 
         total_loss = (
             l_recon
             + (current_ortho * l_ortho)
             + (aux_weight * l_aux)
-            + (disp_weight * l_disp)
             + (sharp_weight * l_sharp)
         )
 
@@ -429,7 +429,6 @@ class LibellaGNN(nn.Module):
             l_ortho.detach(),
             l_sparse.detach(),
             l_aux.detach(),
-            l_disp.detach(),
             l_sharp.detach(),
         )
 

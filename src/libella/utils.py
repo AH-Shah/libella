@@ -89,13 +89,7 @@ from .config import cfg
 
 
 class PhaseTracker:
-    """Coordinates training horizons, spatial warmup, and Pareto early stopping.
-    
-    Coordinates:
-      - Phase 1: Unconstrained manifold alignment & biological discovery.
-      - Phase 2: Spatial routing consolidation & orthogonal regularization.
-      - Centralized schedule generation (spatial warmup, early stopping).
-    """
+    """Adaptive training governor with PID-like pressure modulation and automated early stopping."""
 
     def __init__(
         self,
@@ -107,54 +101,39 @@ class PhaseTracker:
         self.rel_tolerance: float = rel_tolerance
 
         # --- Phase 1 Horizons ---
-        self.min_p1_epochs: int = max(
-            getattr(cfg, "min_p1_epochs", 6),
-            int(self.total_epochs * getattr(cfg, "p1_min_ratio", 0.12)),
-        )
-        self.max_p1_epochs: int = max(
-            self.min_p1_epochs + 2,
-            int(self.total_epochs * getattr(cfg, "p1_max_ratio", 0.25)),
-        )
+        self.min_p1_epochs: int = max(4, int(self.total_epochs * 0.10))
+        self.max_p1_epochs: int = max(self.min_p1_epochs + 2, int(self.total_epochs * 0.25))
         self.p1_plateau_patience: int = 3
         self.p1_plateau_count: int = 0
 
-        # --- Window & Horizon Sizing ---
-        self.cycle_window: int = max(
-            3, int(self.total_epochs * getattr(cfg, "tracker_window_ratio", 0.08))
-        )
-        self.patience_epochs: int = max(
-            5, int(self.total_epochs * getattr(cfg, "patience_ratio", 0.12))
-        )
+        # --- Dynamic Window Sizing ---
+        self.cycle_window: int = max(3, int(self.total_epochs * 0.08))
+        self.patience_epochs: int = max(4, int(self.total_epochs * 0.10))
 
-        # --- Histories & Baselines ---
+        # --- Metric Histories ---
         self.rec_history: list[float] = []
         self.val_history: list[float] = []
+        self.corr_history: list[float] = []
 
         self.best_rec_loss: float = float("inf")
         self.best_val_loss: float = float("inf")
-        self.best_composite_score: float = float("inf")
         self.p1_baseline_rec: float = 0.0
         self.p2_start_epoch: int = 0
 
-        # --- Dynamic Governor State ---
+        # --- Closed-Loop Governor State ---
         self.pressure: float = 0.0
-        self.breathing_cooldown: int = 0
         self.no_improve_count: int = 0
-
-        # --- Schedule State ---
         self._progress: float = 0.0
         self.spatial_warmup: float = 0.10
 
     @staticmethod
     def _fit_ols(series: list[float]) -> tuple[float, float, float]:
-        """Calculates trend slope, mean, and residual standard deviation."""
         n = len(series)
         if n < 3:
             return 0.0, float(series[-1]) if series else 0.0, 0.01
 
         t = np.arange(n, dtype=np.float64)
         y = np.array(series, dtype=np.float64)
-
         t_mean = (n - 1) / 2.0
         y_mean = float(np.mean(y))
 
@@ -165,25 +144,19 @@ class PhaseTracker:
 
         res_sq = np.sum((y - (slope * t + intercept)) ** 2)
         residual_std = float(np.sqrt(res_sq / max(1, n - 2)))
-
         return slope, y_mean, residual_std
 
     def get_progress(self) -> float:
-        """Returns smooth Cosine S-curve progress in [0.0, 1.0]."""
         if self.phase == 1:
             return 0.0
         return float(0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure)))))
 
     def _update_schedules(self, epoch: int) -> None:
-        """Updates spatial warmup schedule based on phase and progress."""
         self._progress = self.get_progress()
-
         if self.phase == 1:
-            # Baseline linear ramp from 0.10 to 0.50 during Phase 1 exploration
             p1_fraction = min(1.0, float(epoch + 1) / max(1, self.min_p1_epochs))
             self.spatial_warmup = 0.10 + 0.40 * p1_fraction
         else:
-            # Smoothly transition from 0.50 to 1.0 based on S-curve progress
             self.spatial_warmup = 0.50 + 0.50 * self._progress
 
     def step(
@@ -192,22 +165,13 @@ class PhaseTracker:
         epoch: int,
         val_loss: float | None = None,
     ) -> bool:
-        """Evaluates epoch telemetry, updates governor pressure, and checks early stopping.
-
-        Returns:
-            bool: True if Pareto optimal convergence is reached (Early Termination).
-        """
         current_rec = float(epoch_telemetry.get("l_rec", 0.0))
         current_val = float(val_loss if val_loss is not None else current_rec)
-        max_corr = float(
-            epoch_telemetry.get(
-                "dict/max_cross_corr",
-                epoch_telemetry.get("d_max_cross_corr", 0.0),
-            )
-        )
+        max_corr = float(epoch_telemetry.get("dict/max_cross_corr", epoch_telemetry.get("d_max_cross_corr", 0.0)))
 
         self.rec_history.append(current_rec)
         self.val_history.append(current_val)
+        self.corr_history.append(max_corr)
 
         if self.phase == 2 and current_rec < self.best_rec_loss:
             self.best_rec_loss = current_rec
@@ -221,13 +185,11 @@ class PhaseTracker:
         rec_slope, rec_mu, rec_sigma = self._fit_ols(window_rec)
 
         # =============================================================
-        # PHASE 1: Manifold Alignment & Plateau Discovery
+        # PHASE 1: Manifold Alignment
         # =============================================================
         if self.phase == 1:
-            drop_tol = getattr(cfg, "p1_drop_tol", 0.010)
             relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
-
-            if relative_drop_rate < drop_tol:
+            if relative_drop_rate < 0.015:  # Flat exploration detected
                 self.p1_plateau_count += 1
             else:
                 self.p1_plateau_count = 0
@@ -238,45 +200,50 @@ class PhaseTracker:
 
             if hit_max_budget or (can_exit_min and sustained_plateau):
                 self.force_phase2(epoch, rec_mu)
-
             return False
 
         # =============================================================
-        # PHASE 2: Elastic Governor & Regularization Consolidation
+        # PHASE 2: Dynamic Closed-Loop Proportional Tuning
         # =============================================================
         remaining_epochs = max(1, self.total_epochs - self.p2_start_epoch)
         base_step = 1.0 / remaining_epochs
 
+        # 1. Loss Budget & Overshoot Scaling
         dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.0 * rec_sigma)
-        loss_ceiling = self.best_rec_loss + dynamic_budget
-        overshoot = current_rec - loss_ceiling
+        loss_overshoot = max(0.0, (current_rec - (self.best_rec_loss + dynamic_budget)) / max(1e-5, dynamic_budget))
 
-        # Atom correlation safety check
-        dict_stress = max_corr > getattr(cfg, "ortho_overlap_threshold", 0.35)
+        # 2. Dynamic Correlation Shock Tracking (Relative to local mean)
+        corr_window = self.corr_history[-min(len(self.corr_history), 10):]
+        corr_baseline = float(np.mean(corr_window[:-1])) if len(corr_window) > 1 else max_corr
+        corr_spike = max(0.0, (max_corr - corr_baseline) / max(1e-3, corr_baseline))
 
-        if overshoot > 0.0 or dict_stress:
-            # Manifold stress: Apply proportional pressure release
-            severity = 1.5 if dict_stress else min(2.0, overshoot / max(1e-5, dynamic_budget))
-            self.pressure = max(0.0, self.pressure - (base_step * 1.0 * severity))
-            self.breathing_cooldown = max(1, int(self.cycle_window * 0.5))
+        # 3. Smooth Proportional Adjustment (No binary throttling)
+        panic_factor = max(0.0, (max_corr - 0.60) * 5.0)
+        stress_factor = (loss_overshoot * 1.5) + (corr_spike * 2.0) + panic_factor
+
+        if stress_factor > 0.05:
+            # Scale down pressure smoothly relative to stress intensity
+            pressure_delta = -base_step * min(2.0, stress_factor)
         else:
-            if self.breathing_cooldown > 0:
-                self.breathing_cooldown -= 1
-            else:
-                # Stable training: Advance pressure monotonically
-                self.pressure = min(1.0, self.pressure + base_step)
+            # Healthy training: Boost progression if loss is dropping rapidly
+            velocity_boost = min(1.5, max(1.0, -rec_slope * 5.0))
+            pressure_delta = base_step * velocity_boost
 
+        self.pressure = min(1.0, max(0.0, self.pressure + pressure_delta))
         self._update_schedules(epoch)
 
         # =============================================================
-        # SCALE-INVARIANT PARETO EARLY STOPPING
+        # ADAPTIVE EARLY STOPPING
         # =============================================================
-        min_progress = getattr(cfg, "min_stop_progress", 0.85)
-        rel_tol = getattr(cfg, "early_stop_rel_tol", 1e-3)
+        # Dynamically lower progress gate if validation plateau is strongly established
+        val_slope, val_mu, _ = self._fit_ols(self.val_history[-self.cycle_window:])
+        val_flat = abs(val_slope * self.cycle_window) / max(1e-5, val_mu) < 0.005
 
-        if self._progress >= min_progress:
-            improvement = (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss)
-            if improvement > rel_tol:
+        active_gate = 0.50 if val_flat else 0.75
+
+        if self._progress >= active_gate:
+            rel_improvement = (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss)
+            if rel_improvement > 1e-3:
                 self.best_val_loss = current_val
                 self.no_improve_count = 0
             else:
@@ -292,7 +259,6 @@ class PhaseTracker:
         return False
 
     def force_phase2(self, epoch: int, current_baseline: float) -> None:
-        """Transitions tracker from Discovery (Phase 1) to Consolidation (Phase 2)."""
         if self.phase == 1:
             self.phase = 2
             self.p2_start_epoch = epoch
@@ -300,10 +266,9 @@ class PhaseTracker:
             self.best_rec_loss = float(current_baseline)
             self.best_val_loss = float("inf")
             self.pressure = 0.0
-            self.breathing_cooldown = 0
             self.no_improve_count = 0
             self._update_schedules(epoch)
-            
+
 class UnifiedLogger:
     """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
     def __init__(self, backend: str, run_name: str, log_dir: str):
@@ -574,4 +539,4 @@ def export_latents_from_graphs(
     print(f"    Shape: {master_csr.shape[0]:,} cells × {master_csr.shape[1]:,} latents (Barcodes embedded)")
 
     return master_csr, master_meta_df
-    
+
