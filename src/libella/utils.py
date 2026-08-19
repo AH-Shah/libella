@@ -88,7 +88,13 @@ from .config import cfg
 
 
 class PhaseTracker:
-    """Coordinates training horizons, spatial warmup, and Pareto early stopping."""
+    """Coordinates training horizons, spatial warmup, and Pareto early stopping.
+    
+    Coordinates:
+      - Phase 1: Unconstrained manifold alignment & biological discovery.
+      - Phase 2: Spatial routing consolidation & orthogonal regularization.
+      - Centralized schedule generation (spatial warmup, early stopping).
+    """
 
     def __init__(
         self,
@@ -125,6 +131,7 @@ class PhaseTracker:
 
         self.best_rec_loss: float = float("inf")
         self.best_val_loss: float = float("inf")
+        self.best_composite_score: float = float("inf")
         self.p1_baseline_rec: float = 0.0
         self.p2_start_epoch: int = 0
 
@@ -167,15 +174,15 @@ class PhaseTracker:
         return float(0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure)))))
 
     def _update_schedules(self, epoch: int) -> None:
-        """Centralized schedule generator for spatial warmup and regularization."""
+        """Updates spatial warmup schedule based on phase and progress."""
         self._progress = self.get_progress()
 
         if self.phase == 1:
-            # Linear exploration ramp [0.10 -> 0.50]
+            # Baseline linear ramp from 0.10 to 0.50 during Phase 1 exploration
             p1_fraction = min(1.0, float(epoch + 1) / max(1, self.min_p1_epochs))
             self.spatial_warmup = 0.10 + 0.40 * p1_fraction
         else:
-            # S-curve consolidation ramp [0.50 -> 1.00]
+            # Smoothly transition from 0.50 to 1.0 based on S-curve progress
             self.spatial_warmup = 0.50 + 0.50 * self._progress
 
     def step(
@@ -184,12 +191,19 @@ class PhaseTracker:
         epoch: int,
         val_loss: float | None = None,
     ) -> bool:
-        """Evaluates epoch telemetry, updates governor pressure, and checks early stopping."""
+        """Evaluates epoch telemetry, updates governor pressure, and checks early stopping.
+
+        Returns:
+            bool: True if Pareto optimal convergence is reached (Early Termination).
+        """
         current_rec = float(epoch_telemetry.get("l_rec", 0.0))
         current_val = float(val_loss if val_loss is not None else current_rec)
-        
-        # Use active telemetry keys for orthogonality/loss pressure
-        l_ort = float(epoch_telemetry.get("l_ort", 0.0))
+        max_corr = float(
+            epoch_telemetry.get(
+                "dict/max_cross_corr",
+                epoch_telemetry.get("d_max_cross_corr", 0.0),
+            )
+        )
 
         self.rec_history.append(current_rec)
         self.val_history.append(current_val)
@@ -205,9 +219,9 @@ class PhaseTracker:
         window_rec = self.rec_history[-self.cycle_window:]
         rec_slope, rec_mu, rec_sigma = self._fit_ols(window_rec)
 
-        # -------------------------------------------------------------
+        # =============================================================
         # PHASE 1: Manifold Alignment & Plateau Discovery
-        # -------------------------------------------------------------
+        # =============================================================
         if self.phase == 1:
             drop_tol = getattr(cfg, "p1_drop_tol", 0.010)
             relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
@@ -226,9 +240,9 @@ class PhaseTracker:
 
             return False
 
-        # -------------------------------------------------------------
+        # =============================================================
         # PHASE 2: Elastic Governor & Regularization Consolidation
-        # -------------------------------------------------------------
+        # =============================================================
         remaining_epochs = max(1, self.total_epochs - self.p2_start_epoch)
         base_step = 1.0 / remaining_epochs
 
@@ -236,24 +250,26 @@ class PhaseTracker:
         loss_ceiling = self.best_rec_loss + dynamic_budget
         overshoot = current_rec - loss_ceiling
 
-        # Manifold stress detection via reconstruction overshoot or orthogonality spikes
-        ortho_stress = l_ort > getattr(cfg, "ortho_stress_threshold", 5.0)
+        # Atom correlation safety check
+        dict_stress = max_corr > getattr(cfg, "ortho_overlap_threshold", 0.35)
 
-        if overshoot > 0.0 or ortho_stress:
-            severity = 1.5 if ortho_stress else min(2.0, overshoot / max(1e-5, dynamic_budget))
+        if overshoot > 0.0 or dict_stress:
+            # Manifold stress: Apply proportional pressure release
+            severity = 1.5 if dict_stress else min(2.0, overshoot / max(1e-5, dynamic_budget))
             self.pressure = max(0.0, self.pressure - (base_step * 1.0 * severity))
             self.breathing_cooldown = max(1, int(self.cycle_window * 0.5))
         else:
             if self.breathing_cooldown > 0:
                 self.breathing_cooldown -= 1
             else:
+                # Stable training: Advance pressure monotonically
                 self.pressure = min(1.0, self.pressure + base_step)
 
         self._update_schedules(epoch)
 
-        # -------------------------------------------------------------
+        # =============================================================
         # SCALE-INVARIANT PARETO EARLY STOPPING
-        # -------------------------------------------------------------
+        # =============================================================
         min_progress = getattr(cfg, "min_stop_progress", 0.85)
         rel_tol = getattr(cfg, "early_stop_rel_tol", 1e-3)
 
@@ -286,7 +302,7 @@ class PhaseTracker:
             self.breathing_cooldown = 0
             self.no_improve_count = 0
             self._update_schedules(epoch)
-             
+            
 class UnifiedLogger:
     """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
     def __init__(self, backend: str, run_name: str, log_dir: str):

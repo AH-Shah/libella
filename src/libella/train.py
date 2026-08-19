@@ -1,7 +1,6 @@
 """Model training loops and orchestrators for the Spatial Ecotype GNN."""
 from __future__ import annotations
-import os
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+
 import gc
 import math
 from collections.abc import Iterator
@@ -153,7 +152,7 @@ def _init_model(
         n_metaprograms=n_latents,
     ).to(device)
 
-    # 1. Clean Parameter grouping
+    # 1. Parameter grouping with dedicated baseline & decoder learning rates
     bias_ambient_params = [
         p for n, p in model.named_parameters()
         if any(k in n for k in ["decoder_bias", "ambient_scale"])
@@ -162,16 +161,21 @@ def _init_model(
         p for n, p in model.named_parameters()
         if "decoder_weight" in n
     ]
+    temp_routing_params = [
+        p for n, p in model.named_parameters()
+        if any(k in n for k in ["att_temp", "cross_temp", "spatial_gain"])
+    ]
     base_params = [
         p for n, p in model.named_parameters()
-        if not any(k in n for k in ["decoder_", "ambient_scale"])
+        if not any(k in n for k in ["decoder_", "ambient_scale", "att_temp", "cross_temp", "spatial_gain"])
     ]
 
     lr_base = getattr(cfg, "lr_base", 1e-3)
     optimizer = torch.optim.AdamW([
-        {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},
-        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0},
+        {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},  # 2x LR for GNN
+        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0}, # 0.5x LR for Dictionary
         {"params": bias_ambient_params, "lr": lr_base * getattr(cfg, "ambient_lr_mult", 5.0), "weight_decay": 0.0},
+        {"params": temp_routing_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
     ])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=getattr(cfg, "epochs", 100), eta_min=getattr(cfg, "lr_min", 1e-6)
@@ -246,7 +250,6 @@ def _train_loop(
 
     tqdm.write("\n[*] Training Loop Initialized...")
 
-    step_loss_acc = torch.tensor(0.0, device=device)
     for epoch in tqdm(range(start_epoch, total_epochs), desc="Training", leave=False):
         model.train()
         train_steps, val_steps = 0, 0
@@ -279,34 +282,36 @@ def _train_loop(
 
         for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
             optimizer.zero_grad(set_to_none=True)
-            step_loss_acc.zero_()
+            current_step_loss = 0.0
             last_r_pos = None
             last_dead_mask = None
 
             for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
-                x = batch["x"].to(device=device, non_blocking=True).contiguous()
-                
-                # PyTorch MPS index_add_ shaders strictly require torch.int64 (torch.long)
-                src = batch["src"].to(device=device, dtype=torch.int64, non_blocking=True).contiguous()
-                dst = batch["dst"].to(device=device, dtype=torch.int64, non_blocking=True).contiguous()
-                weights = batch["weights"].to(device=device, non_blocking=True).contiguous()
+                x = batch["x"].to(device=device, non_blocking=True)
+                src = batch["src"].to(device=device, non_blocking=True)
+                dst = batch["dst"].to(device=device, non_blocking=True)
+                weights = batch["weights"].to(device=device, non_blocking=True)
 
-                if model.training and src.numel() > 0:
+                if model.training and len(src) > 0:
                     edge_drop = getattr(cfg, "edge_dropout", 0.0)
                     if edge_drop > 0.0:
                         keep_mask = torch.rand(src.size(0), device=device) > edge_drop
-                        src = src[keep_mask].contiguous()
-                        dst = dst[keep_mask].contiguous()
-                        weights = weights[keep_mask].contiguous()
+                        src = src[keep_mask]
+                        dst = dst[keep_mask]
+                        weights = weights[keep_mask]
 
                 x, src, dst, weights = pad_mps_shapes(x, src, dst, weights)
 
-                # 1. Define progress and warmup state BEFORE forward/loss
+                if device.type != "mps":
+                    src = src.to(torch.int64)
+                    dst = dst.to(torch.int64)
+
+                # Set spatial warmup progress
                 prog = tracker.get_progress() if tracker.phase == 2 else 0.0
                 model.current_progress = prog
                 model.current_k = getattr(cfg, "topk_k", 3)
 
-                # 2. Forward Pass
+                # 1. Forward Pass
                 (
                     recon,
                     z,
@@ -321,14 +326,14 @@ def _train_loop(
                 last_r_pos = r_pos
                 last_dead_mask = dead_mask
 
-                train_idx = batch["train_core_idx"].to(device=device, dtype=torch.int64, non_blocking=True)
+                train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
                 x_train = x[train_idx]
                 recon_train = recon[train_idx]
                 z_train = z[train_idx]
                 aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
                 r_norm_train = r_norm[train_idx] if r_norm is not None else None
 
-                # 3. Loss Calculation
+                # 2. Loss Calculation
                 loss_res = model.calc_loss(
                     recon_train,
                     x_train,
@@ -345,14 +350,12 @@ def _train_loop(
                 base_aux_val = loss_res[4]
 
                 if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
-                    print(f"\n ↳ [!] NaN/Inf loss detected at Epoch {epoch}, Step {step}. Halting.")
                     nan_detected = True
                     break
 
                 (true_batch_loss / len(meta_meta)).backward()
 
-                # Asynchronous GPU accumulation (Zero Host Sync)
-                step_loss_acc.add_(true_batch_loss.detach() / len(meta_meta))
+                current_step_loss += true_batch_loss.detach().item() / len(meta_meta)
                 train_loss_acc += true_batch_loss.detach()
                 train_steps += 1
 
@@ -387,7 +390,7 @@ def _train_loop(
                 train_chunk_count += 1
                 del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, true_batch_loss
 
-                # --- Optimized Validation Evaluation ---
+                # Validation Evaluation
                 val_core_idx_cpu = batch.get("val_core_idx")
                 if val_core_idx_cpu is not None and val_core_idx_cpu.numel() > 0:
                     val_idx = val_core_idx_cpu.to(device=device, non_blocking=True)
@@ -406,19 +409,16 @@ def _train_loop(
                         raw_delta_val = val_recon - x_val
                         asym_penalty = getattr(cfg, "asym_penalty_weight", 0.5)
                         asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * asym_penalty) * (raw_delta_val < 0).to(x_val.dtype)
-                        scaled_delta_val = raw_delta_val * asym_val
+                        delta_clamp = getattr(cfg, "delta_clamp", 30.0)
+                        scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-delta_clamp, max=delta_clamp)
 
-                        # Numerically stable, overflow-proof softplus Log-Cosh (identical math)
-                        abs_delta_val = scaled_delta_val.abs()
-                        log_cosh_val = abs_delta_val + F.softplus(-2.0 * abs_delta_val) - 0.6931471805599453
+                        val_loss_sum = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
+                        val_log_cosh = val_loss_sum / max(1, x_val.numel())
 
-                        per_cell_val = torch.sum(variance_weight_val * log_cosh_val, dim=-1)
-                        val_log_cosh = torch.mean(per_cell_val) / math.sqrt(x_val.shape[-1])
-
-                        val_loss_acc.add_(val_log_cosh)
+                        val_loss_acc += val_log_cosh.detach()
                         val_steps += 1
 
-                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, per_cell_val, log_cosh_val
+                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
 
                 del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm
 
@@ -426,7 +426,7 @@ def _train_loop(
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            # 1. Dual-Group Gradient Clipping (Preserved Exact Thresholds)
+            # 1. Dual-Group Gradient Clipping
             recon_keys = ("decoder_bias", "ambient_scale", "decoder_weight")
             recon_params = [
                 p for n, p in model.named_parameters()
@@ -446,24 +446,21 @@ def _train_loop(
                     spatial_params, max_norm=getattr(cfg, "grad_clip_spatial", 15.0)
                 )
 
-            # 2. In-Place Tangent-Space Projection on Unit Sphere
+            # 2. Tangent-Space Projection on Unit Sphere
             with torch.no_grad():
                 if hasattr(model, "decoder_weight") and model.decoder_weight.grad is not None:
-                    w = F.normalize(model.decoder_weight.data, p=2, dim=1)
+                    w = F.normalize(model.decoder_weight, p=2, dim=1)
                     grad = model.decoder_weight.grad
-                    # grad.sub_(...) computes grad - (grad * w).sum(dim=1, keepdim=True) * w in-place
-                    grad.sub_((grad * w).sum(dim=1, keepdim=True) * w)
+                    proj_grad = grad - (grad * w).sum(dim=1, keepdim=True) * w
+                    model.decoder_weight.grad.copy_(proj_grad)
 
-            # 3. Optimizer Step
+            # 3. Optimizer Step & Non-Negative Retraction
             optimizer.step()
 
-            # 4. In-Place Non-Negative Spherical Retraction
             with torch.no_grad():
                 if hasattr(model, "decoder_weight"):
-                    w_data = model.decoder_weight.data
-                    w_data.clamp_min_(0.0)
-                    w_norm = torch.linalg.vector_norm(w_data + 1e-8, ord=2, dim=-1, keepdim=True)
-                    w_data.div_(w_norm)
+                    w_clamped = F.relu(model.decoder_weight)
+                    model.decoder_weight.copy_(F.normalize(w_clamped + 1e-8, p=2, dim=-1))
 
                 if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
                     model.resample_dead_latents(last_r_pos, last_dead_mask, optimizer=optimizer)
@@ -472,7 +469,7 @@ def _train_loop(
             step_freq = getattr(cfg, "telemetry_step_freq", 0)
             if step_freq > 0 and (global_step % step_freq == 0):
                 step_metrics = {
-                    "step/batch_loss": step_loss_acc.item(),  # <-- Syncs ONLY when logging triggers
+                    "step/batch_loss": current_step_loss,
                     "step/lr": optimizer.param_groups[0]["lr"],
                     **logger.get_memory_metrics(device),
                 }
@@ -485,58 +482,27 @@ def _train_loop(
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
             break
 
-        # --- REPLACEMENT: Single GPU-to-CPU Barrier ---
-        scheduler.step()
+        # Epoch Synchronization
+        history["train_loss"].append((train_loss_acc / (train_steps + 1e-9)).item())
+        history["val_loss"].append((val_loss_acc / (val_steps + 1e-9)).item())
 
+        scheduler.step()
+        gc.collect()
+
+        # Telemetry Resolution
         epoch_telemetry = {}
         if train_chunk_count > 0:
-            telemetry_keys = [
-                "l_rec", "l_ort", "l_sparse", "l_aux",
-                "l0_avg", "dead_cnt", "max_act", "dyn_w", "z_mag_mean"
-            ]
-
-            # 1. Stack 2 loss accumulators + 9 telemetry scalars into 1 GPU vector
-        all_scalars_gpu = torch.stack([
-            train_loss_acc / (train_steps + 1e-9),
-            val_loss_acc / (val_steps + 1e-9),
-            *[gpu_telemetry[k] / train_chunk_count for k in telemetry_keys],
-        ])
-
-        # 2. Exactly ONE synchronous Metal transfer across Unified Memory
-        all_scalars_host = all_scalars_gpu.cpu().tolist()
-
-        final_train_loss = all_scalars_host[0]
-        final_val_loss = all_scalars_host[1]
-
-        # 3. Check for numerical instability before history logging
-        if math.isnan(final_train_loss) or math.isinf(final_train_loss):
-            print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
-            break
-
-        # 4. Unpack losses into history
-        history["train_loss"].append(final_train_loss)
-        history["val_loss"].append(final_val_loss)
-
-        # 5. Unpack metrics into dictionary
-        for idx, k in enumerate(telemetry_keys):
-            epoch_telemetry[k] = all_scalars_host[idx + 2]
+            for k, v in gpu_telemetry.items():
+                epoch_telemetry[k] = (v / train_chunk_count).item()
 
             current_l0_val = epoch_telemetry.get("l0_avg", float(model.n_latents))
             epoch_telemetry["p_w"] = (1.0 - (current_l0_val / float(model.n_latents))) * 100.0
 
             if ema_latent_freq is not None:
                 p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
-                epoch_telemetry["ent"] = (-(p_norm * torch.log(p_norm + 1e-9)).sum()).item()
+                epoch_telemetry["ent"] = -(p_norm * torch.log(p_norm + 1e-9)).sum().item()
             else:
                 epoch_telemetry["ent"] = 0.0
-        else:
-            # Fallback for empty epoch
-            losses = torch.stack([
-                train_loss_acc / (train_steps + 1e-9),
-                val_loss_acc / (val_steps + 1e-9)
-            ]).cpu().tolist()
-            history["train_loss"].append(losses[0])
-            history["val_loss"].append(losses[1])
 
         current_lr = round(optimizer.param_groups[0]["lr"], 6)
         current_rec = epoch_telemetry.get("l_rec", float("inf"))
@@ -588,17 +554,12 @@ def _train_loop(
         logger.log_metrics(epoch, epoch_log)
         logger.log_model_telemetry(epoch, model, log_histograms=False)
 
-        # --- Optimized Asynchronous Checkpointing ---
         if composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
-            
-            # Non-blocking copy of state dict directly to CPU to avoid Metal serialization locks
-            cpu_state_dict = {k: v.detach().to(device="cpu", non_blocking=True) for k, v in model.state_dict().items()}
-            
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": cpu_state_dict,
+                    "model_state_dict": model.state_dict(),
                     "best_composite_score": best_composite_score,
                     "metrics": epoch_metrics,
                     "history": history,
@@ -611,11 +572,8 @@ def _train_loop(
             autopsy_dir = out_dir / "autopsy_checkpoints"
             autopsy_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = autopsy_dir / f"epoch_{(epoch+1):03d}.pt"
-            
-            cpu_state_dict = {k: v.detach().to(device="cpu", non_blocking=True) for k, v in model.state_dict().items()}
-            
             torch.save(
-                {"epoch": epoch, "model_state_dict": cpu_state_dict, "metrics": epoch_metrics},
+                {"epoch": epoch, "model_state_dict": model.state_dict(), "metrics": epoch_metrics},
                 ckpt_path,
             )
 
@@ -624,7 +582,7 @@ def _train_loop(
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": cpu_state_dict,
+                    "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "best_composite_score": best_composite_score,
@@ -648,12 +606,11 @@ def _train_loop(
 
         epochs_remaining = total_epochs - epoch - 1
         force_window = getattr(cfg, "phase2_force_window", 10)
-        was_phase_1 = tracker.phase == 1
-
-        if was_phase_1 and epochs_remaining <= force_window:
+        if tracker.phase == 1 and epochs_remaining <= force_window:
             tqdm.write(f"\n[!] Approaching max epochs ({total_epochs}). Forcing Phase 2.")
             tracker.force_phase2(epoch, epoch_telemetry.get("l_rec", 0.0))
 
+        was_phase_1 = tracker.phase == 1
         current_val_loss = history["val_loss"][-1]
         is_done = tracker.step(epoch_telemetry, epoch, val_loss=current_val_loss)
 

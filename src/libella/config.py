@@ -39,7 +39,7 @@ class RunConfig:
     k_hops: int = 2
     n_prior_lineages: int = 30
     n_dict_components: int = 100
-    n_latents: int | None = 256
+    n_latents: int | None = 36
     extra_topics: int = 0
 
     # Training & Batches
@@ -52,6 +52,7 @@ class RunConfig:
     # Graph & Data
     k_neighbors: int = 11
     moran_k: int = 7
+    chunk_size: int = 2000
     feature_cap: int = 50_000
     top_n_genes: int = 2000
     max_cells_per_sample: int = 1_000_000
@@ -61,15 +62,15 @@ class RunConfig:
     train_noise: float = 0.05
     edge_dropout: float = 0.40
     edge_sim_threshold: float = 0.60
-    edge_decay_slope: float = 25.0
+    edge_decay_slope: float = 20.0
     appnp_alpha_scale: float = 0.85
     appnp_alpha_offset: float = 0.10
     att_temp_init: float = -2.0
     cross_temp_init: float = -2.0
-    spatial_gain_init: float = 2.5
+    spatial_gain_init: float = 2.0
 
     # Top-K Sparsity & Latent Dynamics
-    topk_k: int = 24
+    topk_k: int = 3
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
@@ -91,7 +92,7 @@ class RunConfig:
     dynamic_w_ema_weight: float = 0.10
     asym_penalty_weight: float = 0.50
     ortho_weight: float = 8.0
-    ortho_overlap_threshold: float = 0.25
+    ortho_overlap_threshold: float = 0.30
     ortho_min_scale: float = 0.50
 
     # Optimizers & Gradient Clipping
@@ -100,7 +101,7 @@ class RunConfig:
     lr_decoder: float = 1e-3
     lr_temperature: float = 1e-3
     lr_min: float = 1e-6
-    grad_clip_recon: float = 10.0
+    grad_clip_recon: float = 5.0
     grad_clip_spatial: float = 15.0
 
     # PhaseTracker & Early Stopping

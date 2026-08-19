@@ -92,11 +92,11 @@ def build_spatial_graph(
     cos_sim = np.zeros(len(src), dtype=np.float32)
     
 
-    batch_size = cfg.batch_size 
+    chunk_size = cfg.chunk_size 
     idx_pointer = 0
     
-    for i in range(0, N, batch_size):
-        end = min(i + batch_size, N)
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
         n_chunk = end - i
         
         # 1. Source cells (No redundancy) -> Shape: (n_chunk, G)
@@ -445,7 +445,7 @@ class SpatialBatcher:
         return len(self.chunks)
         
     def get_chunk(self, chunk_idx: int) -> dict[str, Any]:
-        """Dynamically expands K-Hop halo and returns complete graph & metadata payload."""
+        """Dynamically expands the K-Hop halo ONLY when requested. OOM Proof."""
         core_idx = self.chunks[chunk_idx]
         active_mask = np.zeros(self.n_cells, dtype=np.float32)
         active_mask[core_idx] = 1.0
@@ -455,47 +455,16 @@ class SpatialBatcher:
         
         subgraph_nodes = np.where(active_mask > 0)[0]
         global_to_local = {global_idx: local_idx for local_idx, global_idx in enumerate(subgraph_nodes)}
+        local_core_idx = np.array([global_to_local[idx] for idx in core_idx])
         
-        # Local core indices (strictly bounded within [0, len(subgraph_nodes) - 1])
-        local_core_idx = np.array([global_to_local[idx] for idx in core_idx], dtype=np.int64)
-        
-        # Slice local masks and indices
-        sub_train_mask = self.train_mask[subgraph_nodes]
-        sub_val_mask = self.val_mask[subgraph_nodes]
-        is_train_core = self.train_mask[core_idx]
-        
-        train_core_idx = torch.from_numpy(local_core_idx[is_train_core]).to(dtype=torch.int64)
-        val_core_idx = torch.from_numpy(local_core_idx[~is_train_core]).to(dtype=torch.int64)
-
-        # Slice subgraph adjacency and extract COO edge lists
-        adj_sub = self.adj[subgraph_nodes, :][:, subgraph_nodes]
-        adj_sub_coo = adj_sub.tocoo()
-        src = torch.from_numpy(adj_sub_coo.row.astype(np.int64))
-        dst = torch.from_numpy(adj_sub_coo.col.astype(np.int64))
-        weights = torch.from_numpy(adj_sub_coo.data.astype(np.float32))
-
-        # Convert sparse cell features to Dense Float32 Tensor
-        x_dense = self.X[subgraph_nodes]
-        if sp.issparse(x_dense):
-            x_dense = x_dense.toarray()
-        x_tensor = torch.from_numpy(x_dense).to(dtype=torch.float32)
-
         return {
-            # Model execution tensors
-            'x': x_tensor,
-            'src': src,
-            'dst': dst,
-            'weights': weights,
-            'train_core_idx': train_core_idx,
-            'val_core_idx': val_core_idx,
-            
-            # Metadata & legacy cache keys
-            'adj': adj_sub,
+            'x': self.X[subgraph_nodes],
+            'adj': self.adj[subgraph_nodes, :][:, subgraph_nodes],
+            'coords': self.coords[subgraph_nodes], 
             'local_core_idx': local_core_idx,
-            'orig_core_idx': core_idx,
-            'train_mask': sub_train_mask,
-            'val_mask': sub_val_mask,
-            'coords': torch.from_numpy(self.coords[subgraph_nodes]).float(),
+            'orig_core_idx': core_idx, 
+            'train_mask': self.train_mask[subgraph_nodes],
+            'val_mask': self.val_mask[subgraph_nodes],
             'patient_name': getattr(self, 'patient_name', 'Unknown')
         }
 
@@ -744,23 +713,23 @@ def build_pt_graph(f: Path, common_genes: list[str]) -> Path | None:
         data.pos = torch.from_numpy(coords).float()
         data.patient_name = f.stem
         
-        # Store Scipy CSR matrices directly or as dense/sparse buffers
+        # Pack PyTorch matrices safely using the scope-isolated helper
         data.x_in = to_pt_sparse(X_in_sparse)
         data.y_raw = to_pt_sparse(X_raw_sparse)
         
+        # Clear SciPy versions from RAM instantly
+        del X_in_sparse, X_raw_sparse
+        gc.collect()
+        
         adj_sym_coo = adj_sym.tocoo()
-        # ENFORCE int64 (Long) FOR MPS COMPATIBILITY:
-        data.edge_index = torch.from_numpy(
-            np.vstack((adj_sym_coo.row, adj_sym_coo.col)).astype(np.int64)
-        )
+        data.edge_index = torch.from_numpy(np.vstack((adj_sym_coo.row, adj_sym_coo.col)).astype(np.int32))
         data.edge_attr = torch.from_numpy(adj_sym_coo.data.astype(np.float32))
 
         out_dir = paths.make_dirs(cfg.suffix)["graphs"]
         out_path = out_dir / f"{f.stem}_graph.pt"
         torch.save(data, out_path)
         
-        del data, adj_sym, adj_sym_coo, X_in_sparse, X_raw_sparse
-        gc.collect()
+        del data, adj_sym, adj_sym_coo; gc.collect()
         return out_path
     except Exception as e: 
         print(f"  ↳ [!] Graph construction failed for {f.stem}: {e}")
@@ -774,11 +743,11 @@ def pad_mps_shapes(
     node_bucket: int | None = None, 
     edge_bucket: int | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad graph tensors with strict int64 index alignment for Apple Silicon MPS."""
+    """Calculate optimal buckets and pad graph shapes for PyTorch MPS."""
     if node_bucket is None or edge_bucket is None:
-        if getattr(cfg, "k_hops", 2) <= 1:
+        if cfg.k_hops <= 1:
             n_max = cfg.batch_size * 2
-        elif getattr(cfg, "k_hops", 2) == 2:
+        elif cfg.k_hops == 2:
             n_max = cfg.batch_size * 4
         else:
             n_max = cfg.batch_size * 8
@@ -790,32 +759,29 @@ def pad_mps_shapes(
     N = x.size(0)
     E = src.size(0)
 
-    # Calculate padded bucket sizes
+    # Calculate padded sizes (rounding up to nearest bucket)
     N_pad = ((N + node_bucket - 1) // node_bucket) * node_bucket
-    E_pad = (((E + edge_bucket - 1) // edge_bucket) * edge_bucket) if E > 0 else 0
+    E_pad = ((E + edge_bucket - 1) // edge_bucket) * edge_bucket
 
-    # Ensure at least 1 dummy node exists if we are padding edges
+    # If we need to pad edges, we MUST guarantee at least one dummy node exists 
+    # for the dummy edges to safely point to.
     if E_pad > E and N_pad == N:
         N_pad += node_bucket 
 
-    # 1. Pad Nodes (fill dummy nodes with 0)
+    # 1. Pad Nodes (with zeros)
     if N_pad > N:
-        x_dummy = torch.zeros((N_pad - N, x.size(1)), dtype=x.dtype, device=x.device)
-        x = torch.cat([x, x_dummy], dim=0).contiguous()
+        x_dummy = torch.zeros(N_pad - N, x.size(1), dtype=x.dtype, device=x.device)
+        x = torch.cat([x, x_dummy], dim=0)
 
-    # 2. Pad Edges (route dummy edges strictly to dummy node N with weight 0)
+    # 2. Pad Edges (Dummy edges pointing from Dummy Node -> Dummy Node with weight 0)
     if E_pad > E:
-        dummy_node_idx = N  # Points safely to the first padded dummy node
-        dummy_idx = torch.full((E_pad - E,), dummy_node_idx, dtype=torch.int64, device=src.device)
+        # N is the index of the FIRST dummy node. We route all fake math through it.
+        dummy_idx = torch.full((E_pad - E,), N, dtype=src.dtype, device=src.device)
         dummy_w = torch.zeros(E_pad - E, dtype=weights.dtype, device=weights.device)
 
-        src = torch.cat([src.to(dtype=torch.int64), dummy_idx], dim=0).contiguous()
-        dst = torch.cat([dst.to(dtype=torch.int64), dummy_idx], dim=0).contiguous()
-        weights = torch.cat([weights, dummy_w], dim=0).contiguous()
-    else:
-        src = src.to(dtype=torch.int64).contiguous()
-        dst = dst.to(dtype=torch.int64).contiguous()
-        weights = weights.contiguous()
+        src = torch.cat([src, dummy_idx], dim=0)
+        dst = torch.cat([dst, dummy_idx], dim=0)
+        weights = torch.cat([weights, dummy_w], dim=0)
 
     return x, src, dst, weights
 

@@ -25,12 +25,11 @@ class LibellaGNN(nn.Module):
         self.k_hops = getattr(cfg, "k_hops", 2)
         self.n_latents = n_metaprograms
         self.in_channels = in_channels
-        self.k = getattr(cfg, "topk_k", 6)
+        self.k = getattr(cfg, "topk_k", 3)
 
-        # 1. Identity & Context Encoder
+        # 1. Identity Encoder (Self Signal)
         self.self_enc = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
@@ -38,19 +37,25 @@ class LibellaGNN(nn.Module):
         # 2. Directional Feature-Conditioned Spatial Filter
         self.spatial_lin = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.edge_gate = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim + 1),
             nn.Linear(self.hidden_dim + 1, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Sigmoid(),
         )
 
-        # 3. Spatial Latent Projection Head
-        self.spatial_gate_head = nn.Linear(self.hidden_dim, self.n_latents)
+        # 3. Output Streams
+        self.mag_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.n_latents),
+            nn.Softplus(beta=1.0),
+        )
+        self.spatial_gate_head = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.n_latents)
+        )
+        self.spatial_gain = nn.Parameter(
+            torch.tensor(float(getattr(cfg, "spatial_gain_init", 1.0)))
+        )
 
-        # 4. Learnable Projection Gain (Starts at 5.0 to give raw cosine similarities unit energy)
-        self.enc_scale = nn.Parameter(torch.tensor(5.0, dtype=torch.float32))
-
-        # 5. Decoder Dictionary (Unit-Norm Basis Atoms)
+        # 4. Decoder Dictionary
         if init_components is not None:
             dec_init = torch.tensor(init_components, dtype=torch.float32)
             if dec_init.shape != (self.n_latents, in_channels):
@@ -62,13 +67,16 @@ class LibellaGNN(nn.Module):
             )
 
         self.decoder_weight = nn.Parameter(dec_init)
+        self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
+        self.ambient_scale = nn.Parameter(torch.tensor(getattr(cfg, "ambient_scale_init", 0.50)))
 
-        # Buffers & Auxiliary State Tracking
+        # Buffers & Aux State Tracking
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
         self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
         self.aux_k = getattr(cfg, "aux_k", 4)
+        self.ortho_sample_size = getattr(cfg, "ortho_sample_size", min(256, self.n_latents))
 
     def encode(
         self,
@@ -77,75 +85,128 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if len(src) > 0:
+            src = src.contiguous()
+            dst = dst.contiguous()
+
         N = x_dense.size(0)
-        has_edges = src.numel() > 0
 
-        # 1. Bounds Guard & Alignment for MPS
-        if has_edges:
-            src = src.to(dtype=torch.int64).contiguous()
-            dst = dst.to(dtype=torch.int64).contiguous()
-            edge_weights = edge_weights.to(dtype=torch.float32).contiguous()
-            valid = (src >= 0) & (src < N) & (dst >= 0) & (dst < N)
-            if not valid.all():
-                src = src[valid]
-                dst = dst[valid]
-                edge_weights = edge_weights[valid]
-                has_edges = src.numel() > 0
-
-        # 2. Depth Normalization (Conserves Total Cell Mass)
-        cell_mass = torch.clamp(
-            torch.linalg.vector_norm(x_dense, ord=2, dim=-1, keepdim=True), min=1e-5
-        )
+        # 1. Depth Disentanglement
+        cell_mass = torch.clamp(x_dense.norm(p=2, dim=-1, keepdim=True), min=1e-5)
         x_norm = x_dense / cell_mass
 
-        # 3. Self Feature Extraction
+        # 2. Self Feature Extraction
         h_self = self.self_enc(x_norm)
 
-        # 4. Bilateral Edge Filtering (Hard Cutoff for V1 Sharpness)
-        if has_edges:
+        # 3. Bilateral Edge Filtering & Symmetric Normalization
+        if len(src) > 0:
             with torch.no_grad():
                 cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
-                # Hard Bilateral Cutoff: Zero out edges across sharp transcriptomic boundaries (< 0.45)
-                edge_sim_thresh = float(getattr(cfg, "edge_sim_threshold", 0.45))
-                edge_mask = (cos_sim > edge_sim_thresh).to(dtype=x_dense.dtype)
                 decay = torch.sigmoid(
-                    (cos_sim - edge_sim_thresh) * getattr(cfg, "edge_decay_slope", 15.0)
-                ) * edge_mask
+                    (cos_sim - getattr(cfg, "edge_sim_threshold", 0.50))
+                    * getattr(cfg, "edge_decay_slope", 15.0)
+                )
 
-                deg = torch.zeros((N, 1), dtype=x_dense.dtype, device=x_dense.device)
-                deg.index_add_(0, dst, torch.ones((dst.size(0), 1), dtype=x_dense.dtype, device=x_dense.device))
-                edge_norm = torch.rsqrt(torch.clamp(deg[src], min=1.0)) * torch.rsqrt(torch.clamp(deg[dst], min=1.0))
+                # Symmetric Laplacian normalization
+                deg = torch.zeros((N, 1), device=x_dense.device)
+                deg.index_add_(0, dst, torch.ones((len(dst), 1), device=x_dense.device))
+                norm_inv_sqrt = 1.0 / torch.clamp(deg.sqrt(), min=1.0)
+                edge_norm = norm_inv_sqrt[src] * norm_inv_sqrt[dst]
 
             W_bil = edge_weights.unsqueeze(1) * decay
-            gate = torch.sigmoid(self.edge_gate(torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)))
 
+            # Feature-aware directional gate
+            gate_in = torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)
+            gate = self.edge_gate(gate_in)
+
+            # 4. Selective Graph Message Passing
             h_sp = h_self
             for _ in range(self.k_hops):
-                msg = self.spatial_lin(h_sp)[src] * gate * edge_norm
-                h_sp = h_sp + F.silu(torch.zeros_like(h_sp).index_add_(0, dst, msg))
+                h_proj = self.spatial_lin(h_sp)
+                msg = h_proj[src] * gate * edge_norm
+                agg = torch.zeros_like(h_sp)
+                agg.index_add_(0, dst, msg)
+
+                h_sp = h_sp + F.silu(agg)
         else:
             h_sp = h_self
 
-        # 5. APPNP Teleport Identity Anchor (85% Self + 15% Spatial Context)
-        alpha_teleport = float(getattr(cfg, "appnp_alpha", 0.85))
-        h_fused = F.layer_norm(
-            alpha_teleport * h_self + (1.0 - alpha_teleport) * h_sp, [self.hidden_dim]
-        )
+        # 5. Fusion of Self + Spatial Context
+        h_fused = F.layer_norm(h_self + h_sp, [self.hidden_dim])
 
-        # 6. Direct Latent Projection
+        # 6. Unconstrained Magnitude & Spatial Gating Shifts
+        z_mag = self.mag_head(h_fused)
+
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        scale = F.softplus(self.enc_scale)
-        bio_sim = F.linear(x_norm, w_dec_norm) * scale
-        spatial_logits = self.spatial_gate_head(h_fused)
+        bio_sim = torch.mm(x_norm, w_dec_norm.t())
+        spatial_shift = self.spatial_gate_head(h_sp)
 
-        raw_acts = F.relu(bio_sim + spatial_logits)
+        progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
+        spatial_warmup = 0.20 + 0.80 * min(1.0, progress * 2.0)
+
+        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
+        pre_acts = raw_affinity * z_mag
 
         # 7. Top-K Hard Sparsity
-        target_k = getattr(self, "current_k", max(6, self.k))
-        topk_vals, topk_indices = torch.topk(raw_acts, k=target_k, dim=-1)
-        z_sparse = torch.zeros_like(raw_acts).scatter_(-1, topk_indices, topk_vals)
+        target_k = getattr(self, "current_k", self.k)
+        topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
+        z_sparse = torch.zeros_like(pre_acts).scatter(-1, topk_indices, topk_vals)
 
-        return z_sparse, raw_acts, cell_mass, raw_acts
+        return z_sparse, pre_acts, cell_mass, z_mag
+
+    @torch.no_grad()
+    def resample_dead_latents(
+        self,
+        r_pos: torch.Tensor,
+        dead_mask: torch.Tensor,
+        optimizer: torch.optim.Optimizer | None = None,
+    ) -> int:
+        """Resamples dead atoms with Gram-Schmidt orthogonalization to prevent cloning."""
+        if not dead_mask.any():
+            return 0
+
+        dead_indices = torch.nonzero(dead_mask).squeeze(-1)
+        num_dead = dead_indices.numel()
+        cell_res_energy = r_pos.norm(p=2, dim=-1)
+
+        k_resample = min(num_dead, (cell_res_energy > 0.05).sum().item())
+        if k_resample == 0:
+            return 0
+
+        worst_cells = torch.topk(cell_res_energy, k=k_resample, dim=0).indices
+        target_dead_ids = dead_indices[:k_resample]
+
+        candidates = r_pos[worst_cells].clone()
+        noise = torch.randn_like(candidates) * 0.02
+        candidates = F.relu(candidates + noise)
+
+        healthy_mask = ~dead_mask
+        if healthy_mask.any():
+            w_healthy = F.normalize(self.decoder_weight.data[healthy_mask], p=2, dim=-1)
+            proj = torch.mm(candidates, w_healthy.t())
+            candidates = candidates - torch.mm(proj, w_healthy)
+            candidates = F.relu(candidates)
+
+        norms = candidates.norm(p=2, dim=-1, keepdim=True)
+        collapsed = (norms < 1e-4).squeeze(-1)
+        if collapsed.any():
+            candidates[collapsed] = F.relu(
+                torch.randn(collapsed.sum(), candidates.size(-1), device=candidates.device)
+            )
+
+        new_atoms = F.normalize(candidates, p=2, dim=-1)
+        self.decoder_weight.data[target_dead_ids] = new_atoms
+        self.steps_since_active[target_dead_ids] = 0
+
+        if optimizer is not None:
+            state = optimizer.state.get(self.decoder_weight, None)
+            if state is not None:
+                if "exp_avg" in state:
+                    state["exp_avg"][target_dead_ids] = 0.0
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"][target_dead_ids] = 0.0
+
+        return k_resample
 
     def forward(
         self,
@@ -166,8 +227,11 @@ class LibellaGNN(nn.Module):
         z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        # 100% PURE SPARSE RECONSTRUCTION (NO AMBIENT SHORTCUT)
-        comp_profile = torch.mm(z, w_dec_norm)
+        # Baseline Decoupling
+        baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
+        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.35)
+
+        comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
         x_recon = comp_profile * cell_mass
 
         aux_recon = None
@@ -175,7 +239,6 @@ class LibellaGNN(nn.Module):
         r_pos_ret = None
         dead_mask_ret = torch.zeros(self.n_latents, dtype=torch.bool, device=x_dense.device)
 
-        # Auxiliary Loss & Dead Latent Tracking
         if self.training:
             with torch.no_grad():
                 active_in_batch = (z > 1e-4).any(dim=0)
@@ -188,20 +251,22 @@ class LibellaGNN(nn.Module):
             r_pos = F.relu(x_norm - x_recon_norm)
             r_pos_ret = r_pos.detach()
             r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
-            residual_energy = torch.linalg.vector_norm(r_pos, ord=2, dim=-1).mean()
+            residual_energy = r_pos.norm(p=2, dim=-1).mean()
 
-            # Exact dual-gate AuxK condition
             if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
                 dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
                 num_dead = dead_indices.numel()
                 k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
 
                 w_dead = w_dec_norm[dead_indices]
-                scale = F.softplus(self.enc_scale)
-                aux_sim = F.relu(F.linear(r_norm, w_dead)) * scale
+                aux_sim = torch.mm(r_norm, w_dead.t())
                 topk_res = torch.topk(aux_sim, k=k_aux, dim=-1)
 
-                z_aux = torch.zeros_like(aux_sim).scatter_(-1, topk_res.indices, topk_res.values)
+                dead_mag = z_mag[:, dead_indices]
+                topk_mag = torch.gather(dead_mag, -1, topk_res.indices)
+
+                z_aux_weights = F.softplus(topk_res.values, beta=1.0) * topk_mag
+                z_aux = torch.zeros_like(aux_sim).scatter(-1, topk_res.indices, z_aux_weights)
                 aux_recon = torch.mm(z_aux, w_dead)
 
         return x_recon, z, w_dec_norm, aux_recon, r_norm, z_mag, r_pos_ret, dead_mask_ret
@@ -218,34 +283,47 @@ class LibellaGNN(nn.Module):
         ghost_weights: torch.Tensor | None = None,
         progress: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 1. Depth-Normalized Reconstruction Objective
-        cell_mass = torch.clamp(
-            torch.linalg.vector_norm(x_true, ord=2, dim=-1, keepdim=True), min=1e-5
-        )
-        x_norm = x_true / cell_mass
-        recon_norm = recon_x / cell_mass
+        # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
+        is_non_zero = x_true > 0
+        num_pos = torch.clamp(is_non_zero.float().sum(), min=1.0)
+        num_zeros = (x_true == 0).float().sum()
+        current_dynamic_w = (num_zeros / num_pos).detach()
 
-        # Mean Squared Error on unit-normalized profile
-        mse_loss = F.mse_loss(recon_norm, x_norm, reduction="none").sum(dim=-1)
-        # Cosine alignment on single-cell profile
-        cos_sim = (recon_norm * x_norm).sum(dim=-1)
+        if self.training:
+            self.dynamic_w_ema.lerp_(
+                current_dynamic_w, weight=getattr(cfg, "dynamic_w_ema_weight", 0.10)
+            )
 
-        # Combined Pearson-Cosine Reconstruction Objective
-        per_cell_recon = mse_loss + 2.0 * (1.0 - cos_sim)
-        l_recon = torch.mean(per_cell_recon)
+        w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
+        variance_weight = w_mat * (1.0 + torch.log1p(x_true))
+        variance_weight = variance_weight / torch.clamp(variance_weight.mean(), min=1e-5)
+
+        raw_delta = recon_x - x_true
+        asym_penalty = getattr(cfg, "asym_penalty_weight", 0.50)
+        asym_factor = 1.0 + (is_non_zero.float() * asym_penalty) * (raw_delta < 0).float()
+
+        delta_clamp = getattr(cfg, "delta_clamp", 30.0)
+        scaled_delta = torch.clamp(raw_delta * asym_factor, min=-delta_clamp, max=delta_clamp)
+
+        per_cell_loss = torch.sum(variance_weight * torch.log(torch.cosh(scaled_delta + 1e-6)), dim=-1)
+        l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
 
         # 2. Strict Orthogonality Barrier
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
         off_diag = gram * self.ortho_mask
 
-        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.40)
+        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
         excess_corr = F.relu(off_diag - ortho_thresh)
         num_violating = torch.clamp((excess_corr > 0).float().sum(), min=1.0)
-        l_ortho = excess_corr.pow(2).sum() / num_violating
+        l_ortho_mean = excess_corr.pow(2).sum() / num_violating
 
-        # 3. Sparsity & Auxiliary Loss
+        max_corr = off_diag.max()
+        l_ortho_max = F.relu(max_corr - 0.50).pow(2) * 50.0
+        l_ortho = l_ortho_mean + l_ortho_max
+
         l_sparse = torch.tensor(0.0, device=x_true.device)
 
+        # 3. Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
             aux_error = (aux_recon - r_norm).pow(2).sum(dim=-1).mean()
@@ -253,15 +331,18 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # 4. Combined Loss
-        base_ortho = getattr(cfg, "ortho_weight", 0.50)
-        total_loss = l_recon + (base_ortho * l_ortho) + (0.50 * l_aux)
+        base_ortho = getattr(cfg, "ortho_weight", 8.0)
+        ortho_min = getattr(cfg, "ortho_min_scale", 0.50)
+        current_ortho = base_ortho * (ortho_min + (1.0 - ortho_min) * progress)
+        aux_weight = getattr(cfg, "aux_weight", 0.50)
+
+        total_loss = l_recon + (current_ortho * l_ortho) + (aux_weight * l_aux)
 
         return total_loss, l_recon.detach(), l_ortho.detach(), l_sparse.detach(), l_aux.detach()
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
-        """Harvests telemetry: parameter/gradient norms, SVD spectrum, effective rank, and correlation."""
+        """Harvests parameter/gradient norms, SVD spectrum, effective rank, and correlation."""
         stats: dict[str, float] = {}
         total_g_norm_sq = 0.0
 
@@ -281,7 +362,6 @@ class LibellaGNN(nn.Module):
         if hasattr(self, "decoder_weight"):
             w = F.normalize(self.decoder_weight, p=2, dim=1)
 
-            # 1. Off-diagonal Gram correlations
             sim = torch.mm(w, w.t())
             off_diag_mask = ~torch.eye(w.size(0), dtype=torch.bool, device=w.device)
             off_diag_vals = sim.masked_select(off_diag_mask)
@@ -289,7 +369,6 @@ class LibellaGNN(nn.Module):
                 stats["dict/max_cross_corr"] = off_diag_vals.max().item()
                 stats["dict/mean_cross_corr"] = off_diag_vals.abs().mean().item()
 
-            # 2. SVD Spectrum and Effective Rank
             w_cpu = w.detach().cpu()
             s = torch.linalg.svdvals(w_cpu)
             eff_rank = (s.sum() ** 2) / torch.clamp((s**2).sum(), min=1e-9)
@@ -297,6 +376,12 @@ class LibellaGNN(nn.Module):
             stats["dict/svd_sigma_1"] = s[0].item()
             stats["dict/svd_sigma_2"] = s[1].item() if s.numel() > 1 else 0.0
             stats["dict/svd_sigma_3"] = s[2].item() if s.numel() > 2 else 0.0
+
+        if hasattr(self, "ambient_scale"):
+            lr_mult = getattr(cfg, "ambient_lr_mult", 1.0)
+            max_cap = getattr(cfg, "ambient_max_cap", 0.35)
+            amb_pct = torch.sigmoid(self.ambient_scale * lr_mult).item() * max_cap * 100.0
+            stats["model/ambient_absorption_pct"] = amb_pct
 
         dead_count = (self.steps_since_active >= self.dead_step_threshold).sum().item()
         stats["latents/dead_count"] = float(dead_count)
