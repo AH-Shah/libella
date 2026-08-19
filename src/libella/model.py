@@ -131,26 +131,49 @@ class LibellaGNN(nn.Module):
         else:
             h_sp = h_self
 
-        # 5. Fusion of Self + Spatial Context
-        h_fused = F.layer_norm(h_self + h_sp, [self.hidden_dim])
-
-        # 6. Unconstrained Magnitude & Spatial Gating Shifts
+         # 5. Fusion of Self + Spatial Context (Biology dominates 80/20)
+        h_fused = F.layer_norm(h_self + (0.25 * h_sp), [self.hidden_dim])
         z_mag = self.mag_head(h_fused)
 
+        # 6. Strictly Bounded Spatial Routing
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        bio_sim = torch.mm(x_norm, w_dec_norm.t())
-        spatial_shift = self.spatial_gate_head(h_sp)
+        
+        # bio_sim is naturally bounded [-1, 1]
+        bio_sim = torch.mm(x_norm, w_dec_norm.t()) 
+        
+        # Force spatial shift to be strictly bounded [-1, 1]
+        spatial_shift = torch.tanh(self.spatial_gate_head(h_sp))
 
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
-        spatial_warmup = 0.20 + 0.80 * min(1.0, progress * 2.0)
+        spatial_warmup = 0.20 + 0.80 * progress
+        
+        # Force the maximum spatial multiplier to be 0.5 (GNN can never overwrite biology)
+        leashed_gain = torch.sigmoid(self.spatial_gain) * 0.5 
 
-        raw_affinity = F.softplus(bio_sim + (self.spatial_gain * spatial_warmup * spatial_shift))
-        pre_acts = raw_affinity * z_mag
+        # Combine perfectly scaled signals
+        raw_affinity = bio_sim + (leashed_gain * spatial_warmup * spatial_shift)
+        
+        # Shift up and multiply by magnitude
+        pre_acts = F.relu(raw_affinity) * z_mag
+
+        # Tie-breaker noise
+        if self.training:
+            pre_acts = pre_acts + (torch.randn_like(pre_acts) * 0.05 * pre_acts.detach().std(dim=-1, keepdim=True))
 
         # 7. Top-K Hard Sparsity
         target_k = getattr(self, "current_k", self.k)
         topk_vals, topk_indices = torch.topk(pre_acts, k=target_k, dim=-1)
-        z_sparse = torch.zeros_like(pre_acts).scatter(-1, topk_indices, topk_vals)
+        mask = torch.zeros_like(pre_acts, dtype=torch.bool).scatter_(-1, topk_indices, True)
+
+        if self.training:
+            # 1% bleed to keep gradients alive
+            z_sparse = torch.where(mask, pre_acts, pre_acts * 0.01)
+        else:
+            # STRICT ZERO for benchmark export
+            z_sparse = torch.where(mask, pre_acts, torch.tensor(0.0, device=pre_acts.device))
+
+        # We DO NOT multiply by cell_mass here anymore!
+        z_sparse = F.relu(z_sparse)
 
         return z_sparse, pre_acts, cell_mass, z_mag
 
@@ -227,10 +250,10 @@ class LibellaGNN(nn.Module):
         z, pre_acts, cell_mass, z_mag = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
 
-        # Baseline Decoupling
         baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
-        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.35)
+        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.0)
 
+        # Reconstruct compositional signature, THEN scale by cell mass
         comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
         x_recon = comp_profile * cell_mass
 

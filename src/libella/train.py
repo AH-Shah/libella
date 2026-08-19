@@ -412,13 +412,13 @@ def _train_loop(
                         delta_clamp = getattr(cfg, "delta_clamp", 30.0)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-delta_clamp, max=delta_clamp)
 
-                        val_loss_sum = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)))
-                        val_log_cosh = val_loss_sum / max(1, x_val.numel())
+                        per_cell_loss_val = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)), dim=-1)
+                        val_log_cosh = torch.mean(per_cell_loss_val) / math.sqrt(x_val.shape[-1])
 
                         val_loss_acc += val_log_cosh.detach()
                         val_steps += 1
 
-                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, val_loss_sum, val_log_cosh
+                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, per_cell_loss_val, val_log_cosh
 
                 del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm
 
@@ -439,7 +439,7 @@ def _train_loop(
 
             if recon_params:
                 torch.nn.utils.clip_grad_norm_(
-                    recon_params, max_norm=getattr(cfg, "grad_clip_recon", 5.0)
+                    recon_params, max_norm=getattr(cfg, "grad_clip_recon", 1000.0)
                 )
             if spatial_params:
                 torch.nn.utils.clip_grad_norm_(
