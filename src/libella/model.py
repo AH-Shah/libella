@@ -420,28 +420,25 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # 5. Delta Boundary Loss (Bounded Shift Space)
+        # 5. Delta Boundary Loss (Bipolar Edge Attention Sharpness)
         l_sharp = torch.tensor(0.0, device=x_true.device)
-        if src is not None and len(src) > 0 and edge_decay is not None and spatial_shift is not None:
-            n_dims = spatial_shift.size(-1)
-            edge_shift_sim = (spatial_shift[src] * spatial_shift[dst]).sum(dim=-1, keepdim=True) / n_dims
-
+        if src is not None and len(src) > 0 and edge_decay is not None and raw_gate is not None:
             boundary_mask = (edge_decay < 0.40).float()
             internal_mask = (edge_decay > 0.60).float()
 
             n_boundary = boundary_mask.sum()
             n_internal = internal_mask.sum()
 
-            # Boundary: Repel spatial deltas (Target < -0.05)
+            # Boundary Fix: Force attention gate to actively repel (raw_gate < -0.10)
             l_boundary = (
-                (F.relu(edge_shift_sim + 0.15) * boundary_mask).sum() / torch.clamp(n_boundary, min=1.0)
+                (F.relu(raw_gate + 0.10) * boundary_mask).sum() / torch.clamp(n_boundary * raw_gate.size(-1), min=1.0)
                 if n_boundary > 0
                 else torch.tensor(0.0, device=x_true.device)
             )
 
-            # Internal: Bundle spatial deltas (Target > 0.10)
+            # Internal Fix: Force attention gate to actively attract (raw_gate > 0.10)
             l_internal = (
-                (F.relu(0.25 - edge_shift_sim) * internal_mask).sum() / torch.clamp(n_internal, min=1.0)
+                (F.relu(0.10 - raw_gate) * internal_mask).sum() / torch.clamp(n_internal * raw_gate.size(-1), min=1.0)
                 if n_internal > 0
                 else torch.tensor(0.0, device=x_true.device)
             )
