@@ -325,7 +325,7 @@ def _train_loop(
                     r_pos,
                     dead_mask,
                     edge_decay,
-                    spatial_shift,
+                    raw_gate,
                 ) = model(x, src, dst, weights)
 
                 last_r_pos = r_pos
