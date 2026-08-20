@@ -351,7 +351,7 @@ def _train_loop(
                     src=src,
                     dst=dst,
                     z_full=z,
-                    spatial_shift=spatial_shift,
+                    raw_gate=raw_gate,
                 )
                 true_batch_loss = loss_res[0]
                 base_recon_val = loss_res[1]
