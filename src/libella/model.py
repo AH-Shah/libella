@@ -370,7 +370,7 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor | None = None,
         dst: torch.Tensor | None = None,
         z_full: torch.Tensor | None = None,
-        spatial_shift: torch.Tensor | None = None,
+        raw_gate: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = x_true > 0
