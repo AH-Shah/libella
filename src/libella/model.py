@@ -352,7 +352,7 @@ class LibellaGNN(nn.Module):
             r_pos_ret,
             dead_mask_ret,
             decay,
-            spatial_shift,
+            raw_gate,
         )
 
     def calc_loss(
