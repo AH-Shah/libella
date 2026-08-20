@@ -440,7 +440,7 @@ def _train_loop(
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, per_cell_loss_val, val_log_cosh
 
-                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay, spatial_shift
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay, raw_gate
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
