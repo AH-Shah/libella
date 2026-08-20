@@ -294,7 +294,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        z, pre_acts, cell_mass, z_mag, decay, src, dst, spatial_shift = self.encode(
+        z, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate = self.encode(
             x_dense, src, dst, edge_weights
         )
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
