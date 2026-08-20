@@ -388,12 +388,13 @@ def _train_loop(
                     )
 
                     if len(src) > 0 and edge_decay is not None and raw_gate is not None:
+                        mean_g = raw_gate.mean(dim=-1, keepdim=True)
                         b_mask = (edge_decay < 0.40).squeeze(-1)
                         i_mask = (edge_decay > 0.60).squeeze(-1)
                         if b_mask.any():
-                            gpu_telemetry["shift_bnd_sim"] += raw_gate[b_mask].mean()
+                            gpu_telemetry["shift_bnd_sim"] += mean_g[b_mask].mean()
                         if i_mask.any():
-                            gpu_telemetry["shift_int_sim"] += raw_gate[i_mask].mean()
+                            gpu_telemetry["shift_int_sim"] += mean_g[i_mask].mean()
 
                     gpu_telemetry["l_rec"] += base_recon_val
                     gpu_telemetry["l_ort"] += base_ort_val
