@@ -265,6 +265,8 @@ def _train_loop(
             "l_sparse": torch.tensor(0.0, device=device),
             "l_aux": torch.tensor(0.0, device=device),
             "l_sharp": torch.tensor(0.0, device=device),
+            "shift_bnd_sim": torch.tensor(0.0, device=device),
+            "shift_int_sim": torch.tensor(0.0, device=device),
             "l0_avg": torch.tensor(0.0, device=device),
             "dead_cnt": torch.tensor(0.0, device=device),
             "max_act": torch.tensor(0.0, device=device),
@@ -323,6 +325,7 @@ def _train_loop(
                     r_pos,
                     dead_mask,
                     edge_decay,
+                    spatial_shift,
                 ) = model(x, src, dst, weights)
 
                 last_r_pos = r_pos
@@ -348,6 +351,7 @@ def _train_loop(
                     src=src,
                     dst=dst,
                     z_full=z,
+                    spatial_shift=spatial_shift,
                 )
                 true_batch_loss = loss_res[0]
                 base_recon_val = loss_res[1]
@@ -369,7 +373,7 @@ def _train_loop(
                 # 3. GPU Telemetry Tracking
                 with torch.no_grad():
                     active_thresh = getattr(cfg, "active_latent_threshold", 1e-2)
-                    batch_active = (z_train > active_thresh).float()
+                    batch_active = (z_train.abs() > active_thresh).float()
                     current_freq = batch_active.mean(dim=0)
 
                     if ema_latent_freq is None:
@@ -383,6 +387,15 @@ def _train_loop(
                         else torch.tensor(0.0, device=device)
                     )
 
+                    if len(src) > 0 and edge_decay is not None and spatial_shift is not None:
+                        shift_sim = (spatial_shift[src] * spatial_shift[dst]).sum(dim=-1, keepdim=True) / spatial_shift.size(-1)
+                        b_mask = edge_decay < 0.40
+                        i_mask = edge_decay > 0.60
+                        if b_mask.any():
+                            gpu_telemetry["shift_bnd_sim"] += shift_sim[b_mask].mean()
+                        if i_mask.any():
+                            gpu_telemetry["shift_int_sim"] += shift_sim[i_mask].mean()
+
                     gpu_telemetry["l_rec"] += base_recon_val
                     gpu_telemetry["l_ort"] += base_ort_val
                     gpu_telemetry["l_sparse"] += base_sparse_val
@@ -390,7 +403,7 @@ def _train_loop(
                     gpu_telemetry["l_sharp"] += base_sharp_val
                     gpu_telemetry["l0_avg"] += batch_active.sum(dim=-1).mean()
                     gpu_telemetry["dead_cnt"] += dead_count_val
-                    gpu_telemetry["max_act"] += z_train.max()
+                    gpu_telemetry["max_act"] += z_train.abs().max()
                     gpu_telemetry["dyn_w"] += model.dynamic_w_ema.detach()
                     if z_mag is not None:
                         gpu_telemetry["z_mag_mean"] += z_mag.detach().mean()
@@ -428,7 +441,7 @@ def _train_loop(
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, per_cell_loss_val, val_log_cosh
 
-                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay, spatial_shift
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
@@ -556,6 +569,10 @@ def _train_loop(
             "loss/aux": epoch_telemetry.get("l_aux", 0.0),
             "loss/sharp": epoch_telemetry.get("l_sharp", 0.0),
             "loss/dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
+            "spatial/lat_bnd_sim": epoch_telemetry.get("lat_bnd_sim", 0.0),
+            "spatial/lat_int_sim": epoch_telemetry.get("lat_int_sim", 0.0),
+            "spatial/shift_bnd_sim": epoch_telemetry.get("shift_bnd_sim", 0.0),
+            "spatial/shift_int_sim": epoch_telemetry.get("shift_int_sim", 0.0),
             "sae/l0_avg": current_l0,
             "sae/dead_latents": current_dead,
             "sae/z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),

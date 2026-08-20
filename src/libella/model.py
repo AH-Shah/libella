@@ -36,16 +36,21 @@ class LibellaGNN(nn.Module):
 
         # 2. Directional Feature-Conditioned Spatial Filter
         self.spatial_lin = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+
         self.edge_gate = nn.Sequential(
             nn.Linear(self.hidden_dim + 1, self.hidden_dim),
-            nn.Sigmoid(),
+            nn.Tanh(),  # Phase 1: Bipolar edge generation
         )
+        
+        # Phase 3: SwiGLU Feature-Wise Gating (The MHA Fix)
+        self.gate_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.val_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
         # 3. Output Streams
         self.mag_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.n_latents),
+            nn.Linear(self.hidden_dim, self.n_latents), # Back to 1x latents
             nn.Softplus(beta=1.0),
         )
         self.spatial_gate_head = nn.Sequential(
@@ -125,70 +130,99 @@ class LibellaGNN(nn.Module):
 
             # Feature-aware directional gate
             gate_in = torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)
-            gate = self.edge_gate(gate_in)
+            raw_gate = self.edge_gate(gate_in)
+            
+            # Phase 1: Sparse Bipolar Attention with Gradient Bleed
+            dead_zone = getattr(cfg, "bipolar_deadzone", 0.20)
+            abs_gate = raw_gate.abs()
+            mask = abs_gate >= dead_zone
+            
+            if self.training:
+                # 1% bleed for trapped edges so they can learn to escape the dead zone
+                routed_gate = torch.where(mask, abs_gate - dead_zone, abs_gate * 0.01)
+            else:
+                routed_gate = F.relu(abs_gate - dead_zone)
+                
+            gate = torch.sign(raw_gate) * routed_gate
 
-            # 4. Selective Graph Message Passing
-            h_sp = h_self
+            # 4. Selective Bipolar Message Passing & APPNP
+            H_0 = h_self  # Phase 2: Pure Biological Identity
+            H_k = H_0
+            
             for _ in range(self.k_hops):
-                h_proj = self.spatial_lin(h_sp)
-                msg = h_proj[src] * gate * edge_norm
-                agg = torch.zeros_like(h_sp)
+                h_proj = self.spatial_lin(H_k)
+                msg = h_proj[src] * gate * edge_norm  # Can now actively repel (negative msg)
+                agg = torch.zeros_like(H_k)
                 agg.index_add_(0, dst, msg)
 
-                h_sp = h_sp + F.silu(agg)
+                # Phase 3: SwiGLU Feature-Wise Inhibition (No mixing!)
+                gate_val = torch.sigmoid(self.gate_proj(agg)) 
+                val = F.silu(self.val_proj(agg))           
+                H_mixed = gate_val * val
+                
+                # Phase 2: Progressive APPNP Bipolar Anchor
+                # Starts at balanced 50/50, tightens to strict 80/20 biological anchor
+                progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
+                alpha_id = 0.50 + (0.30 * progress)
+                alpha_sp = 1.0 - alpha_id
+                
+                H_k = (alpha_id * H_0) + (alpha_sp * H_mixed)
+                
+            h_sp = H_k  # Overwrite for downstream
         else:
             h_sp = h_self
             decay = None
+            raw_gate = None
 
-         # 5. Fusion of Self + Spatial Context (Biology dominates 80/20)
+         # 5. Fusion of Self + Spatial Context (For Magnitude / Baseline Biology)
         h_fused = F.layer_norm(h_self + (0.25 * h_sp), [self.hidden_dim])
         z_mag = self.mag_head(h_fused)
 
-        # 6. Strictly Bounded Spatial Routing
+        # 6. Strictly Bounded Feature-Contrastive Spatial Routing
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        
-        # bio_sim is naturally bounded [-1, 1]
         bio_sim = torch.mm(x_norm, w_dec_norm.t()) 
         
-        # Force spatial shift to be strictly bounded [-1, 1]
-        spatial_shift = torch.tanh(self.spatial_gate_head(h_sp))
+        # Step A: Reverse the APPNP blend to extract the PURE, un-dampened spatial messages
+        progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
+        alpha_id = 0.50 + (0.30 * progress)
+        alpha_sp = 1.0 - alpha_id
+        
+        h_pure_spatial = (h_sp - (alpha_id * h_self)) / max(alpha_sp, 1e-3)
+        
+        # Step B: Generate the spatial shift using ONLY the raw spatial context
+        spatial_shift = torch.tanh(self.spatial_gate_head(h_pure_spatial))
 
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         spatial_warmup = 0.20 + 0.80 * progress
-        
-        # Force the maximum spatial multiplier to be 0.5 (GNN can never overwrite biology)
         unleashed_gain = F.softplus(self.spatial_gain)
 
-
-        # Combine perfectly scaled signals
+        # 1. Bipolar Affinity (GNN repels/attracts)
         raw_affinity = bio_sim + (unleashed_gain * spatial_warmup * spatial_shift)
         
-        # Shift up and multiply by magnitude
+        # 2. Unipolar Biology (Clamp negatives to 0, then scale)
         pre_acts = F.relu(raw_affinity) * z_mag
 
-        # Tie-breaker noise
         if self.training:
             pre_acts = pre_acts + (torch.randn_like(pre_acts) * 0.05 * pre_acts.detach().std(dim=-1, keepdim=True))
 
-        # 7. Top-K Hard Sparsity
+        # 3. Standard Positive Top-K
         target_k = getattr(self, "current_k", self.k)
-        N_cells = pre_acts.size(0)
-        global_k_budget = N_cells * target_k
+        global_k_budget = pre_acts.size(0) * target_k
         flat_acts = pre_acts.view(-1)
+        
         threshold = torch.kthvalue(flat_acts, flat_acts.numel() - global_k_budget + 1).values
         mask = pre_acts >= threshold
 
-
         if self.training:
-            # 1% bleed to keep gradients alive
+            # 1% bleed to keep gradients alive for inactive pathways
             z_sparse = torch.where(mask, pre_acts, pre_acts * 0.01)
         else:
             # STRICT ZERO for benchmark export
             z_sparse = torch.where(mask, pre_acts, torch.tensor(0.0, device=pre_acts.device))
 
-        z_sparse = F.relu(z_sparse)
-
-        return z_sparse, pre_acts, cell_mass, z_mag, decay, src, dst
+        z_sparse = F.relu(z_sparse)  # Redundant safety anchor
+        
+        return z_sparse, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -260,7 +294,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        z, pre_acts, cell_mass, z_mag, decay, _, _ = self.encode(
+        z, pre_acts, cell_mass, z_mag, decay, src, dst, spatial_shift = self.encode(
             x_dense, src, dst, edge_weights
         )
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
@@ -269,6 +303,7 @@ class LibellaGNN(nn.Module):
         ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.0)
 
         # Reconstruct compositional signature, THEN scale by cell mass
+        # No ReLU cheat allowed. The network must learn true biological zeros.
         comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
         x_recon = comp_profile * cell_mass
 
@@ -279,7 +314,7 @@ class LibellaGNN(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                active_in_batch = (z > 1e-2).any(dim=0)
+                active_in_batch = (z.abs() > 1e-2).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
                 dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
@@ -317,6 +352,7 @@ class LibellaGNN(nn.Module):
             r_pos_ret,
             dead_mask_ret,
             decay,
+            spatial_shift,
         )
 
     def calc_loss(
@@ -334,6 +370,7 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor | None = None,
         dst: torch.Tensor | None = None,
         z_full: torch.Tensor | None = None,
+        spatial_shift: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = x_true > 0
@@ -365,7 +402,7 @@ class LibellaGNN(nn.Module):
         off_diag = gram * self.ortho_mask
 
         ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
-        excess_corr = F.relu(off_diag - ortho_thresh)
+        excess_corr = F.relu(off_diag.abs() - ortho_thresh)
         num_violating = torch.clamp((excess_corr > 0).float().sum(), min=1.0)
         l_ortho_mean = excess_corr.pow(2).sum() / num_violating
 
@@ -383,12 +420,11 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # 5. Boundary Contrastive Sharpening (Delta Boost)
+        # 5. Delta Boundary Loss (Bounded Shift Space)
         l_sharp = torch.tensor(0.0, device=x_true.device)
-        if src is not None and len(src) > 0 and edge_decay is not None:
-            latent_source = z_full if z_full is not None else z
-            z_unit = F.normalize(latent_source + 1e-6, p=2, dim=-1)
-            edge_latent_sim = (z_unit[src] * z_unit[dst]).sum(dim=-1, keepdim=True)
+        if src is not None and len(src) > 0 and edge_decay is not None and spatial_shift is not None:
+            n_dims = spatial_shift.size(-1)
+            edge_shift_sim = (spatial_shift[src] * spatial_shift[dst]).sum(dim=-1, keepdim=True) / n_dims
 
             boundary_mask = (edge_decay < 0.40).float()
             internal_mask = (edge_decay > 0.60).float()
@@ -396,14 +432,16 @@ class LibellaGNN(nn.Module):
             n_boundary = boundary_mask.sum()
             n_internal = internal_mask.sum()
 
+            # Boundary: Repel spatial deltas (Target < -0.05)
             l_boundary = (
-                F.relu(((edge_latent_sim * boundary_mask).sum() / torch.clamp(n_boundary, min=1.0)) - 0.20)
+                (F.relu(edge_shift_sim + 0.15) * boundary_mask).sum() / torch.clamp(n_boundary, min=1.0)
                 if n_boundary > 0
                 else torch.tensor(0.0, device=x_true.device)
             )
 
+            # Internal: Bundle spatial deltas (Target > 0.10)
             l_internal = (
-                F.relu(0.80 - ((edge_latent_sim * internal_mask).sum() / torch.clamp(n_internal, min=1.0)))
+                (F.relu(0.25 - edge_shift_sim) * internal_mask).sum() / torch.clamp(n_internal, min=1.0)
                 if n_internal > 0
                 else torch.tensor(0.0, device=x_true.device)
             )
@@ -414,7 +452,7 @@ class LibellaGNN(nn.Module):
         ortho_min = getattr(cfg, "ortho_min_scale", 0.50)
         current_ortho = base_ortho * (ortho_min + (1.0 - ortho_min) * progress)
         aux_weight = getattr(cfg, "aux_weight", 0.50)
-        sharp_weight = getattr(cfg, "sharp_weight", 10)
+        sharp_weight = getattr(cfg, "sharp_weight", 50)
 
         total_loss = (
             l_recon

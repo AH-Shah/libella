@@ -46,7 +46,6 @@ class RunConfig:
     epochs: int = 300
     batch_size: int = 5000
     meta_batch_size: int = 5
-    checkpoint_freq: int = 5
     phase2_force_window: int = 20
 
     # Graph & Data
@@ -68,7 +67,7 @@ class RunConfig:
     att_temp_init: float = -2.0
     cross_temp_init: float = -2.0
     spatial_gain_init: float = 2.0
-    sharp_weight: float = 10
+    sharp_weight: float = 50
 
     # Top-K Sparsity & Latent Dynamics
     topk_k: int = 40
@@ -112,10 +111,7 @@ class RunConfig:
     patience_ratio: float = 0.12
     min_stop_progress: float = 0.5
     early_stop_rel_tol: float = 1e-3
-    phase2_force_window: int = 20
-    checkpoint_freq: int = 10
-    telemetry_step_freq: int = 50
-    log_histograms: bool = False
+
     
 
     # Inference & Topology
