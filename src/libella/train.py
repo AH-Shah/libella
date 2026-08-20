@@ -387,14 +387,13 @@ def _train_loop(
                         else torch.tensor(0.0, device=device)
                     )
 
-                    if len(src) > 0 and edge_decay is not None and spatial_shift is not None:
-                        shift_sim = (spatial_shift[src] * spatial_shift[dst]).sum(dim=-1, keepdim=True) / spatial_shift.size(-1)
-                        b_mask = edge_decay < 0.40
-                        i_mask = edge_decay > 0.60
+                    if len(src) > 0 and edge_decay is not None and raw_gate is not None:
+                        b_mask = (edge_decay < 0.40).squeeze(-1)
+                        i_mask = (edge_decay > 0.60).squeeze(-1)
                         if b_mask.any():
-                            gpu_telemetry["shift_bnd_sim"] += shift_sim[b_mask].mean()
+                            gpu_telemetry["shift_bnd_sim"] += raw_gate[b_mask].mean()
                         if i_mask.any():
-                            gpu_telemetry["shift_int_sim"] += shift_sim[i_mask].mean()
+                            gpu_telemetry["shift_int_sim"] += raw_gate[i_mask].mean()
 
                     gpu_telemetry["l_rec"] += base_recon_val
                     gpu_telemetry["l_ort"] += base_ort_val
