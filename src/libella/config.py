@@ -96,6 +96,7 @@ class RunConfig:
     ortho_weight: float = 8.0
     ortho_overlap_threshold: float = 0.30
     ortho_min_scale: float = 0.50
+    routing_ema_weight: float = 5e-3
 
     # Optimizers & Gradient Clipping
     lr_base: float = 1e-3

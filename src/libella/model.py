@@ -222,7 +222,7 @@ class LibellaGNN(nn.Module):
                 batch_mean = cell_norm_scores.mean(dim=0)
                 batch_std = cell_norm_scores.std(dim=0).clamp(min=1e-4)
 
-                routing_ema_weight = getattr(cfg, "routing_ema_weight", 0.10)
+                routing_ema_weight = getattr(cfg, "routing_ema_weight", 0.005)
                 self.routing_mean.lerp_(batch_mean, weight=routing_ema_weight)
                 self.routing_std.lerp_(batch_std, weight=routing_ema_weight)
 
