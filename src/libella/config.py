@@ -100,7 +100,7 @@ class RunConfig:
     # Optimizers & Gradient Clipping
     lr_base: float = 1e-3
     wd_base: float = 1e-4
-    lr_decoder: float = 1e-3
+    lr_decoder: float = 3e-3
     lr_temperature: float = 1e-3
     lr_min: float = 1e-6
     grad_clip_recon: float = 1000.0
