@@ -109,10 +109,10 @@ class RunConfig:
     # PhaseTracker & Early Stopping
     p1_max_ratio: float = 0.15
     p1_drop_tol: float = 0.010
-    tracker_window_ratio: float = 0.15
-    patience_ratio: float = 0.20
-    min_stop_progress: float = 0.85
-    early_stop_rel_tol: float = 1e-4
+    tracker_window_ratio: float = 0.08
+    patience_ratio: float = 0.12
+    min_stop_progress: float = 0.5
+    early_stop_rel_tol: float = 1e-3
 
     
 
