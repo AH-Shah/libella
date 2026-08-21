@@ -222,11 +222,16 @@ class LibellaGNN(nn.Module):
         threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
         mask = normalized_scores >= threshold
 
-        # 7. Apply the Top-K Mask to the UNTIED z_bio (not to bio_sim)
+        # 7. Straight-Through Estimator (STE) Gradient Reconnection
+        # Forward pass: ste_connector evaluates to 0, keeping z_routed identical to z_bio
+        # Backward pass: dL/dz flows into BOTH z_bio and raw_affinity
+        ste_connector = F.relu(raw_affinity) - F.relu(raw_affinity).detach()
+        z_routed = z_bio + ste_connector
+
         if self.training:
-            z_sparse = torch.where(mask, z_bio, z_bio * 0.01)
+            z_sparse = torch.where(mask, z_routed, z_routed * 0.01)
         else:
-            z_sparse = torch.where(mask, z_bio, torch.tensor(0.0, device=z_bio.device))
+            z_sparse = torch.where(mask, z_routed, torch.tensor(0.0, device=z_routed.device))
 
         z_sparse = F.relu(z_sparse)
 
