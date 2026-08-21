@@ -323,7 +323,7 @@ def _train_loop(
                     w_dec_norm,
                     aux_recon,
                     r_norm,
-                    z_bio,
+                    z_mag,
                     r_pos,
                     dead_mask,
                     edge_decay,
@@ -439,17 +439,17 @@ def _train_loop(
                         delta_clamp = getattr(cfg, "delta_clamp", 100.0)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-delta_clamp, max=delta_clamp)
 
-                        # Numerically stable log-cosh + MSE for validation evaluation
+                        # Numerically stable log-cosh + 1.5 power law for validation evaluation
                         abs_delta_val = torch.abs(scaled_delta_val)
                         stable_log_cosh_val = abs_delta_val + torch.log1p(torch.exp(-2.0 * abs_delta_val)) - math.log(2.0)
-                        per_cell_loss_cosh_val = torch.sum(variance_weight_val * stable_log_cosh_val, dim=-1)
-                        per_cell_loss_mse_val = torch.sum(variance_weight_val * (scaled_delta_val ** 2), dim=-1) * 0.25
-                        val_recon_loss = torch.mean(per_cell_loss_cosh_val + per_cell_loss_mse_val) / math.sqrt(x_val.shape[-1])
+                        peak_penalty_val = (abs_delta_val + 1e-6).pow(1.5) * 0.05
+                        per_cell_loss_val = torch.sum(variance_weight_val * (stable_log_cosh_val + peak_penalty_val), dim=-1)
+                        val_recon_loss = torch.mean(per_cell_loss_val) / math.sqrt(x_val.shape[-1])
 
                         val_loss_acc += val_recon_loss.detach()
                         val_steps += 1
 
-                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, per_cell_loss_cosh_val, per_cell_loss_mse_val, val_recon_loss
+                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
 
                 del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay, raw_gate
 
