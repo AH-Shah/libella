@@ -1,0 +1,53 @@
+{
+  "dataset_spec": {
+    "N_cells": 493834,
+    "G_genes": 2000,
+    "Sparsity_Pct": 91.82327666666666,
+    "Mean_Library_Size": 295.96307373046875,
+    "Median_Library_Size": 220.0,
+    "Std_Library_Size": 262.7019348144531,
+    "N_Classes": 46,
+    "Class_Entropy": 2.662469069260969,
+    "Class_Imbalance_Ratio": 21995.0,
+    "Has_Spatial": true
+  },
+  "audit_findings": [
+    {
+      "Test_Domain": "Test 1: Linear Probe",
+      "Observed_Bias": "Uniform L2 shrinkage (0.1*N) on overcomplete bases + uncentered mean offset",
+      "Impact_on_Sparse_vs_Dense": "Severely suppresses high-D sparse SAE/topics relative to low-D dense PCA",
+      "Required_Mathematical_Fix": "Normalize Ridge penalty by dimension: lambda = (0.1*N)/D or use ElasticNet/kNN",
+      "Severity": "HIGH"
+    },
+    {
+      "Test_Domain": "Test 2: Dirichlet Energy",
+      "Observed_Bias": "Standardizing rare-cell indicators (std=sqrt(p)) inflates difference variance by 1/p",
+      "Impact_on_Sparse_vs_Dense": "Artificially inflates Dirichlet energy and distorts Moran's I on sparse topics",
+      "Required_Mathematical_Fix": "Use scale-free Cosine Laplacian Energy or non-standardized robust variation",
+      "Severity": "CRITICAL"
+    },
+    {
+      "Test_Domain": "Test 5: Effective Rank",
+      "Observed_Bias": "Divides eRank by total dimension D (Normalized_eRank = eRank / D)",
+      "Impact_on_Sparse_vs_Dense": "Penalizes overcomplete dictionaries (D=256) despite higher true signal rank",
+      "Required_Mathematical_Fix": "Evaluate raw eRank or normalize against ground truth lineage count (eRank / K_gt)",
+      "Severity": "CRITICAL"
+    },
+    {
+      "Test_Domain": "Test 9: Reconstruction",
+      "Observed_Bias": "Gaussian MSE R\u00b2 on >90% dropout + raw variance HVG selection",
+      "Impact_on_Sparse_vs_Dense": "Rewards trivial zero-predicting baselines; only reconstructs high-mean housekeepers",
+      "Required_Mathematical_Fix": "Standardized VMR gene selection + Poisson/NB Deviance Explained + Cosine Sim",
+      "Severity": "CRITICAL"
+    },
+    {
+      "Test_Domain": "Test 10: Composite HBI/ICI",
+      "Observed_Bias": "Heuristic multiplication compounding biased intermediate terms",
+      "Impact_on_Sparse_vs_Dense": "Distorts overall rankings by compounding eRank/D and MSE R\u00b2 penalties",
+      "Required_Mathematical_Fix": "Harmonized geometric mean across orthogonal, unbiased dimensions",
+      "Severity": "HIGH"
+    }
+  ],
+  "execution_timestamp": "2026-08-21 18:07:05",
+  "audit_duration_sec": 1.39
+}
