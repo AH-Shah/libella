@@ -72,7 +72,7 @@ class RunConfig:
     gate_boundary_target: float = 0.25
 
     # Top-K Sparsity & Latent Dynamics
-    topk_k: int = 32
+    topk_k: int = 38
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
