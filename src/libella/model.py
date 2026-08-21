@@ -62,6 +62,7 @@ class LibellaGNN(nn.Module):
         self.spatial_gate_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.n_latents)
         )
+        self.spatial_gamma = nn.Linear(self.hidden_dim, self.n_latents)
         self.spatial_gain = nn.Parameter(
             torch.tensor(float(getattr(cfg, "spatial_gain_init", 1.0)))
         )
@@ -185,19 +186,23 @@ class LibellaGNN(nn.Module):
             decay = None
             raw_gate = None
 
-        # 5. Biological Magnitude Estimation
-        z_mag = self.mag_head(h_self) * self.mag_scaler
+        # 5. Base Biological Magnitude
+        z_mag_base = self.mag_head(h_self) * self.mag_scaler
 
         # 6. Biological Grounding (Cosine Sim [-1, 1])
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
         bio_sim = torch.mm(x_norm, w_dec_norm.t())
 
-        # Extract Spatial Shift
+        # Extract Pure Directional Spatial Shift
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         alpha_id = 0.50 + (0.30 * progress)
         alpha_sp = 1.0 - alpha_id
         h_pure_spatial = (h_sp - (alpha_id * h_self)) / max(alpha_sp, 1e-3)
         spatial_shift = torch.tanh(self.spatial_gate_head(h_pure_spatial))
+
+        # Spatial Magnitude Modulation (Centered at positive scale)
+        spatial_gamma = F.softplus(self.spatial_gamma(h_pure_spatial)) + 0.5
+        z_mag = z_mag_base * spatial_gamma
 
         # Combine: Biology grounds, GNN guides
         spatial_warmup = 0.20 + 0.80 * progress
@@ -221,7 +226,7 @@ class LibellaGNN(nn.Module):
         threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
         mask = normalized_scores >= threshold
 
-        # 7. The Equilibrium Pre-Acts (Gradients flow into both raw_affinity and z_mag)
+        # 7. The Equilibrium Pre-Acts (Gradients flow into raw_affinity, z_mag_base, and spatial_gamma)
         pre_acts = F.relu(raw_affinity) * z_mag
 
         if self.training:
