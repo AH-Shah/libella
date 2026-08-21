@@ -21,11 +21,11 @@ class LibellaGNN(nn.Module):
         init_components: np.ndarray | None = None,
     ) -> None:
         super().__init__()
-        self.hidden_dim = getattr(cfg, "hidden_dim", 64)
+        self.hidden_dim = getattr(cfg, "hidden_dim", 128)
         self.k_hops = getattr(cfg, "k_hops", 2)
         self.n_latents = n_metaprograms
         self.in_channels = in_channels
-        self.k = getattr(cfg, "topk_k", 3)
+        self.k = getattr(cfg, "topk_k", 64)
 
         # 1. Identity Encoder (Self Signal)
         self.self_enc = nn.Sequential(
@@ -34,25 +34,31 @@ class LibellaGNN(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
-        # 2. Directional Feature-Conditioned Spatial Filter
+        # 2. Asymmetric Key-Query Spatial Attention
         self.spatial_lin = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.head_dim = max(16, self.hidden_dim // 2)
+        self.q_proj = nn.Linear(self.hidden_dim, self.head_dim)
+        self.k_proj = nn.Linear(self.hidden_dim, self.head_dim)
 
         self.edge_gate = nn.Sequential(
-            nn.Linear(self.hidden_dim + 1, self.hidden_dim),
-            nn.Tanh(),  # Phase 1: Bipolar edge generation
+            nn.Linear(2, self.hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim // 2, 1),
+            nn.Tanh(),
         )
         
-        # Phase 3: SwiGLU Feature-Wise Gating (The MHA Fix)
+        # Phase 3: Bipolar GLU Feature-Wise Gating
         self.gate_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.val_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
 
-        # 3. Output Streams
+        # 3. Output Streams (Single-Stream Latents)
         self.mag_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.n_latents), # Back to 1x latents
+            nn.Linear(self.hidden_dim, self.n_latents),
             nn.Softplus(beta=1.0),
         )
+        self.mag_scaler = nn.Parameter(torch.tensor(2.0))
         self.spatial_gate_head = nn.Sequential(
             nn.Linear(self.hidden_dim, self.n_latents)
         )
@@ -60,7 +66,7 @@ class LibellaGNN(nn.Module):
             torch.tensor(float(getattr(cfg, "spatial_gain_init", 1.0)))
         )
 
-        # 4. Decoder Dictionary
+        # 4. Single Decoder Dictionary
         if init_components is not None:
             dec_init = torch.tensor(init_components, dtype=torch.float32)
             if dec_init.shape != (self.n_latents, in_channels):
@@ -79,6 +85,9 @@ class LibellaGNN(nn.Module):
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
         self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
+
+
+        
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
         self.aux_k = getattr(cfg, "aux_k", 4)
         self.ortho_sample_size = getattr(cfg, "ortho_sample_size", min(256, self.n_latents))
@@ -128,8 +137,12 @@ class LibellaGNN(nn.Module):
 
             W_bil = edge_weights.unsqueeze(1) * decay
 
-            # Feature-aware directional gate
-            gate_in = torch.cat([h_self[src] - h_self[dst], W_bil], dim=-1)
+            # 1. Asymmetric Key-Query Gating
+            q = self.q_proj(h_self)
+            k = self.k_proj(h_self)
+            kq_sim = (q[dst] * k[src]).sum(dim=-1, keepdim=True) / math.sqrt(self.head_dim)
+
+            gate_in = torch.cat([kq_sim, W_bil], dim=-1)
             raw_gate = self.edge_gate(gate_in)
             
             # Phase 1: Sparse Bipolar Attention with Gradient Bleed
@@ -138,7 +151,6 @@ class LibellaGNN(nn.Module):
             mask = abs_gate >= dead_zone
             
             if self.training:
-                # 1% bleed for trapped edges so they can learn to escape the dead zone
                 routed_gate = torch.where(mask, abs_gate - dead_zone, abs_gate * 0.01)
             else:
                 routed_gate = F.relu(abs_gate - dead_zone)
@@ -146,86 +158,81 @@ class LibellaGNN(nn.Module):
             gate = torch.sign(raw_gate) * routed_gate
 
             # 4. Selective Bipolar Message Passing & APPNP
-            H_0 = h_self  # Phase 2: Pure Biological Identity
+            H_0 = h_self
             H_k = H_0
             
             for _ in range(self.k_hops):
                 h_proj = self.spatial_lin(H_k)
-                msg = h_proj[src] * gate * edge_norm  # Can now actively repel (negative msg)
+                msg = h_proj[src] * gate * edge_norm
                 agg = torch.zeros_like(H_k)
                 agg.index_add_(0, dst, msg)
 
-                # Phase 3 (Fixed): Bipolar Gated Linear Unit (BGLU)
-                # Sigmoid controls magnitude/routing; Tanh preserves directional signed messages.
+                # Phase 3: Bipolar GLU Feature-Wise Gating
                 gate_val = torch.sigmoid(self.gate_proj(agg)) 
                 val = torch.tanh(self.val_proj(agg))
                 H_mixed = gate_val * val
                 
-                # Phase 2: Progressive APPNP Bipolar Anchor
-                # Starts at balanced 50/50, tightens to strict 80/20 biological anchor
                 progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
                 alpha_id = 0.50 + (0.30 * progress)
                 alpha_sp = 1.0 - alpha_id
                 
                 H_k = (alpha_id * H_0) + (alpha_sp * H_mixed)
                 
-            h_sp = H_k  # Overwrite for downstream
+            h_sp = H_k
         else:
             h_sp = h_self
             decay = None
             raw_gate = None
 
-         # 5. Self-Sustaining Magnitude (Orphan Cell Protection)
-        z_mag = self.mag_head(h_self)
+        # 5. Self-Sustaining Magnitude (Biological Baseline)
+        z_mag = self.mag_head(h_self) * self.mag_scaler
 
-        # 6. Strictly Bounded Feature-Contrastive Spatial Routing
+        # 6. Biological Grounding + Spatial Suggestion (Reality Check)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
-        bio_sim = torch.mm(x_norm, w_dec_norm.t()) 
-        
-        # Step A: Reverse the APPNP blend to extract the PURE, un-dampened spatial messages
+        bio_sim = torch.mm(x_norm, w_dec_norm.t())
+
+        # Extract pure directional spatial shift via APPNP reverse
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         alpha_id = 0.50 + (0.30 * progress)
         alpha_sp = 1.0 - alpha_id
-        
         h_pure_spatial = (h_sp - (alpha_id * h_self)) / max(alpha_sp, 1e-3)
-        
-        # Step B: Generate the spatial shift using ONLY the raw spatial context
         spatial_shift = torch.tanh(self.spatial_gate_head(h_pure_spatial))
 
-        progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         spatial_warmup = 0.20 + 0.80 * progress
         unleashed_gain = F.softplus(self.spatial_gain)
 
-        # 1. Bipolar Affinity (GNN repels/attracts)
+        # Combine: Biology grounds, GNN guides
         raw_affinity = bio_sim + (unleashed_gain * spatial_warmup * spatial_shift)
-        
-        # 2. Decoupled Normalized Routing (Anti-Stealing / Volume Invariance)
-        # Compute selection threshold on unit-bounded directional affinity (~[-1.5, 1.5])
+
         routing_scores = raw_affinity.clone()
         if self.training:
             routing_scores = routing_scores + (
                 torch.randn_like(routing_scores) * 0.05 * routing_scores.detach().std(dim=-1, keepdim=True)
             )
 
+        # Detached, Absolute Scale-Invariant Routing
+        with torch.no_grad():
+            cell_scale = routing_scores.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-3)
+            normalized_scores = routing_scores / cell_scale
+
         target_k = getattr(self, "current_k", self.k)
-        global_k_budget = routing_scores.size(0) * target_k
-        flat_scores = routing_scores.view(-1)
-        
+        global_k_budget = normalized_scores.size(0) * target_k
+        flat_scores = normalized_scores.view(-1)
+
+        # Apply Top-K thresholding on normalized scores
         threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
-        mask = routing_scores >= threshold
+        mask = normalized_scores >= threshold
 
-        # 3. Unipolar Biology (Clamp negatives to 0, then scale activations by z_mag)
+        # Apply mask to original un-normalized magnitudes
         pre_acts = F.relu(raw_affinity) * z_mag
-
+        
         if self.training:
-            # 1% bleed to keep gradients alive for inactive pathways
             z_sparse = torch.where(mask, pre_acts, pre_acts * 0.01)
         else:
-            # STRICT ZERO for benchmark export
             z_sparse = torch.where(mask, pre_acts, torch.tensor(0.0, device=pre_acts.device))
 
-        z_sparse = F.relu(z_sparse)  # Redundant safety anchor
-        
+        z_sparse = F.relu(z_sparse)
+
         return z_sparse, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate
 
     @torch.no_grad()
@@ -297,6 +304,8 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         z, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate = self.encode(
             x_dense, src, dst, edge_weights
@@ -306,8 +315,6 @@ class LibellaGNN(nn.Module):
         baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
         ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.0)
 
-        # Reconstruct compositional signature, THEN scale by cell mass
-        # No ReLU cheat allowed. The network must learn true biological zeros.
         comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
         x_recon = comp_profile * cell_mass
 
@@ -318,13 +325,13 @@ class LibellaGNN(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                active_in_batch = (z.abs() > 1e-2).any(dim=0)
+                active_in_batch = (z > 0.05).any(dim=0)
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
                 dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
 
             x_norm = F.normalize(x_dense, p=2, dim=-1)
-            x_recon_norm = F.normalize(F.relu(x_recon), p=2, dim=-1)
+            x_recon_norm = F.normalize(F.relu(x_recon) + 1e-6, p=2, dim=-1)
             r_pos = F.relu(x_norm - x_recon_norm)
             r_pos_ret = r_pos.detach()
             r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
@@ -398,8 +405,15 @@ class LibellaGNN(nn.Module):
         delta_clamp = getattr(cfg, "delta_clamp", 30.0)
         scaled_delta = torch.clamp(raw_delta * asym_factor, min=-delta_clamp, max=delta_clamp)
 
-        per_cell_loss = torch.sum(variance_weight * torch.log(torch.cosh(scaled_delta + 1e-6)), dim=-1)
-        l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
+        # 1. Numerically Stable Log-Cosh (Handles the zeros and small noise perfectly)
+        abs_delta = torch.abs(scaled_delta)
+        stable_log_cosh = abs_delta + torch.log1p(torch.exp(-2.0 * abs_delta)) - math.log(2.0)
+        per_cell_loss_cosh = torch.sum(variance_weight * stable_log_cosh, dim=-1)
+
+        # 2. Reintroduce MSE (Forces the network to respect massive expression peaks for R2)
+        per_cell_loss_mse = torch.sum(variance_weight * (scaled_delta ** 2), dim=-1) * 0.05
+
+        l_recon = torch.mean(per_cell_loss_cosh + per_cell_loss_mse) / math.sqrt(x_true.shape[-1])
 
         # 2. Strict Orthogonality Barrier
         gram = torch.mm(w_dec_norm, w_dec_norm.t())
@@ -424,31 +438,20 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # 5. Boundary Attention Loss (Supervising GNN Edge Gates Directly)
+        # 5. Continuous Boundary Attention Loss
         l_sharp = torch.tensor(0.0, device=x_true.device)
         if src is not None and len(src) > 0 and edge_decay is not None and raw_gate is not None:
-            # Mean gate intensity across hidden dimensions: [E, 1]
             mean_gate = raw_gate.mean(dim=-1, keepdim=True)
 
             boundary_mask = (edge_decay < 0.40).float()
             internal_mask = (edge_decay > 0.60).float()
 
-            n_boundary = boundary_mask.sum()
-            n_internal = internal_mask.sum()
+            n_boundary = torch.clamp(boundary_mask.sum(), min=1.0)
+            n_internal = torch.clamp(internal_mask.sum(), min=1.0)
 
-            # Boundary: Force attention gate to actively repel (target < -0.10)
-            l_boundary = (
-                (F.relu(mean_gate + 0.10) * boundary_mask).sum() / torch.clamp(n_boundary, min=1.0)
-                if n_boundary > 0
-                else torch.tensor(0.0, device=x_true.device)
-            )
-
-            # Internal: Force attention gate to actively attract (target > 0.10)
-            l_internal = (
-                (F.relu(0.10 - mean_gate) * internal_mask).sum() / torch.clamp(n_internal, min=1.0)
-                if n_internal > 0
-                else torch.tensor(0.0, device=x_true.device)
-            )
+            # Continuous MSE against targets (-0.50 for boundary, +0.25 for internal)
+            l_boundary = (boundary_mask * (mean_gate + 0.50).pow(2)).sum() / n_boundary
+            l_internal = (internal_mask * (mean_gate - 0.25).pow(2)).sum() / n_internal
 
             l_sharp = l_boundary + l_internal
 

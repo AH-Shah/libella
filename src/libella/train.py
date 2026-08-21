@@ -265,9 +265,11 @@ def _train_loop(
             "l_sparse": torch.tensor(0.0, device=device),
             "l_aux": torch.tensor(0.0, device=device),
             "l_sharp": torch.tensor(0.0, device=device),
-            "shift_bnd_sim": torch.tensor(0.0, device=device),
-            "shift_int_sim": torch.tensor(0.0, device=device),
+            "gate_bnd_mean": torch.tensor(0.0, device=device),
+            "gate_int_mean": torch.tensor(0.0, device=device),
             "l0_avg": torch.tensor(0.0, device=device),
+            "l0_id_avg": torch.tensor(0.0, device=device),
+            "l0_sp_avg": torch.tensor(0.0, device=device),
             "dead_cnt": torch.tensor(0.0, device=device),
             "max_act": torch.tensor(0.0, device=device),
             "dyn_w": torch.tensor(0.0, device=device),
@@ -372,8 +374,7 @@ def _train_loop(
 
                 # 3. GPU Telemetry Tracking
                 with torch.no_grad():
-                    active_thresh = getattr(cfg, "active_latent_threshold", 1e-2)
-                    batch_active = (z_train.abs() > active_thresh).float()
+                    batch_active = (z_train.abs() > 0.05).float()
                     current_freq = batch_active.mean(dim=0)
 
                     if ema_latent_freq is None:
@@ -388,13 +389,16 @@ def _train_loop(
                     )
 
                     if len(src) > 0 and edge_decay is not None and raw_gate is not None:
-                        mean_g = raw_gate.mean(dim=-1, keepdim=True)
                         b_mask = (edge_decay < 0.40).squeeze(-1)
                         i_mask = (edge_decay > 0.60).squeeze(-1)
                         if b_mask.any():
-                            gpu_telemetry["shift_bnd_sim"] += mean_g[b_mask].mean()
+                            gpu_telemetry["gate_bnd_mean"] += raw_gate[b_mask].mean()
                         if i_mask.any():
-                            gpu_telemetry["shift_int_sim"] += mean_g[i_mask].mean()
+                            gpu_telemetry["gate_int_mean"] += raw_gate[i_mask].mean()
+
+                    n_id = getattr(model, "n_id_latents", z_train.size(-1))
+                    z_id_active = batch_active[:, :n_id]
+                    z_sp_active = batch_active[:, n_id:]
 
                     gpu_telemetry["l_rec"] += base_recon_val
                     gpu_telemetry["l_ort"] += base_ort_val
@@ -402,6 +406,8 @@ def _train_loop(
                     gpu_telemetry["l_aux"] += base_aux_val
                     gpu_telemetry["l_sharp"] += base_sharp_val
                     gpu_telemetry["l0_avg"] += batch_active.sum(dim=-1).mean()
+                    gpu_telemetry["l0_id_avg"] += z_id_active.sum(dim=-1).mean()
+                    gpu_telemetry["l0_sp_avg"] += z_sp_active.sum(dim=-1).mean() if z_sp_active.numel() > 0 else torch.tensor(0.0, device=device)
                     gpu_telemetry["dead_cnt"] += dead_count_val
                     gpu_telemetry["max_act"] += z_train.abs().max()
                     gpu_telemetry["dyn_w"] += model.dynamic_w_ema.detach()
@@ -430,16 +436,20 @@ def _train_loop(
                         raw_delta_val = val_recon - x_val
                         asym_penalty = getattr(cfg, "asym_penalty_weight", 0.5)
                         asym_val = 1.0 + (is_non_zero_val.to(x_val.dtype) * asym_penalty) * (raw_delta_val < 0).to(x_val.dtype)
-                        delta_clamp = getattr(cfg, "delta_clamp", 30.0)
+                        delta_clamp = getattr(cfg, "delta_clamp", 100.0)
                         scaled_delta_val = torch.clamp(raw_delta_val * asym_val, min=-delta_clamp, max=delta_clamp)
 
-                        per_cell_loss_val = torch.sum(variance_weight_val * torch.log(torch.cosh(scaled_delta_val + 1e-6)), dim=-1)
-                        val_log_cosh = torch.mean(per_cell_loss_val) / math.sqrt(x_val.shape[-1])
+                        # Numerically stable log-cosh + MSE for validation evaluation
+                        abs_delta_val = torch.abs(scaled_delta_val)
+                        stable_log_cosh_val = abs_delta_val + torch.log1p(torch.exp(-2.0 * abs_delta_val)) - math.log(2.0)
+                        per_cell_loss_cosh_val = torch.sum(variance_weight_val * stable_log_cosh_val, dim=-1)
+                        per_cell_loss_mse_val = torch.sum(variance_weight_val * (scaled_delta_val ** 2), dim=-1) * 0.05
+                        val_recon_loss = torch.mean(per_cell_loss_cosh_val + per_cell_loss_mse_val) / math.sqrt(x_val.shape[-1])
 
-                        val_loss_acc += val_log_cosh.detach()
+                        val_loss_acc += val_recon_loss.detach()
                         val_steps += 1
 
-                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, per_cell_loss_val, val_log_cosh
+                    del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, per_cell_loss_cosh_val, per_cell_loss_mse_val, val_recon_loss
 
                 del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay, raw_gate
 
@@ -495,9 +505,6 @@ def _train_loop(
                     **logger.get_memory_metrics(device),
                 }
                 logger.log_metrics(global_step, step_metrics)
-                logger.log_model_telemetry(
-                    global_step, model, log_histograms=getattr(cfg, "log_histograms", False)
-                )
 
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
@@ -559,6 +566,8 @@ def _train_loop(
 
         composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
 
+        deep_stats = model.get_deep_telemetry()
+
         epoch_log = {
             "epoch/train_loss": history["train_loss"][-1],
             "epoch/val_loss": history["val_loss"][-1],
@@ -569,14 +578,15 @@ def _train_loop(
             "loss/aux": epoch_telemetry.get("l_aux", 0.0),
             "loss/sharp": epoch_telemetry.get("l_sharp", 0.0),
             "loss/dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
-            "spatial/lat_bnd_sim": epoch_telemetry.get("lat_bnd_sim", 0.0),
-            "spatial/lat_int_sim": epoch_telemetry.get("lat_int_sim", 0.0),
-            "spatial/shift_bnd_sim": epoch_telemetry.get("shift_bnd_sim", 0.0),
-            "spatial/shift_int_sim": epoch_telemetry.get("shift_int_sim", 0.0),
-            "sae/l0_avg": current_l0,
+            "gnn/gate_bnd_mean": epoch_telemetry.get("gate_bnd_mean", 0.0),
+            "gnn/gate_int_mean": epoch_telemetry.get("gate_int_mean", 0.0),
+            "sae/l0_total": current_l0,
+            "sae/l0_identity": epoch_telemetry.get("l0_id_avg", 0.0),
+            "sae/l0_spatial": epoch_telemetry.get("l0_sp_avg", 0.0),
             "sae/dead_latents": current_dead,
             "sae/z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),
             "tracker/progress": tracker.get_progress(),
+            **deep_stats,
         }
         logger.log_metrics(epoch, epoch_log)
         logger.log_model_telemetry(epoch, model, log_histograms=False)

@@ -66,11 +66,13 @@ class RunConfig:
     appnp_alpha_offset: float = 0.10
     att_temp_init: float = -2.0
     cross_temp_init: float = -2.0
-    spatial_gain_init: float = 2.0
+    spatial_gain_init: float = 0.5
     sharp_weight: float = 50
+    id_split_ratio: float = 0.75
+    gate_boundary_target: float = 0.25
 
     # Top-K Sparsity & Latent Dynamics
-    topk_k: int = 40
+    topk_k: int = 31
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
@@ -88,7 +90,7 @@ class RunConfig:
     ambient_max_cap: float = 0.0
 
     # Asymmetric Reconstruction & Orthogonality
-    delta_clamp: float = 30.0
+    delta_clamp: float = 100.0
     dynamic_w_ema_weight: float = 0.10
     asym_penalty_weight: float = 0.50
     ortho_weight: float = 8.0
