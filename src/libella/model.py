@@ -304,7 +304,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        z, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate = self.encode(
+        z, z_bio, cell_mass, _, decay, src, dst, raw_gate = self.encode(
             x_dense, src, dst, edge_weights
         )
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
@@ -343,7 +343,7 @@ class LibellaGNN(nn.Module):
                 aux_sim = torch.mm(r_norm, w_dead.t())
                 topk_res = torch.topk(aux_sim, k=k_aux, dim=-1)
 
-                dead_mag = z_mag[:, dead_indices]
+                dead_mag = z_bio[:, dead_indices]
                 topk_mag = torch.gather(dead_mag, -1, topk_res.indices)
 
                 z_aux_weights = F.softplus(topk_res.values, beta=1.0) * topk_mag
@@ -356,7 +356,7 @@ class LibellaGNN(nn.Module):
             w_dec_norm,
             aux_recon,
             r_norm,
-            z_mag,
+            z_bio,
             r_pos_ret,
             dead_mask_ret,
             decay,

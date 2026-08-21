@@ -323,7 +323,7 @@ def _train_loop(
                     w_dec_norm,
                     aux_recon,
                     r_norm,
-                    z_mag,
+                    z_bio,
                     r_pos,
                     dead_mask,
                     edge_decay,
@@ -411,8 +411,8 @@ def _train_loop(
                     gpu_telemetry["dead_cnt"] += dead_count_val
                     gpu_telemetry["max_act"] += z_train.abs().max()
                     gpu_telemetry["dyn_w"] += model.dynamic_w_ema.detach()
-                    if z_mag is not None:
-                        gpu_telemetry["z_mag_mean"] += z_mag.detach().mean()
+                    if z_bio is not None:
+                        gpu_telemetry["z_mag_mean"] += z_bio.detach().mean()
 
                 train_chunk_count += 1
                 del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, true_batch_loss
