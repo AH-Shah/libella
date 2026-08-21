@@ -184,14 +184,15 @@ class LibellaGNN(nn.Module):
             decay = None
             raw_gate = None
 
-        # 5. Self-Sustaining Magnitude (Biological Baseline)
-        z_mag = self.mag_head(h_self) * self.mag_scaler
+        # 5. The True Biological Magnitudes (Untied from Cosine Similarity!)
+        # z_bio is no longer just a scaler; it is the ACTUAL activation.
+        z_bio = self.mag_head(h_self) * self.mag_scaler
 
-        # 6. Biological Grounding + Spatial Suggestion (Reality Check)
+        # 6. Biological Grounding (Strictly for ROUTING, not for activation values)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
         bio_sim = torch.mm(x_norm, w_dec_norm.t())
 
-        # Extract pure directional spatial shift via APPNP reverse
+        # Extract pure directional spatial shift
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         alpha_id = 0.50 + (0.30 * progress)
         alpha_sp = 1.0 - alpha_id
@@ -201,9 +202,8 @@ class LibellaGNN(nn.Module):
         spatial_warmup = 0.20 + 0.80 * progress
         unleashed_gain = F.softplus(self.spatial_gain)
 
-        # Combine: Biology grounds, GNN guides
+        # Combine: Biology grounds, GNN guides (This is our routing logic)
         raw_affinity = bio_sim + (unleashed_gain * spatial_warmup * spatial_shift)
-
         routing_scores = raw_affinity.clone()
         if self.training:
             routing_scores = routing_scores + (
@@ -218,22 +218,19 @@ class LibellaGNN(nn.Module):
         target_k = getattr(self, "current_k", self.k)
         global_k_budget = normalized_scores.size(0) * target_k
         flat_scores = normalized_scores.view(-1)
-
-        # Apply Top-K thresholding on normalized scores
         threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
         mask = normalized_scores >= threshold
 
-        # Apply mask to original un-normalized magnitudes
-        pre_acts = F.relu(raw_affinity) * z_mag
-        
+        # 7. Apply the Top-K Mask to the UNTIED z_bio (not to bio_sim)
         if self.training:
-            z_sparse = torch.where(mask, pre_acts, pre_acts * 0.01)
+            z_sparse = torch.where(mask, z_bio, z_bio * 0.01)
         else:
-            z_sparse = torch.where(mask, pre_acts, torch.tensor(0.0, device=pre_acts.device))
+            z_sparse = torch.where(mask, z_bio, torch.tensor(0.0, device=z_bio.device))
 
         z_sparse = F.relu(z_sparse)
 
-        return z_sparse, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate
+        # Return z_bio as the pre_acts so auxiliary tracking looks at the true MLP magnitudes
+        return z_sparse, z_bio, cell_mass, z_bio, decay, src, dst, raw_gate
 
     @torch.no_grad()
     def resample_dead_latents(
