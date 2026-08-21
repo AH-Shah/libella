@@ -443,7 +443,7 @@ def _train_loop(
                         abs_delta_val = torch.abs(scaled_delta_val)
                         stable_log_cosh_val = abs_delta_val + torch.log1p(torch.exp(-2.0 * abs_delta_val)) - math.log(2.0)
                         per_cell_loss_cosh_val = torch.sum(variance_weight_val * stable_log_cosh_val, dim=-1)
-                        per_cell_loss_mse_val = torch.sum(variance_weight_val * (scaled_delta_val ** 2), dim=-1) * 0.05
+                        per_cell_loss_mse_val = torch.sum(variance_weight_val * (scaled_delta_val ** 2), dim=-1) * 0.25
                         val_recon_loss = torch.mean(per_cell_loss_cosh_val + per_cell_loss_mse_val) / math.sqrt(x_val.shape[-1])
 
                         val_loss_acc += val_recon_loss.detach()

@@ -106,6 +106,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor | None,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor | None,
     ]:
         if len(src) > 0:
             src = src.contiguous()
