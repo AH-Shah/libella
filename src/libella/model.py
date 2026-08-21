@@ -411,7 +411,7 @@ class LibellaGNN(nn.Module):
         per_cell_loss_cosh = torch.sum(variance_weight * stable_log_cosh, dim=-1)
 
         # 2. Reintroduce MSE (Forces the network to respect massive expression peaks for R2)
-        per_cell_loss_mse = torch.sum(variance_weight * (scaled_delta ** 2), dim=-1) * 0.05
+        per_cell_loss_mse = torch.sum(variance_weight * (scaled_delta ** 2), dim=-1) * 0.25
 
         l_recon = torch.mean(per_cell_loss_cosh + per_cell_loss_mse) / math.sqrt(x_true.shape[-1])
 
