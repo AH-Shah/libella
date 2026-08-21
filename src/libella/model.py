@@ -210,16 +210,24 @@ class LibellaGNN(nn.Module):
                 torch.randn_like(routing_scores) * 0.05 * routing_scores.detach().std(dim=-1, keepdim=True)
             )
 
-        # Detached, Absolute Scale-Invariant Routing (Prevents latent stealing)
+        # Detached, Doubly-Normalized Routing (Prevents Cell-Stealing AND Lineage-Stealing)
         with torch.no_grad():
+            # 1. ROW NORM (Cell-Wise): Equalizes cells so loud cells don't steal the budget
             cell_scale = routing_scores.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-3)
-            normalized_scores = routing_scores / cell_scale
+            cell_norm_scores = routing_scores / cell_scale
+
+            # 2. COLUMN NORM (Latent-Wise): Equalizes lineages so Fibroblasts don't suppress Dendritic cells
+            batch_mean = cell_norm_scores.mean(dim=0, keepdim=True)
+            batch_std = cell_norm_scores.std(dim=0, keepdim=True).clamp(min=1e-4)
+            doubly_norm_scores = (cell_norm_scores - batch_mean) / batch_std
 
         target_k = getattr(self, "current_k", self.k)
-        global_k_budget = normalized_scores.size(0) * target_k
-        flat_scores = normalized_scores.view(-1)
+        global_k_budget = doubly_norm_scores.size(0) * target_k
+        flat_scores = doubly_norm_scores.view(-1)
+        
+        # Apply the global threshold to the perfectly balanced matrix
         threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
-        mask = normalized_scores >= threshold
+        mask = doubly_norm_scores >= threshold
 
         # 7. The Equilibrium Pre-Acts (Gradients flow into both raw_affinity and z_mag)
         pre_acts = F.relu(raw_affinity) * z_mag
