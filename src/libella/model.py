@@ -85,10 +85,11 @@ class LibellaGNN(nn.Module):
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
         self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer("routing_mean", torch.zeros(self.n_latents, dtype=torch.float32))
+        self.register_buffer("routing_std", torch.ones(self.n_latents, dtype=torch.float32))
 
-
-        
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
+
         self.aux_k = getattr(cfg, "aux_k", 4)
         self.ortho_sample_size = getattr(cfg, "ortho_sample_size", min(256, self.n_latents))
 
@@ -216,10 +217,19 @@ class LibellaGNN(nn.Module):
             cell_scale = routing_scores.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-3)
             cell_norm_scores = routing_scores / cell_scale
 
-            # 2. COLUMN NORM (Latent-Wise): Equalizes lineages so Fibroblasts don't suppress Dendritic cells
-            batch_mean = cell_norm_scores.mean(dim=0, keepdim=True)
-            batch_std = cell_norm_scores.std(dim=0, keepdim=True).clamp(min=1e-4)
-            doubly_norm_scores = (cell_norm_scores - batch_mean) / batch_std
+            # 2. COLUMN NORM (Latent-Wise): EMA-tracked stats for cross-batch consistency
+            if self.training:
+                batch_mean = cell_norm_scores.mean(dim=0)
+                batch_std = cell_norm_scores.std(dim=0).clamp(min=1e-4)
+
+                routing_ema_weight = getattr(cfg, "routing_ema_weight", 0.10)
+                self.routing_mean.lerp_(batch_mean, weight=routing_ema_weight)
+                self.routing_std.lerp_(batch_std, weight=routing_ema_weight)
+
+                doubly_norm_scores = (cell_norm_scores - batch_mean.unsqueeze(0)) / batch_std.unsqueeze(0)
+            else:
+                # Evaluation: Use stabilized running statistics across all cells
+                doubly_norm_scores = (cell_norm_scores - self.routing_mean.unsqueeze(0)) / self.routing_std.unsqueeze(0).clamp(min=1e-4)
 
         target_k = getattr(self, "current_k", self.k)
         global_k_budget = doubly_norm_scores.size(0) * target_k
@@ -529,5 +539,11 @@ class LibellaGNN(nn.Module):
         dead_count = (self.steps_since_active >= self.dead_step_threshold).sum().item()
         stats["latents/dead_count"] = float(dead_count)
         stats["latents/active_pct"] = (1.0 - (dead_count / self.n_latents)) * 100.0
+
+        if hasattr(self, "routing_mean") and hasattr(self, "routing_std"):
+            stats["routing/mean_l2"] = self.routing_mean.norm(2).item()
+            stats["routing/std_mean"] = self.routing_std.mean().item()
+            stats["routing/std_min"] = self.routing_std.min().item()
+            stats["routing/std_max"] = self.routing_std.max().item()
 
         return stats

@@ -585,6 +585,8 @@ def _train_loop(
             "sae/l0_spatial": epoch_telemetry.get("l0_sp_avg", 0.0),
             "sae/dead_latents": current_dead,
             "sae/z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),
+            "routing/mean_l2": deep_stats.get("routing/mean_l2", 0.0),
+            "routing/std_mean": deep_stats.get("routing/std_mean", 1.0),
             "tracker/progress": tracker.get_progress(),
             **deep_stats,
         }
