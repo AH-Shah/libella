@@ -66,20 +66,28 @@ class LibellaGNN(nn.Module):
             torch.tensor(float(getattr(cfg, "spatial_gain_init", 1.0)))
         )
 
-        # 4. Single Decoder Dictionary
+        # 4. Single Decoder Dictionary (State-of-the-Art Parameterization)
         if init_components is not None:
             dec_init = torch.tensor(init_components, dtype=torch.float32)
             if dec_init.shape != (self.n_latents, in_channels):
                 dec_init = torch.randn(self.n_latents, in_channels)
-            dec_init = F.normalize(dec_init, p=2, dim=-1)
         else:
-            dec_init = F.normalize(
-                torch.randn(self.n_latents, in_channels).abs() + 0.1, p=2, dim=-1
-            )
+            dec_init = torch.randn(self.n_latents, in_channels)
+
+        dec_init = F.normalize(dec_init, p=2, dim=-1)
 
         self.decoder_weight = nn.Parameter(dec_init)
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
-        self.ambient_scale = nn.Parameter(torch.tensor(getattr(cfg, "ambient_scale_init", 0.50)))
+
+        with torch.no_grad():
+            self.self_enc[0].weight.copy_(self.decoder_weight)
+
+        def project_gradients(grad: torch.Tensor) -> torch.Tensor:
+            W = self.decoder_weight.data
+            dot_product = (grad * W).sum(dim=-1, keepdim=True)
+            return grad - (dot_product * W)
+
+        self.decoder_weight.register_hook(project_gradients)
 
         # Buffers & Aux State Tracking
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
@@ -119,8 +127,11 @@ class LibellaGNN(nn.Module):
         cell_mass = torch.clamp(x_dense.norm(p=2, dim=-1, keepdim=True), min=1e-5)
         x_norm = x_dense / cell_mass
 
+        # Pre-Encoder Bias Subtraction
+        x_centered = x_norm - self.decoder_bias
+
         # 2. Self Feature Extraction
-        h_self = self.self_enc(x_norm)
+        h_self = self.self_enc(x_centered)
 
         # 3. Bilateral Edge Filtering & Symmetric Normalization
         if len(src) > 0:
@@ -244,17 +255,10 @@ class LibellaGNN(nn.Module):
         local_threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
         
         # 11. Strict Relative Budgeting (THE GOLDILOCKS MASK)
-        # 1. Must clear the Top-K budget threshold
-        # 2. Must be at least 5% as strong as the cell's dominant identity (stops vacuuming noise)
-        # 3. Must have physical biological presence (> 1e-6)
-        mask = (cell_norm_scores >= local_threshold) & (cell_norm_scores > 0.05) & (raw_affinity > 1e-6)
+        mask = (cell_norm_scores >= local_threshold) & (cell_norm_scores > 0.01) & (raw_affinity > 1e-6)
 
-        # 12. Leaky Routing
-        # Unselected values get the 0.01 leak to keep gradients alive for borderline biology
-        if self.training:
-            z_sparse = torch.where(mask, pre_acts, pre_acts * 0.01)
-        else:
-            z_sparse = torch.where(mask, pre_acts, torch.tensor(0.0, device=pre_acts.device))
+        # 12. Strict Hard Routing
+        z_sparse = torch.where(mask, pre_acts, torch.tensor(0.0, device=pre_acts.device))
 
         # Final Safety ReLU
         z_sparse = F.relu(z_sparse)
@@ -338,13 +342,10 @@ class LibellaGNN(nn.Module):
         z, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate = self.encode(
             x_dense, src, dst, edge_weights
         )
-        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
+        w_dec_norm = self.decoder_weight
 
-        baseline_gene = F.normalize(F.softplus(self.decoder_bias) + 1e-6, p=2, dim=-1).unsqueeze(0)
-        ambient_coeff = torch.sigmoid(self.ambient_scale) * getattr(cfg, "ambient_max_cap", 0.0)
-
-        comp_profile = (1.0 - ambient_coeff) * torch.mm(z, w_dec_norm) + (ambient_coeff * baseline_gene)
-        x_recon = comp_profile * cell_mass
+        x_recon_centered = torch.mm(z, self.decoder_weight)
+        x_recon = (x_recon_centered + self.decoder_bias) * cell_mass
 
         aux_recon = None
         r_norm = None
@@ -546,11 +547,7 @@ class LibellaGNN(nn.Module):
             stats["dict/svd_sigma_2"] = s[1].item() if s.numel() > 1 else 0.0
             stats["dict/svd_sigma_3"] = s[2].item() if s.numel() > 2 else 0.0
 
-        if hasattr(self, "ambient_scale"):
-            lr_mult = getattr(cfg, "ambient_lr_mult", 1.0)
-            max_cap = getattr(cfg, "ambient_max_cap", 0.35)
-            amb_pct = torch.sigmoid(self.ambient_scale * lr_mult).item() * max_cap * 100.0
-            stats["model/ambient_absorption_pct"] = amb_pct
+        # Ambient scale removed in favor of pre-encoder centering
 
         dead_count = (self.steps_since_active >= self.dead_step_threshold).sum().item()
         stats["latents/dead_count"] = float(dead_count)

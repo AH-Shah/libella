@@ -153,9 +153,9 @@ def _init_model(
     ).to(device)
 
     # 1. Parameter grouping with dedicated baseline & decoder learning rates
-    bias_ambient_params = [
+    bias_params = [
         p for n, p in model.named_parameters()
-        if any(k in n for k in ["decoder_bias", "ambient_scale"])
+        if "decoder_bias" in n
     ]
     decoder_weight_params = [
         p for n, p in model.named_parameters()
@@ -167,16 +167,17 @@ def _init_model(
     ]
     base_params = [
         p for n, p in model.named_parameters()
-        if not any(k in n for k in ["decoder_", "ambient_scale", "att_temp", "cross_temp", "spatial_gain"])
+        if not any(k in n for k in ["decoder_", "att_temp", "cross_temp", "spatial_gain"])
     ]
 
     lr_base = getattr(cfg, "lr_base", 1e-3)
-    optimizer = torch.optim.AdamW([
-        {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},  # 2x LR for GNN
-        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0}, # 0.5x LR for Dictionary
-        {"params": bias_ambient_params, "lr": lr_base * getattr(cfg, "ambient_lr_mult", 5.0), "weight_decay": 0.0},
+    optimizer = torch.optim.Adam([
+        {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},
+        {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0},
+        {"params": bias_params, "lr": lr_base * getattr(cfg, "ambient_lr_mult", 5.0), "weight_decay": 0.0},
         {"params": temp_routing_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
-    ])
+    ], betas=(0.0, 0.999), eps=1e-8)
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=getattr(cfg, "epochs", 100), eta_min=getattr(cfg, "lr_min", 1e-6)
     )
@@ -458,7 +459,7 @@ def _train_loop(
                 break
 
             # 1. Dual-Group Gradient Clipping
-            recon_keys = ("decoder_bias", "ambient_scale", "decoder_weight")
+            recon_keys = ("decoder_bias", "decoder_weight")
             recon_params = [
                 p for n, p in model.named_parameters()
                 if any(k in n for k in recon_keys) and p.grad is not None
@@ -477,21 +478,12 @@ def _train_loop(
                     spatial_params, max_norm=getattr(cfg, "grad_clip_spatial", 15.0)
                 )
 
-            # 2. Tangent-Space Projection on Unit Sphere
-            with torch.no_grad():
-                if hasattr(model, "decoder_weight") and model.decoder_weight.grad is not None:
-                    w = F.normalize(model.decoder_weight, p=2, dim=1)
-                    grad = model.decoder_weight.grad
-                    proj_grad = grad - (grad * w).sum(dim=1, keepdim=True) * w
-                    model.decoder_weight.grad.copy_(proj_grad)
-
-            # 3. Optimizer Step & Non-Negative Retraction
+            # 2. Optimizer Step & Unit Sphere Normalization
             optimizer.step()
 
             with torch.no_grad():
                 if hasattr(model, "decoder_weight"):
-                    w_clamped = F.relu(model.decoder_weight)
-                    model.decoder_weight.copy_(F.normalize(w_clamped + 1e-8, p=2, dim=-1))
+                    model.decoder_weight.data = F.normalize(model.decoder_weight.data, p=2, dim=-1)
 
                 if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
                     model.resample_dead_latents(last_r_pos, last_dead_mask, optimizer=optimizer)
