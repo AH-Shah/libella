@@ -187,66 +187,76 @@ class LibellaGNN(nn.Module):
             raw_gate = None
 
         # 5. Biological Magnitude Estimation
-        z_mag = self.mag_head(h_self) * self.mag_scaler
+        z_mag = self.mag_head(h_sp) * self.mag_scaler
 
-        # 6. Biological Grounding (Cosine Sim [-1, 1])
+        # 6. Biological Grounding (The Holy Grail)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=1)
         bio_sim = torch.mm(x_norm, w_dec_norm.t())
 
-        # Extract Spatial Shift
+        # CRITICAL FIX: Only positive biological overlap can be modulated
+        bio_grounded = F.relu(bio_sim)
+
+        # 7. Extract Spatial Shift
         progress = getattr(self, "current_progress", 1.0) if self.training else 1.0
         alpha_id = 0.50 + (0.30 * progress)
         alpha_sp = 1.0 - alpha_id
+        
+        # Isolate the pure GNN message
         h_pure_spatial = (h_sp - (alpha_id * h_self)) / max(alpha_sp, 1e-3)
         spatial_shift = torch.tanh(self.spatial_gate_head(h_pure_spatial))
 
-        # Combine: Biology grounds, GNN guides
+        # 8. TRUE MULTIPLICATIVE GAIN CONTROL
         spatial_warmup = 0.20 + 0.80 * progress
         unleashed_gain = F.softplus(self.spatial_gain)
-        raw_affinity = bio_sim + (unleashed_gain * spatial_warmup * spatial_shift)
 
+        # Bounded between 0.05x (severe suppression) and 2.5x (strong amplification)
+        spatial_gain_knob = torch.clamp(
+            1.0 + (unleashed_gain * spatial_warmup * spatial_shift), 
+            min=0.05, 
+            max=2.5
+        )
+
+        # The GNN modulates the volume of existing biology. Zero Hallucinations.
+        raw_affinity = bio_grounded * spatial_gain_knob
+        
+        # Combine with biological magnitude estimation
+        pre_acts = raw_affinity * z_mag
+
+        # DEFINITION OF ROUTING SCORES (With training noise for exploration)
         routing_scores = raw_affinity.clone()
         if self.training:
             routing_scores = routing_scores + (
                 torch.randn_like(routing_scores) * 0.05 * routing_scores.detach().std(dim=-1, keepdim=True)
             )
 
-        # Detached, Doubly-Normalized Routing (Prevents Cell-Stealing AND Lineage-Stealing)
+        # 9. Detached, Row-Normalized Routing (Strictly Local for Spatial Data)
         with torch.no_grad():
-            # 1. ROW NORM (Cell-Wise): Equalizes cells so loud cells don't steal the budget
+            # Equalizes cells, converting all affinities to a relative percentage [0.0 to 1.0]
             cell_scale = routing_scores.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-3)
             cell_norm_scores = routing_scores / cell_scale
 
-            # 2. COLUMN NORM (Latent-Wise): EMA-tracked stats for cross-batch consistency
-            if self.training:
-                batch_mean = cell_norm_scores.mean(dim=0)
-                batch_std = cell_norm_scores.std(dim=0).clamp(min=1e-4)
-
-                routing_ema_weight = getattr(cfg, "routing_ema_weight", 0.005)
-                self.routing_mean.lerp_(batch_mean, weight=routing_ema_weight)
-                self.routing_std.lerp_(batch_std, weight=routing_ema_weight)
-
-                doubly_norm_scores = (cell_norm_scores - batch_mean.unsqueeze(0)) / batch_std.unsqueeze(0)
-            else:
-                # Evaluation: Use stabilized running statistics across all cells
-                doubly_norm_scores = (cell_norm_scores - self.routing_mean.unsqueeze(0)) / self.routing_std.unsqueeze(0).clamp(min=1e-4)
-
+        # 10. LOCAL BATCH THRESHOLD
         target_k = getattr(self, "current_k", self.k)
-        global_k_budget = doubly_norm_scores.size(0) * target_k
-        flat_scores = doubly_norm_scores.view(-1)
+        global_k_budget = cell_norm_scores.size(0) * target_k
+        flat_scores = cell_norm_scores.view(-1)
         
-        # Apply the global threshold to the perfectly balanced matrix
-        threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
-        mask = doubly_norm_scores >= threshold
+        # Calculate strict local threshold for THIS exact spatial crop
+        local_threshold = torch.kthvalue(flat_scores, flat_scores.numel() - global_k_budget + 1).values
+        
+        # 11. Strict Relative Budgeting (THE GOLDILOCKS MASK)
+        # 1. Must clear the Top-K budget threshold
+        # 2. Must be at least 5% as strong as the cell's dominant identity (stops vacuuming noise)
+        # 3. Must have physical biological presence (> 1e-6)
+        mask = (cell_norm_scores >= local_threshold) & (cell_norm_scores > 0.05) & (raw_affinity > 1e-6)
 
-        # 7. The Equilibrium Pre-Acts (Gradients flow into both raw_affinity and z_mag)
-        pre_acts = F.relu(raw_affinity) * z_mag
-
+        # 12. Leaky Routing
+        # Unselected values get the 0.01 leak to keep gradients alive for borderline biology
         if self.training:
             z_sparse = torch.where(mask, pre_acts, pre_acts * 0.01)
         else:
             z_sparse = torch.where(mask, pre_acts, torch.tensor(0.0, device=pre_acts.device))
 
+        # Final Safety ReLU
         z_sparse = F.relu(z_sparse)
 
         return z_sparse, pre_acts, cell_mass, z_mag, decay, src, dst, raw_gate
@@ -294,6 +304,8 @@ class LibellaGNN(nn.Module):
         new_atoms = F.normalize(candidates, p=2, dim=-1)
         self.decoder_weight.data[target_dead_ids] = new_atoms
         self.steps_since_active[target_dead_ids] = 0
+        self.routing_mean[target_dead_ids] = 0.0
+        self.routing_std[target_dead_ids] = 1.0
 
         if optimizer is not None:
             state = optimizer.state.get(self.decoder_weight, None)
@@ -454,7 +466,7 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # 5. Strict, Continuous Boundary Targets (No ReLU Deadzones!)
+        # 5. Strict, Continuous Boundary Targets (One-Sided Hinge Loss)
         l_sharp = torch.tensor(0.0, device=x_true.device)
         if src is not None and len(src) > 0 and edge_decay is not None and raw_gate is not None:
             mean_gate = raw_gate.mean(dim=-1, keepdim=True)
@@ -465,9 +477,13 @@ class LibellaGNN(nn.Module):
             n_boundary = torch.clamp(boundary_mask.sum(), min=1.0)
             n_internal = torch.clamp(internal_mask.sum(), min=1.0)
 
-            # Target: -0.35 for boundaries (repel), +0.25 for internals (attract)
-            l_boundary = (boundary_mask * (mean_gate + 0.35).pow(2)).sum() / n_boundary
-            l_internal = (internal_mask * (mean_gate - 0.25).pow(2)).sum() / n_internal
+            # TARGETS: Boundary <= -0.35 (Repel), Internal >= +0.25 (Attract)
+            # F.relu ensures loss is exactly 0 if the gate successfully crosses the target threshold.
+            bnd_violation = F.relu(mean_gate + 0.35)  # Penalizes if mean_gate > -0.35
+            int_violation = F.relu(0.25 - mean_gate)  # Penalizes if mean_gate < +0.25
+
+            l_boundary = (boundary_mask * bnd_violation.pow(2)).sum() / n_boundary
+            l_internal = (internal_mask * int_violation.pow(2)).sum() / n_internal
 
             l_sharp = l_boundary + l_internal
 
