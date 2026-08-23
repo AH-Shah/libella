@@ -159,15 +159,16 @@ def _init_model(
     ]
     decoder_weight_params = [
         p for n, p in model.named_parameters()
-        if "decoder_weight" in n
+        if "decoder_weight" in n or "encoder_weight" in n
     ]
     temp_routing_params = [
         p for n, p in model.named_parameters()
-        if any(k in n for k in ["att_temp", "cross_temp", "spatial_gain"])
+        if any(k in n for k in ["att_temp", "cross_temp", "spatial_gain", "b_scale", "b_enc", "pade_gate", "k_predictor"])
     ]
+    special_ids = {id(p) for p in bias_params + decoder_weight_params + temp_routing_params}
     base_params = [
-        p for n, p in model.named_parameters()
-        if not any(k in n for k in ["decoder_", "att_temp", "cross_temp", "spatial_gain"])
+        p for p in model.parameters()
+        if id(p) not in special_ids
     ]
 
     lr_base = getattr(cfg, "lr_base", 1e-3)
@@ -246,7 +247,7 @@ def _train_loop(
         tracker.__dict__.update(tracker_state)
         print(
             f"  ↳ Restored PhaseTracker state (Phase {tracker.phase}, "
-            f"Pressure: {tracker.pressure:.2f}, Progress: {tracker.get_progress():.2f})"
+            f"Pressure: {tracker.pressure:.2f}, Squeeze Progress: {tracker.get_squeeze_progress():.2f})"
         )
 
     tqdm.write("\n[*] Training Loop Initialized...")
@@ -266,6 +267,11 @@ def _train_loop(
             "l_sparse": torch.tensor(0.0, device=device),
             "l_aux": torch.tensor(0.0, device=device),
             "l_sharp": torch.tensor(0.0, device=device),
+            "l_budget": torch.tensor(0.0, device=device),
+            "k_pred_mean": torch.tensor(0.0, device=device),
+            "k_pred_std": torch.tensor(0.0, device=device),
+            "k_pred_min": torch.tensor(0.0, device=device),
+            "k_pred_max": torch.tensor(0.0, device=device),
             "gate_bnd_mean": torch.tensor(0.0, device=device),
             "gate_int_mean": torch.tensor(0.0, device=device),
             "l0_avg": torch.tensor(0.0, device=device),
@@ -275,6 +281,7 @@ def _train_loop(
             "max_act": torch.tensor(0.0, device=device),
             "dyn_w": torch.tensor(0.0, device=device),
             "z_mag_mean": torch.tensor(0.0, device=device),
+            "cell_mass_mean": torch.tensor(0.0, device=device),
         }
 
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
@@ -312,10 +319,15 @@ def _train_loop(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                # Set spatial warmup progress
-                prog = tracker.get_progress() if tracker.phase == 2 else 0.0
-                model.current_progress = prog
-                model.current_k = getattr(cfg, "topk_k", 3)
+                # Continuous Multi-Scale Progress from PhaseTracker
+                step_fraction = float(step) / max(1.0, float(total_steps_per_epoch))
+                schedules = tracker.get_schedules(epoch, step_fraction)
+
+                model.current_progress = schedules["squeeze_progress"]
+                model.current_global_progress = schedules["global_progress"]
+                model.current_spatial_progress = schedules["spatial_progress"]
+                model.current_gamma_progress = schedules["gamma_progress"]
+                model.target_k = getattr(cfg, "topk_k", 64)
 
                 # 1. Forward Pass
                 (
@@ -329,6 +341,7 @@ def _train_loop(
                     dead_mask,
                     edge_decay,
                     raw_gate,
+                    k_i_float,
                 ) = model(x, src, dst, weights)
 
                 last_r_pos = r_pos
@@ -340,6 +353,7 @@ def _train_loop(
                 z_train = z[train_idx]
                 aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
                 r_norm_train = r_norm[train_idx] if r_norm is not None else None
+                k_i_train = k_i_float[train_idx] if k_i_float is not None else None
 
                 # 2. Loss Calculation
                 loss_res = model.calc_loss(
@@ -349,12 +363,13 @@ def _train_loop(
                     w_dec_norm,
                     aux_recon=aux_recon_train,
                     r_norm=r_norm_train,
-                    progress=prog,
+                    progress=schedules["global_progress"],
                     edge_decay=edge_decay,
                     src=src,
                     dst=dst,
                     z_full=z,
                     raw_gate=raw_gate,
+                    k_i_float=k_i_train,
                 )
                 true_batch_loss = loss_res[0]
                 base_recon_val = loss_res[1]
@@ -362,6 +377,7 @@ def _train_loop(
                 base_sparse_val = loss_res[3]
                 base_aux_val = loss_res[4]
                 base_sharp_val = loss_res[5]
+                base_budget_val = loss_res[6]
 
                 if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
                     nan_detected = True
@@ -375,7 +391,7 @@ def _train_loop(
 
                 # 3. GPU Telemetry Tracking
                 with torch.no_grad():
-                    batch_active = (z_train.abs() > 0.05).float()
+                    batch_active = (z_train > 0.01).float()
                     current_freq = batch_active.mean(dim=0)
 
                     if ema_latent_freq is None:
@@ -406,17 +422,25 @@ def _train_loop(
                     gpu_telemetry["l_sparse"] += base_sparse_val
                     gpu_telemetry["l_aux"] += base_aux_val
                     gpu_telemetry["l_sharp"] += base_sharp_val
+                    gpu_telemetry["l_budget"] += base_budget_val
+                    if k_i_train is not None:
+                        k_detached = k_i_train.detach()
+                        gpu_telemetry["k_pred_mean"] += k_detached.mean()
+                        gpu_telemetry["k_pred_std"] += k_detached.std() if k_detached.numel() > 1 else torch.tensor(0.0, device=device)
+                        gpu_telemetry["k_pred_min"] += k_detached.min()
+                        gpu_telemetry["k_pred_max"] += k_detached.max()
                     gpu_telemetry["l0_avg"] += batch_active.sum(dim=-1).mean()
                     gpu_telemetry["l0_id_avg"] += z_id_active.sum(dim=-1).mean()
                     gpu_telemetry["l0_sp_avg"] += z_sp_active.sum(dim=-1).mean() if z_sp_active.numel() > 0 else torch.tensor(0.0, device=device)
                     gpu_telemetry["dead_cnt"] += dead_count_val
-                    gpu_telemetry["max_act"] += z_train.abs().max()
+                    gpu_telemetry["max_act"] += z_train.max()
                     gpu_telemetry["dyn_w"] += model.dynamic_w_ema.detach()
+                    gpu_telemetry["z_mag_mean"] += z_train.detach().mean()
                     if z_mag is not None:
-                        gpu_telemetry["z_mag_mean"] += z_mag.detach().mean()
+                        gpu_telemetry["cell_mass_mean"] += z_mag[train_idx].detach().mean()
 
                 train_chunk_count += 1
-                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, true_batch_loss
+                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, true_batch_loss
 
                 # Validation Evaluation
                 val_core_idx_cpu = batch.get("val_core_idx")
@@ -452,7 +476,7 @@ def _train_loop(
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
 
-                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay, raw_gate
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, edge_decay, raw_gate, k_i_float
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
@@ -482,7 +506,9 @@ def _train_loop(
             optimizer.step()
 
             with torch.no_grad():
-                if hasattr(model, "decoder_weight"):
+                if hasattr(model, "normalize_decoder"):
+                    model.normalize_decoder()
+                elif hasattr(model, "decoder_weight"):
                     model.decoder_weight.data = F.normalize(model.decoder_weight.data, p=2, dim=-1)
 
                 if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
@@ -524,6 +550,8 @@ def _train_loop(
             else:
                 epoch_telemetry["ent"] = 0.0
 
+        epoch_schedules = tracker.get_schedules(epoch)
+
         current_lr = round(optimizer.param_groups[0]["lr"], 6)
         current_rec = epoch_telemetry.get("l_rec", float("inf"))
         current_l0 = epoch_telemetry.get("l0_avg", 0.0)
@@ -539,19 +567,29 @@ def _train_loop(
                 "rec": round(current_rec, 4),
                 "ort": round(epoch_telemetry.get("l_ort", 0.0), 4),
                 "sparse": round(epoch_telemetry.get("l_sparse", 0.0), 4),
+                "budget": round(epoch_telemetry.get("l_budget", 0.0), 4),
                 "aux": round(epoch_telemetry.get("l_aux", 0.0), 4),
                 "sharp": round(epoch_telemetry.get("l_sharp", 0.0), 4),
                 "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
             },
+            "k_pred_mean": round(epoch_telemetry.get("k_pred_mean", float(getattr(model, "target_k", 64))), 2),
+            "k_pred_std": round(epoch_telemetry.get("k_pred_std", 0.0), 2),
+            "k_pred_min": round(epoch_telemetry.get("k_pred_min", 0.0), 2),
+            "k_pred_max": round(epoch_telemetry.get("k_pred_max", 0.0), 2),
+            "dead_latents": current_dead,
             "entropy": round(epoch_telemetry.get("ent", 0.0), 4),
             "l0_avg": round(current_l0, 2),
-            "dead_latents": current_dead,
+            "p_w_sparsity_pct": round(epoch_telemetry.get("p_w", 0.0), 2),
             "max_activation": round(epoch_telemetry.get("max_act", 0.0), 2),
             "z_mag_mean": round(epoch_telemetry.get("z_mag_mean", 0.0), 4),
+            "cell_mass_mean": round(epoch_telemetry.get("cell_mass_mean", 0.0), 4),
+            "laprune_gamma_effective": round(float(getattr(model, "laprune_gamma", 0.99)) * schedules["gamma_progress"], 4),
             "tracker": {
-                "progress": round(prog, 4),
+                "global_progress": round(schedules["global_progress"], 4),
+                "spatial_progress": round(schedules["spatial_progress"], 4),
+                "squeeze_progress": round(schedules["squeeze_progress"], 4),
                 "pressure": round(getattr(tracker, "pressure", 0.0), 4),
-                "topk_k": getattr(model, "k", 3),
+                "target_k": getattr(model, "target_k", 64),
             },
         }
         history.setdefault("autopsy_metrics", []).append(epoch_metrics)
@@ -567,9 +605,16 @@ def _train_loop(
             "loss/recon": epoch_telemetry.get("l_rec", 0.0),
             "loss/ort": epoch_telemetry.get("l_ort", 0.0),
             "loss/sparse": epoch_telemetry.get("l_sparse", 0.0),
+            "loss/budget": epoch_telemetry.get("l_budget", 0.0),
             "loss/aux": epoch_telemetry.get("l_aux", 0.0),
             "loss/sharp": epoch_telemetry.get("l_sharp", 0.0),
             "loss/dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
+            "sae/k_pred_mean": epoch_telemetry.get("k_pred_mean", 0.0),
+            "sae/k_pred_std": epoch_telemetry.get("k_pred_std", 0.0),
+            "sae/k_pred_min": epoch_telemetry.get("k_pred_min", 0.0),
+            "sae/k_pred_max": epoch_telemetry.get("k_pred_max", 0.0),
+            "sae/sparsity_pct": epoch_telemetry.get("p_w", 0.0),
+            "sae/entropy": epoch_telemetry.get("ent", 0.0),
             "gnn/gate_bnd_mean": epoch_telemetry.get("gate_bnd_mean", 0.0),
             "gnn/gate_int_mean": epoch_telemetry.get("gate_int_mean", 0.0),
             "sae/l0_total": current_l0,
@@ -577,10 +622,14 @@ def _train_loop(
             "sae/l0_spatial": epoch_telemetry.get("l0_sp_avg", 0.0),
             "sae/dead_latents": current_dead,
             "sae/z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),
-            "routing/global_thresh": getattr(model, "global_thresh_ema", torch.tensor(0.0)).item(),
+            "sae/cell_mass_mean": epoch_telemetry.get("cell_mass_mean", 0.0),
+            "sae/laprune_gamma": float(getattr(model, "laprune_gamma", 0.99)) * epoch_schedules["gamma_progress"],
             "routing/mean_l2": deep_stats.get("routing/mean_l2", 0.0),
             "routing/std_mean": deep_stats.get("routing/std_mean", 1.0),
-            "tracker/progress": tracker.get_progress(),
+            "tracker/global_progress": schedules["global_progress"],
+            "tracker/spatial_progress": schedules["spatial_progress"],
+            "tracker/squeeze_progress": schedules["squeeze_progress"],
+            "tracker/pressure": getattr(tracker, "pressure", 0.0),
             **deep_stats,
         }
         logger.log_metrics(epoch, epoch_log)
@@ -631,9 +680,12 @@ def _train_loop(
                     f" [Ep {(epoch+1):03d}] Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
                     f"V_Loss:{history['val_loss'][-1]:<5.3f} | "
                     f"L0:{l0_val:<4.1f}/{model.n_latents} ({l0_pct:<4.1f}%) "
+                    f"K_Pred:{epoch_telemetry.get('k_pred_mean', 0.0):<4.1f} "
                     f"Dead:{int(epoch_telemetry.get('dead_cnt', 0)):<3d} | "
                     f"L_Ort:{epoch_telemetry.get('l_ort', 0.0):<5.3f} "
-                    f"L_Aux:{epoch_telemetry.get('l_aux', 0.0):<5.3f}"
+                    f"L_Bud:{epoch_telemetry.get('l_budget', 0.0):<5.3f} "
+                    f"L_Aux:{epoch_telemetry.get('l_aux', 0.0):<5.3f} "
+                    f"L_Shp:{epoch_telemetry.get('l_sharp', 0.0):<5.3f}"
                 )
 
         epochs_remaining = total_epochs - epoch - 1
@@ -655,7 +707,7 @@ def _train_loop(
         if is_done:
             tqdm.write(
                 f"\n[✓] Pareto Convergence Reached at Epoch {(epoch+1)}/{total_epochs} "
-                f"(Val Loss: {current_val_loss:.4f}, Squeeze Progress: {tracker.get_progress():.2%}). Terminating gracefully."
+                f"(Val Loss: {current_val_loss:.4f}, Squeeze Progress: {tracker.get_squeeze_progress():.2%}). Terminating gracefully."
             )
             break
 

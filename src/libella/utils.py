@@ -146,18 +146,41 @@ class PhaseTracker:
         residual_std = float(np.sqrt(res_sq / max(1, n - 2)))
         return slope, y_mean, residual_std
 
-    def get_progress(self) -> float:
+    def get_global_progress(self, epoch: int, step_fraction: float = 0.0) -> float:
+        """Continuous, monotonic progress [0.0, 1.0] from Step 1 to final epoch."""
+        return min(1.0, max(0.0, (epoch + step_fraction) / float(self.total_epochs)))
+
+    def get_squeeze_progress(self) -> float:
+        """Closed-loop adaptive cosine progress for Phase 2 sparsity pressure."""
         if self.phase == 1:
             return 0.0
         return float(0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure)))))
 
-    def _update_schedules(self, epoch: int) -> None:
-        self._progress = self.get_progress()
+    def get_schedules(self, epoch: int, step_fraction: float = 0.0) -> dict[str, float]:
+        """Provides unified, non-zero schedules across all model components from Step 1."""
+        global_prog = self.get_global_progress(epoch, step_fraction)
+        squeeze_prog = self.get_squeeze_progress()
+
+        # Phase 1 transitions smoothly from 0.05 to 0.50; Phase 2 transitions from 0.50 to 1.0
         if self.phase == 1:
-            p1_fraction = min(1.0, float(epoch + 1) / max(1, self.min_p1_epochs))
-            self.spatial_warmup = 0.10 + 0.40 * p1_fraction
+            p1_fraction = min(1.0, (epoch + step_fraction) / max(1.0, float(self.min_p1_epochs)))
+            spatial_prog = 0.10 + 0.40 * p1_fraction
+            gamma_prog = 0.05 + 0.45 * global_prog  # Non-zero floor prevents gamma=0 singularity
         else:
-            self.spatial_warmup = 0.50 + 0.50 * self._progress
+            spatial_prog = 0.50 + 0.50 * squeeze_prog
+            gamma_prog = 0.50 + 0.50 * squeeze_prog  # Fully reaches 1.0 (gamma -> 0.99)
+
+        return {
+            "global_progress": global_prog,
+            "squeeze_progress": squeeze_prog,
+            "spatial_progress": spatial_prog,
+            "gamma_progress": gamma_prog,
+        }
+
+    def _update_schedules(self, epoch: int) -> None:
+        schedules = self.get_schedules(epoch)
+        self._progress = schedules["squeeze_progress"]
+        self.spatial_warmup = schedules["spatial_progress"]
 
     def step(
         self,
