@@ -232,6 +232,10 @@ class LibellaGNN(nn.Module):
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
         self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
+        
+        # Track historical co-activation probabilities of all latent pairs
+        self.register_buffer("coact_ema", torch.zeros((self.n_latents, self.n_latents), dtype=torch.float32))
+        self.coact_ema_momentum = getattr(cfg, "coact_ema_momentum", 0.99)
 
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
 
@@ -596,19 +600,38 @@ class LibellaGNN(nn.Module):
         else:
             l_gate_sparse = torch.tensor(0.0, device=x_true.device)
 
-        # 3. Symmetric Orthogonality Barrier (Decoder + Encoder)
+        # 3. CONTEXT-AWARE REDUNDANCY PENALTY (Co-Activation Orthogonality)
+        with torch.no_grad():
+            # Vectorized pairwise co-activation frequency for the current batch
+            active_mask = (z > 1e-4).float()
+            batch_coact = torch.mm(active_mask.t(), active_mask) / max(1.0, float(active_mask.size(0)))
+            
+            # Update running co-activation graph
+            if self.training:
+                self.coact_ema.lerp_(batch_coact, weight=1.0 - self.coact_ema_momentum)
+
+        # Decoder Weight Similarity
         gram_dec = torch.mm(w_dec_norm, w_dec_norm.t())
-        off_diag_dec = gram_dec * self.ortho_mask
-        # Tighten threshold from 0.30 to 0.20 to enforce atom diversity
-        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.20)
-        l_ortho_dec = F.relu(off_diag_dec.abs() - ortho_thresh).pow(2).mean()
-        l_ortho_max = F.relu(off_diag_dec.max() - 0.40).pow(2) * 50.0
+        weight_sim = gram_dec.abs() * self.ortho_mask
+        
+        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
+        excess_sim = F.relu(weight_sim - ortho_thresh)
+        
+        # Scale excess similarity by co-activation: Mutually exclusive pairs receive 0 penalty
+        redundancy_matrix = self.coact_ema * excess_sim.pow(2)
+        l_ortho_mean = redundancy_matrix.sum() / max(1.0, self.ortho_mask.sum())
+        
+        # Hard clone guard: prevent literal duplicate atoms (>0.60) regardless of firing state
+        max_corr = weight_sim.max()
+        l_ortho_max = F.relu(max_corr - 0.60).pow(2) * 20.0
 
+        # Encoder Weight Redundancy (Symmetric Guard)
         gram_enc = torch.mm(w_enc_norm, w_enc_norm.t())
-        off_diag_enc = gram_enc * self.ortho_mask
-        l_ortho_enc = F.relu(off_diag_enc.abs() - ortho_thresh).pow(2).mean()
+        enc_sim = gram_enc.abs() * self.ortho_mask
+        excess_enc_sim = F.relu(enc_sim - ortho_thresh)
+        l_ortho_enc = (self.coact_ema * excess_enc_sim.pow(2)).sum() / max(1.0, self.ortho_mask.sum())
 
-        l_ortho = l_ortho_dec + l_ortho_max + l_ortho_enc
+        l_ortho = l_ortho_mean + l_ortho_max + l_ortho_enc
 
         # 4. Batch-Mean Quadratic K-Budget Loss (Penalizes batch-level deviation, allows per-cell variance)
         if k_i_float is not None:
@@ -729,6 +752,11 @@ class LibellaGNN(nn.Module):
             stats["dict/svd_sigma_1"] = s_dec[0].item()
             stats["dict/svd_sigma_2"] = s_dec[1].item() if s_dec.numel() > 1 else 0.0
             stats["dict/svd_sigma_3"] = s_dec[2].item() if s_dec.numel() > 2 else 0.0
+
+        if hasattr(self, "coact_ema"):
+            off_diag_coact = self.coact_ema * self.ortho_mask
+            stats["dict/coact_ema_mean"] = off_diag_coact.mean().item()
+            stats["dict/coact_ema_max"] = off_diag_coact.max().item()
 
         # Untied Encoder-Decoder Feature Alignment Telemetry
         if hasattr(self, "encoder_weight") and hasattr(self, "decoder_weight"):
