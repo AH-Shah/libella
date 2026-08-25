@@ -166,7 +166,7 @@ class LibellaGNN(nn.Module):
         # Limit dynamic budget bounds to [0.5x, 1.5x] of K goal
         self.min_k = 0.5 * self.target_k
         self.max_k = 1.5 * self.target_k
-        self.laprune_gamma = float(getattr(cfg, "laprune_gamma", 0.99))
+        self.laprune_gamma = float(getattr(cfg, "laprune_gamma", 0.90))
 
         # SoftSAE Dynamic Sparsity & Cosine Scoring Parameterization
         self.k_predictor = nn.Sequential(

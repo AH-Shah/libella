@@ -70,7 +70,7 @@ class RunConfig:
     sharp_weight: float = 50
     id_split_ratio: float = 0.75
     gate_boundary_target: float = 0.25
-    laprune_gamma: float = 0.99
+    laprune_gamma: float = 0.90
 
     # Top-K Sparsity & Latent Dynamics
     topk_k: int = 38
