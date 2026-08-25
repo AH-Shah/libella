@@ -13,24 +13,33 @@ from .config import cfg
 
 class SafePadeActivation(nn.Module):
     """
-    Direct Safe-Padé rational activation unit (Yin & Yu, 2026).
-    Smoothly approximates non-linear thresholding without hard gradient cliffs.
+    Direct Safe-Padé rational activation unit.
+    Initialized as an identity pass-through to prevent Dead-ReLU collapse.
     """
     def __init__(self, p_deg: int = 3, q_deg: int = 2) -> None:
         super().__init__()
-        self.p_coeffs = nn.Parameter(torch.randn(p_deg + 1) * 0.02)
+        
+        # FIX: Start the numerator close to f(x) = x (Identity Function)
+        p_init = torch.zeros(p_deg + 1)
+        p_init[1] = 1.0  # Set the linear coefficient to 1.0
+        
+        # Add small symmetry-breaking noise
+        self.p_coeffs = nn.Parameter(p_init + torch.randn(p_deg + 1) * 0.02)
+        
+        # Denominator starts near 1.0
         self.q_coeffs = nn.Parameter(torch.randn(q_deg) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         p_val = self.p_coeffs[0]
         for i in range(1, len(self.p_coeffs)):
             p_val = p_val + self.p_coeffs[i] * (x ** i)
+        
         q_val = 1.0
         abs_x = torch.abs(x)
         for i in range(len(self.q_coeffs)):
             q_val = q_val + torch.abs(self.q_coeffs[i]) * (abs_x ** (i + 1))
+            
         return p_val / q_val
-
 
 class ExactLaPruneFunction(torch.autograd.Function):
     """
@@ -162,40 +171,44 @@ class LibellaGNN(nn.Module):
             nn.Linear(self.hidden_dim // 2, 1),
             nn.Sigmoid(),
         )
-        init_scale = math.log(math.sqrt(in_channels))
-        self.b_scale = nn.Parameter(torch.full((n_metaprograms,), init_scale))
+        # Start scale at 1.0 (e^0 = 1.0) so Padé operates in its optimal [-1, 1] domain
+        self.b_scale = nn.Parameter(torch.zeros(n_metaprograms))
         self.b_enc = nn.Parameter(torch.zeros(n_metaprograms))
         self.pade_gate = SafePadeActivation(p_deg=3, q_deg=2)
 
-        # 1. Identity Encoder (Self Signal)
-        self.self_enc = nn.Sequential(
-            nn.Linear(in_channels, self.hidden_dim),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-        )
-
-        # 2. Asymmetric Key-Query Spatial Attention
-        self.spatial_lin = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        # --- NATIVE ARCHITECTURE (Unified on n_latents) ---
         self.head_dim = max(16, self.hidden_dim // 2)
-        self.q_proj = nn.Linear(self.hidden_dim, self.head_dim)
-        self.k_proj = nn.Linear(self.hidden_dim, self.head_dim)
-
-        self.edge_gate = nn.Sequential(
-            nn.Linear(2, self.hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(self.hidden_dim // 2, 1),
-            nn.Tanh(),
-        )
+        self.q_proj = nn.Linear(self.n_latents, self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.n_latents, self.head_dim, bias=False)
         
-        # Phase 3: Bipolar GLU Feature-Wise Gating
-        self.gate_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.val_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.sign_tau = nn.Parameter(torch.tensor(-2.0))
+        self.acmp_beta = nn.Parameter(torch.tensor(0.0))
+        self.ac_delta = nn.Parameter(torch.tensor(0.0))
+        
+        self.listen_gate = nn.Linear(self.n_latents, 1)
+        self.broadcast_gate = nn.Linear(self.n_latents, 1)
+        
+        with torch.no_grad():
+            # Start at 50/50 probability (0.0 raw) to maximize initial gradient flow
+            nn.init.constant_(self.acmp_beta, 0.0)
+            nn.init.constant_(self.listen_gate.bias, 0.0)
+            nn.init.constant_(self.broadcast_gate.bias, 0.0)
 
-        # 3. Spatial Gate Head (Direct Rational Modulation)
-        self.spatial_gate_head = nn.Linear(self.hidden_dim, self.n_latents)
-        self.spatial_gain = nn.Parameter(
-            torch.tensor(float(getattr(cfg, "spatial_gain_init", 1.0)))
-        )
+        self.last_listen_prob = None
+        self.last_broadcast_prob = None
+
+        # Spatial Gate Head operates on latent delta residual
+        self.spatial_gate_head = nn.Linear(self.n_latents, self.n_latents)
+        with torch.no_grad():
+            nn.init.normal_(self.spatial_gate_head.weight, std=0.02)
+            nn.init.zeros_(self.spatial_gate_head.bias)
+
+        # Learnable spatial gain knob (sigmoid(0.0) * 0.10 = 0.05 baseline modulation)
+        self.spatial_gain = nn.Parameter(torch.tensor(0.0))
+
+        self.register_buffer("last_a_ij_density", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_a_ij_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_spatial_delta_ratio", torch.tensor(0.0), persistent=False)
 
         # 4. Untied Encoder & Decoder Dictionaries
         if init_components is not None:
@@ -215,8 +228,6 @@ class LibellaGNN(nn.Module):
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
         self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("routing_mean", torch.zeros(self.n_latents, dtype=torch.float32))
-        self.register_buffer("routing_std", torch.ones(self.n_latents, dtype=torch.float32))
 
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
 
@@ -239,7 +250,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor,
         torch.Tensor,
@@ -252,111 +263,116 @@ class LibellaGNN(nn.Module):
 
         N = x_dense.size(0)
 
-        # 1. Depth Disentanglement (True Biological Mass)
+        # 1. BIOLOGY & RAW LOGIT SCORING (Scale σ ≈ sqrt(in_channels))
         cell_mass = torch.clamp(x_dense.norm(p=2, dim=-1, keepdim=True), min=1e-5)
         x_norm = x_dense / cell_mass
         x_centered = x_norm - self.decoder_bias
 
-        # 2. Pure Biological Cosine Scoring
         w_enc_dir = F.normalize(self.encoder_weight, p=2, dim=1)
         cosine_sim = torch.mm(x_centered, w_enc_dir.t())
         bio_scores = torch.exp(self.b_scale) * cosine_sim + self.b_enc
 
-        # 3. Spatial GNN Message Passing (APPNP with Leaky Bipolar Gating)
-        h_self = self.self_enc(x_centered)
-
-        # 3. Bilateral Edge Filtering & Symmetric Normalization
-        if len(src) > 0:
-            with torch.no_grad():
-                cos_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
-                decay = torch.sigmoid(
-                    (cos_sim - getattr(cfg, "edge_sim_threshold", 0.50))
-                    * getattr(cfg, "edge_decay_slope", 15.0)
-                )
-
-                # Symmetric Laplacian normalization
-                deg = torch.zeros((N, 1), device=x_dense.device)
-                deg.index_add_(0, dst, torch.ones((len(dst), 1), device=x_dense.device))
-                norm_inv_sqrt = 1.0 / torch.clamp(deg.sqrt(), min=1.0)
-                edge_norm = norm_inv_sqrt[src] * norm_inv_sqrt[dst]
-
-            W_bil = edge_weights.unsqueeze(1) * decay
-
-            # 1. Asymmetric Key-Query Gating
-            q = self.q_proj(h_self)
-            k = self.k_proj(h_self)
-            kq_sim = (q[dst] * k[src]).sum(dim=-1, keepdim=True) / math.sqrt(self.head_dim)
-
-            gate_in = torch.cat([kq_sim, W_bil], dim=-1)
-            raw_gate = self.edge_gate(gate_in)
-            
-            # Phase 1: Sparse Bipolar Attention with Differentiable Softshrink
-            dead_zone = float(getattr(cfg, "bipolar_deadzone", 0.20))
-            gate = F.softshrink(raw_gate, lambd=dead_zone)
-
-            # 4. Selective Bipolar Message Passing & APPNP
-            H_0 = h_self
-            H_k = H_0
-            
-            for _ in range(self.k_hops):
-                h_proj = self.spatial_lin(H_k)
-                msg = h_proj[src] * gate * edge_norm
-                agg = torch.zeros_like(H_k)
-                agg.index_add_(0, dst, msg)
-
-                # Phase 3: Bipolar GLU Feature-Wise Gating
-                gate_val = torch.sigmoid(self.gate_proj(agg)) 
-                val = torch.tanh(self.val_proj(agg))
-                H_mixed = gate_val * val
-                
-                spatial_prog = getattr(self, "current_spatial_progress", 1.0) if self.training else 1.0
-                alpha_id = 0.50 + (0.30 * spatial_prog)
-                alpha_sp = 1.0 - alpha_id
-                
-                H_k = (alpha_id * H_0) + (alpha_sp * H_mixed)
-                
-            h_sp = H_k
-        else:
-            h_sp = h_self
-            decay = None
-            raw_gate = None
-
-        # 4. Spatial Modulation Generation
-        spatial_prog = getattr(self, "current_spatial_progress", 1.0) if self.training else 1.0
-        alpha_id = 0.50 + (0.30 * spatial_prog)
-        alpha_sp = 1.0 - alpha_id
-        
-        h_pure_spatial = (h_sp - (alpha_id * h_self)) / max(alpha_sp, 1e-3)
-        spatial_shift = torch.tanh(self.spatial_gate_head(h_pure_spatial))
-
-        spatial_warmup = 0.10 + 0.90 * spatial_prog
-        unleashed_gain = F.softplus(self.spatial_gain)
-        spatial_gain_knob = torch.clamp(
-            1.0 + (unleashed_gain * spatial_warmup * spatial_shift), 
-            min=0.05, 
-            max=2.5
-        )
-
-        # 5. Modulate Scores BEFORE Routing (Only modulate positive biological evidence)
-        routed_scores = torch.where(bio_scores > 0.0, bio_scores * spatial_gain_knob, bio_scores)
-
-        # 6. Exact-K Differentiable Routing & Activation
+        # 2. DYNAMIC K-BUDGET ESTIMATION
         k_ratio = self.k_predictor(x_centered)
         k_i_float = 4.0 + k_ratio * (self.max_k - 4.0)
+
+        # 3. EXACT-K ROUTING: Standardize Inputs for Solver Stability & Safe-Padé Amplitude
+        bio_mean = bio_scores.mean(dim=-1, keepdim=True)
+        bio_std = bio_scores.std(dim=-1, keepdim=True).clamp(min=1e-4)
+        laprune_inputs = (bio_scores - bio_mean) / bio_std
 
         if self.training:
             gamma_scale = getattr(self, "current_gamma_progress", 1.0)
             gamma_effective = max(0.05, self.laprune_gamma * gamma_scale)
-            soft_mask = ExactLaPruneFunction.apply(routed_scores, k_i_float, gamma_effective)
-            z_sparse = F.relu(self.pade_gate(routed_scores)) * soft_mask
+            soft_mask = ExactLaPruneFunction.apply(laprune_inputs, k_i_float, gamma_effective)
+            # Safe-Padé rational pre-conditioner with ReLU positivity guard
+            z_canonical = F.relu(self.pade_gate(bio_scores)) * soft_mask
         else:
             k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
-            sorted_scores, _ = torch.sort(routed_scores, dim=-1, descending=True)
-            hard_thresh = torch.gather(sorted_scores, dim=1, index=k_discrete - 1)
-            hard_mask = (routed_scores >= hard_thresh).float()
-            z_sparse = F.relu(self.pade_gate(routed_scores)) * hard_mask
+            # Double-argsort guarantees EXACTLY K non-zeros by breaking ties deterministically
+            rank = torch.argsort(torch.argsort(bio_scores, dim=-1, descending=True), dim=-1)
+            hard_mask = (rank < k_discrete).float()
+            z_canonical = F.relu(self.pade_gate(bio_scores)) * hard_mask
 
-        return z_sparse, routed_scores, cell_mass, None, decay, src, dst, raw_gate, k_i_float
+        # 4. TOPOLOGY & ACMP WITH REINFORCED 5% GRADIENT FIREWALL
+        H_0 = torch.tanh(bio_scores)
+        
+        # Spatial Gradient Firewall: Passes forward activations, throttles backward gradients into SAE to 5%
+        rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.05)
+        H_0_spatial = H_0.detach() + rho_spatial * (H_0 - H_0.detach())
+
+        if len(src) > 0:
+            W_bil = edge_weights.unsqueeze(1)
+
+            # Cosine Attention directly on firewall-shielded latents
+            q = F.normalize(self.q_proj(H_0_spatial), p=2, dim=-1)
+            k = F.normalize(self.k_proj(H_0_spatial), p=2, dim=-1)
+            sim = (q[dst] * k[src]).sum(dim=-1, keepdim=True)
+
+            # Reconnect tau for learned temperature sharpness
+            tau = F.softplus(self.sign_tau) + 1e-3
+            a_ij_raw = torch.sigmoid(sim / tau)
+            beta = torch.sigmoid(self.acmp_beta)
+            edge_sign = torch.tanh((a_ij_raw - beta) * 4.0)
+            edge_mag = torch.exp(torch.clamp(torch.abs(sim / tau), max=20.0))
+
+            mag_sum = torch.zeros((N, 1), device=x_dense.device)
+            mag_sum.index_add_(0, dst, edge_mag)
+            normalized_mag = edge_mag / torch.clamp(mag_sum[dst], min=1e-5)
+            A_ij = edge_sign * normalized_mag * W_bil
+
+            if self.training:
+                with torch.no_grad():
+                    self.last_a_ij_density.copy_((torch.abs(A_ij) > 0.01).float().mean())
+                    self.last_a_ij_mean.copy_(A_ij.mean())
+
+            H_k = H_0_spatial
+            delta = torch.sigmoid(self.ac_delta) * 0.45
+            eta = 0.5  # Explicit Euler step size to prevent overshooting
+
+            for _ in range(self.k_hops):
+                # Strict hard cap at 0.40 to prevent semantic oversmoothing and dictionary collapse
+                g_listen = 0.40 * torch.sigmoid(self.listen_gate(H_k))
+                g_broadcast = 0.40 * torch.sigmoid(self.broadcast_gate(H_k))
+                W_edge = A_ij * g_broadcast[src] * g_listen[dst]
+
+                msg = W_edge * (H_k[src] - H_k[dst])
+                laplacian_agg = torch.zeros_like(H_k)
+                laplacian_agg.index_add_(0, dst, msg)
+
+                ac_force = H_k * (1.0 - H_k**2)
+                H_k = torch.tanh(H_k + eta * laplacian_agg + delta * ac_force)
+
+            # Track gate probabilities for L1 sparsity regularizer
+            self.last_listen_prob = g_listen
+            self.last_broadcast_prob = g_broadcast
+
+            # THE GRAPH RESIDUAL: Pure neighborhood deviation from firewall state
+            delta_h = H_k - H_0_spatial
+        else:
+            self.last_listen_prob = None
+            self.last_broadcast_prob = None
+            delta_h = torch.zeros_like(H_0_spatial)
+            A_ij = None
+
+        # Track GNN activity telemetry
+        if self.training:
+            with torch.no_grad():
+                d_ratio = delta_h.norm(p=2, dim=-1).mean() / (H_0_spatial.norm(p=2, dim=-1).mean() + 1e-5)
+                self.last_spatial_delta_ratio.copy_(d_ratio)
+
+        # 5. ZERO-CENTERED CONTEXTUAL MODULATION (Center BEFORE Tanh)
+        raw_context = self.spatial_gate_head(delta_h)
+        centered_context = raw_context - raw_context.mean(dim=-1, keepdim=True)
+        spatial_context = torch.tanh(centered_context)
+
+        spatial_prog = getattr(self, "current_spatial_progress", 1.0) if self.training else 1.0
+        # Cap modulation at 15% maximum
+        alpha = torch.sigmoid(self.spatial_gain) * 0.15 * spatial_prog
+
+        z_contextual = z_canonical * (1.0 + alpha * spatial_context)
+
+        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -399,18 +415,27 @@ class LibellaGNN(nn.Module):
             )
 
         new_atoms = F.normalize(candidates, p=2, dim=-1)
-        self.decoder_weight.data[target_dead_ids] = new_atoms
-        self.steps_since_active[target_dead_ids] = 0
-        self.routing_mean[target_dead_ids] = 0.0
-        self.routing_std[target_dead_ids] = 1.0
 
+        # 1. Update BOTH dictionaries simultaneously
+        self.decoder_weight.data[target_dead_ids] = new_atoms
+        self.encoder_weight.data[target_dead_ids] = new_atoms.clone()
+
+        # 2. Reset score scale and bias for revived latents (Scale = 0.0 -> e^0 = 1.0)
+        self.b_scale.data[target_dead_ids] = 0.0
+        self.b_enc.data[target_dead_ids] = 0.0
+
+        self.steps_since_active[target_dead_ids] = 0
+
+        # 3. Reset optimizer moments
         if optimizer is not None:
-            state = optimizer.state.get(self.decoder_weight, None)
-            if state is not None:
-                if "exp_avg" in state:
-                    state["exp_avg"][target_dead_ids] = 0.0
-                if "exp_avg_sq" in state:
-                    state["exp_avg_sq"][target_dead_ids] = 0.0
+            params_to_reset = [self.decoder_weight, self.encoder_weight, self.b_scale, self.b_enc]
+            for param in params_to_reset:
+                state = optimizer.state.get(param, None)
+                if state is not None:
+                    if "exp_avg" in state:
+                        state["exp_avg"][target_dead_ids] = 0.0
+                    if "exp_avg_sq" in state:
+                        state["exp_avg_sq"][target_dead_ids] = 0.0
 
         return k_resample
 
@@ -433,13 +458,22 @@ class LibellaGNN(nn.Module):
         torch.Tensor | None,
         torch.Tensor,
     ]:
-        z, pre_acts, cell_mass, _, decay, src, dst, raw_gate, k_i_float = self.encode(
-            x_dense, src, dst, edge_weights
-        )
+        (
+            z_contextual,
+            z_canonical,
+            bio_scores,
+            cell_mass,
+            spatial_context,
+            delta_h,
+            src,
+            dst,
+            A_ij,
+            k_i_float,
+        ) = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=-1)
 
         # Direct Magnitude-Bypass Decoder Reconstruction
-        x_recon_centered = torch.mm(z, w_dec_norm)
+        x_recon_centered = torch.mm(z_contextual, w_dec_norm)
         x_recon = (x_recon_centered + self.decoder_bias) * cell_mass
 
         aux_recon = None
@@ -449,7 +483,12 @@ class LibellaGNN(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                active_in_batch = (z > 0.01).any(dim=0)
+                # Use top-K indices from raw scores to determine genuine usage
+                k_track = k_i_float.round().clamp(1, self.n_latents).long()
+                sorted_scores, _ = torch.sort(bio_scores, dim=-1, descending=True)
+                hard_thresh = torch.gather(sorted_scores, dim=1, index=k_track - 1)
+                active_in_batch = (bio_scores >= hard_thresh).any(dim=0)
+
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
                 dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
@@ -477,16 +516,18 @@ class LibellaGNN(nn.Module):
 
         return (
             x_recon,
-            z,
+            z_contextual,
             w_dec_norm,
             aux_recon,
             r_norm,
             cell_mass,
             r_pos_ret,
             dead_mask_ret,
-            decay,
-            raw_gate,
+            spatial_context,
+            A_ij,
             k_i_float,
+            delta_h,
+            z_canonical,
         )
 
     def calc_loss(
@@ -500,12 +541,13 @@ class LibellaGNN(nn.Module):
         ghost_logits: torch.Tensor | None = None,
         ghost_weights: torch.Tensor | None = None,
         progress: float = 1.0,
-        edge_decay: torch.Tensor | None = None,
+        spatial_shift: torch.Tensor | None = None,
         src: torch.Tensor | None = None,
         dst: torch.Tensor | None = None,
         z_full: torch.Tensor | None = None,
-        raw_gate: torch.Tensor | None = None,
+        A_ij: torch.Tensor | None = None,
         k_i_float: torch.Tensor | None = None,
+        x_full: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = x_true > 0
@@ -529,39 +571,51 @@ class LibellaGNN(nn.Module):
         delta_clamp = getattr(cfg, "delta_clamp", 30.0)
         scaled_delta = torch.clamp(raw_delta * asym_factor, min=-delta_clamp, max=delta_clamp)
 
-        # 1. Numerically Stable Log-Cosh (Handles the baseline distribution perfectly)
         abs_delta = torch.abs(scaled_delta)
         stable_log_cosh = abs_delta + torch.log1p(torch.exp(-2.0 * abs_delta)) - math.log(2.0)
-
-        # 2. The 1.5 Power Law (Forces the network to respect peaks for R2 safely)
         peak_penalty = (abs_delta + 1e-6).pow(1.5) * 0.05
 
         per_cell_loss = torch.sum(variance_weight * (stable_log_cosh + peak_penalty), dim=-1)
         l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
 
-        # 2. Strict Orthogonality Barrier
-        gram = torch.mm(w_dec_norm, w_dec_norm.t())
-        off_diag = gram * self.ortho_mask
+        # 2. DUAL-HINGE ALIGNMENT LOSS (500x hard boundary wall)
+        w_enc_norm = F.normalize(self.encoder_weight, p=2, dim=-1)
+        align_cos = (w_enc_norm * w_dec_norm).sum(dim=-1)
+        # Linear hinge below 0.85 (gentle tether) + Impenetrable cliff below 0.75
+        l_align_linear = F.relu(0.85 - align_cos)
+        l_align_hard = F.relu(0.75 - align_cos).pow(2) * 500.0
+        l_align = torch.mean(l_align_linear + l_align_hard)
 
-        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
-        excess_corr = F.relu(off_diag.abs() - ortho_thresh)
-        l_ortho_mean = excess_corr.pow(2).mean()
+        # 3. L1 GATE SPARSITY PENALTY (Forces selective neighborhood listening)
+        if self.last_listen_prob is not None and self.last_broadcast_prob is not None:
+            l_gate_sparse = self.last_listen_prob.mean() + self.last_broadcast_prob.mean()
+        else:
+            l_gate_sparse = torch.tensor(0.0, device=x_true.device)
 
-        max_corr = off_diag.max()
-        l_ortho_max = F.relu(max_corr - 0.50).pow(2) * 50.0
-        l_ortho = l_ortho_mean + l_ortho_max
+        # 3. Symmetric Orthogonality Barrier (Decoder + Encoder)
+        gram_dec = torch.mm(w_dec_norm, w_dec_norm.t())
+        off_diag_dec = gram_dec * self.ortho_mask
+        # Tighten threshold from 0.30 to 0.20 to enforce atom diversity
+        ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.20)
+        l_ortho_dec = F.relu(off_diag_dec.abs() - ortho_thresh).pow(2).mean()
+        l_ortho_max = F.relu(off_diag_dec.max() - 0.40).pow(2) * 50.0
 
-        # SoftSAE Continuous Differentiable Sparsity Budget (Eq. 11)
+        gram_enc = torch.mm(w_enc_norm, w_enc_norm.t())
+        off_diag_enc = gram_enc * self.ortho_mask
+        l_ortho_enc = F.relu(off_diag_enc.abs() - ortho_thresh).pow(2).mean()
+
+        l_ortho = l_ortho_dec + l_ortho_max + l_ortho_enc
+
+        # 4. Batch-Mean Quadratic K-Budget Loss (Penalizes batch-level deviation, allows per-cell variance)
         if k_i_float is not None:
             mean_k = k_i_float.mean()
-            beta_soft = 5.0
-            l_budget = (1.0 / beta_soft) * F.softplus(beta_soft * (mean_k - self.target_k))
+            l_budget = (mean_k - self.target_k).pow(2) / self.target_k
         else:
             l_budget = torch.tensor(0.0, device=x_true.device)
 
         l_sparse = l_budget
 
-        # 3. Residual Alignment
+        # 5. Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
             aux_error = (aux_recon - r_norm).pow(2).sum(dim=-1).mean()
@@ -569,41 +623,24 @@ class LibellaGNN(nn.Module):
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
-        # 5. Strict, Continuous Boundary Targets (One-Sided Hinge Loss)
-        l_sharp = torch.tensor(0.0, device=x_true.device)
-        if src is not None and len(src) > 0 and edge_decay is not None and raw_gate is not None:
-            mean_gate = raw_gate.mean(dim=-1, keepdim=True)
-
-            boundary_mask = (edge_decay < 0.40).float()
-            internal_mask = (edge_decay > 0.60).float()
-
-            n_boundary = torch.clamp(boundary_mask.sum(), min=1.0)
-            n_internal = torch.clamp(internal_mask.sum(), min=1.0)
-
-            # TARGETS: Boundary <= -0.35 (Repel), Internal >= +0.25 (Attract)
-            # F.relu ensures loss is exactly 0 if the gate successfully crosses the target threshold.
-            bnd_violation = F.relu(mean_gate + 0.35)  # Penalizes if mean_gate > -0.35
-            int_violation = F.relu(0.25 - mean_gate)  # Penalizes if mean_gate < +0.25
-
-            l_boundary = (boundary_mask * bnd_violation.pow(2)).sum() / n_boundary
-            l_internal = (internal_mask * int_violation.pow(2)).sum() / n_internal
-
-            l_sharp = l_boundary + l_internal
-
-        base_ortho = getattr(cfg, "ortho_weight", 8.0)
+        # Loss Compilation
+        base_ortho = getattr(cfg, "ortho_weight", 15.0)
         ortho_min = getattr(cfg, "ortho_min_scale", 0.50)
         global_prog = getattr(self, "current_global_progress", progress)
         current_ortho = base_ortho * (ortho_min + (1.0 - ortho_min) * global_prog)
+
         aux_weight = getattr(cfg, "aux_weight", 0.50)
-        sharp_weight = getattr(cfg, "sharp_weight", 50)
         budget_weight = getattr(cfg, "softsae_budget_weight", 1.0)
+        align_weight = getattr(cfg, "enc_dec_align_weight", 15.0)
+        gate_weight = getattr(cfg, "gate_sparsity_weight", 0.05)
 
         total_loss = (
             l_recon
             + (current_ortho * l_ortho)
             + (budget_weight * l_budget)
             + (aux_weight * l_aux)
-            + (sharp_weight * l_sharp)
+            + (align_weight * l_align)
+            + (gate_weight * l_gate_sparse)
         )
 
         return (
@@ -612,9 +649,35 @@ class LibellaGNN(nn.Module):
             l_ortho.detach(),
             l_sparse.detach(),
             l_aux.detach(),
-            l_sharp.detach(),
+            l_align.detach(),
             l_budget.detach(),
         )
+
+    def calc_spatial_loss(
+        self,
+        delta_h: torch.Tensor,
+        pos_src: torch.Tensor,
+        pos_dst: torch.Tensor,
+        hard_neg_src: torch.Tensor,
+        hard_neg_dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Supervises the neighborhood-induced delta embeddings."""
+        # Correct epsilon placement via F.normalize built-in parameter
+        d_norm = F.normalize(delta_h, p=2, dim=-1, eps=1e-6)
+
+        if len(pos_src) > 0:
+            pos_sim = (d_norm[pos_src] * d_norm[pos_dst]).sum(dim=-1)
+            l_pos = torch.mean(F.relu(0.50 - pos_sim))
+        else:
+            l_pos = torch.tensor(0.0, device=delta_h.device)
+
+        if len(hard_neg_src) > 0:
+            neg_sim = (d_norm[hard_neg_src] * d_norm[hard_neg_dst]).sum(dim=-1)
+            l_neg = torch.mean(F.relu(neg_sim - 0.20))
+        else:
+            l_neg = torch.tensor(0.0, device=delta_h.device)
+
+        return l_pos + l_neg
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
@@ -667,20 +730,42 @@ class LibellaGNN(nn.Module):
         if hasattr(self, "encoder_weight") and hasattr(self, "decoder_weight"):
             w_enc = F.normalize(self.encoder_weight, p=2, dim=1)
             w_dec = F.normalize(self.decoder_weight, p=2, dim=1)
-            enc_dec_diag = (w_enc * w_dec).sum(dim=-1)
-            stats["dict/enc_dec_alignment_mean"] = enc_dec_diag.mean().item()
-            stats["dict/enc_dec_alignment_min"] = enc_dec_diag.min().item()
-            stats["dict/enc_dec_alignment_max"] = enc_dec_diag.max().item()
+            align_cos = (w_enc * w_dec).sum(dim=-1)
+            
+            stats["dict/alignment_mean"] = align_cos.mean().item()
+            stats["dict/alignment_min"] = align_cos.min().item()
+            
+            quantiles = torch.quantile(align_cos, torch.tensor([0.10, 0.90], device=align_cos.device))
+            stats["dict/alignment_p10"] = quantiles[0].item()
+            stats["dict/alignment_p90"] = quantiles[1].item()
 
         dead_count = (self.steps_since_active >= self.dead_step_threshold).sum().item()
         stats["latents/dead_count"] = float(dead_count)
         stats["latents/active_pct"] = (1.0 - (dead_count / self.n_latents)) * 100.0
 
-        if hasattr(self, "routing_mean") and hasattr(self, "routing_std"):
-            stats["routing/mean_l2"] = self.routing_mean.norm(2).item()
-            stats["routing/std_mean"] = self.routing_std.mean().item()
-            stats["routing/std_min"] = self.routing_std.min().item()
-            stats["routing/std_max"] = self.routing_std.max().item()
+        # SignGT, ACMP, Spatial Gain, Delta Ratio, and CSNN Telemetry
+        if hasattr(self, "last_spatial_delta_ratio"):
+            stats["spatial/delta_ratio"] = self.last_spatial_delta_ratio.item()
+        if hasattr(self, "spatial_gain"):
+            stats["spatial/gain_raw"] = self.spatial_gain.item()
+            stats["spatial/effective_gain"] = (torch.sigmoid(self.spatial_gain) * 0.10).item()
+        if hasattr(self, "sign_tau"):
+            stats["sign_gt/tau_effective"] = (F.softplus(self.sign_tau) + 1e-3).item()
+            stats["sign_gt/tau_raw"] = self.sign_tau.item()
+        if hasattr(self, "acmp_beta"):
+            stats["acmp/beta_effective"] = torch.sigmoid(self.acmp_beta).item()
+            stats["acmp/beta_raw"] = self.acmp_beta.item()
+        if hasattr(self, "ac_delta"):
+            stats["acmp/delta_effective"] = (torch.sigmoid(self.ac_delta) * 0.45).item()
+            stats["acmp/delta_raw"] = self.ac_delta.item()
+        if hasattr(self, "listen_gate"):
+            gate_w_listen = self.listen_gate.weight.detach()
+            gate_w_broad = self.broadcast_gate.weight.detach()
+            stats["csnn/listen_gate_norm"] = gate_w_listen.norm(2).item()
+            stats["csnn/broadcast_gate_norm"] = gate_w_broad.norm(2).item()
+        if hasattr(self, "last_a_ij_mean"):
+            stats["graph/a_ij_mean"] = self.last_a_ij_mean.item()
+            stats["graph/a_ij_active_density"] = self.last_a_ij_density.item()
 
         # Cosine Scoring, Safe-Padé & LaPrune Exact Telemetry
         if hasattr(self, "b_scale"):
@@ -691,11 +776,28 @@ class LibellaGNN(nn.Module):
             stats["rsae/pade_q_norm"] = self.pade_gate.q_coeffs.norm(2).item()
             stats["rsae/pade_p0"] = self.pade_gate.p_coeffs[0].item()
             stats["rsae/pade_q0"] = self.pade_gate.q_coeffs[0].item()
+
+            # Dynamic Padé Monotonicity and Rank Inversion Audit (1D Grid over [0, 10])
+            with torch.enable_grad():
+                s_grid = torch.linspace(
+                    0.0, 10.0, 500, device=self.pade_gate.p_coeffs.device, requires_grad=True
+                )
+                y_grid = self.pade_gate(s_grid)
+                dy_ds = torch.autograd.grad(y_grid.sum(), s_grid)[0]
+
+                neg_mask = dy_ds < 0.0
+                stats["pade/negative_derivative_pct"] = neg_mask.float().mean().item() * 100.0
+                stats["pade/rank_inversion_pct"] = neg_mask.float().mean().item() * 100.0
+                stats["pade/derivative_min"] = dy_ds.min().item()
+                stats["pade/output_min"] = y_grid.min().item()
+                stats["pade/output_max"] = y_grid.max().item()
+
         if hasattr(self, "laprune_gamma"):
             gamma_scale = getattr(self, "current_gamma_progress", 1.0)
             stats["laprune/gamma_effective"] = float(self.laprune_gamma) * gamma_scale
             stats["schedules/global_progress"] = float(getattr(self, "current_global_progress", 1.0))
             stats["schedules/spatial_progress"] = float(getattr(self, "current_spatial_progress", 1.0))
             stats["schedules/squeeze_progress"] = float(getattr(self, "current_progress", 0.0))
+            stats["schedules/gamma_progress"] = float(gamma_scale)
 
         return stats

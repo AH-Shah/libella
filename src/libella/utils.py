@@ -87,7 +87,6 @@ from typing import Any
 import numpy as np
 from .config import cfg
 
-
 class PhaseTracker:
     """Adaptive training governor with PID-like pressure modulation and automated early stopping."""
 
@@ -114,6 +113,7 @@ class PhaseTracker:
         self.rec_history: list[float] = []
         self.val_history: list[float] = []
         self.corr_history: list[float] = []
+        self.align_history: list[float] = [] # NEW: Track dictionary alignment
 
         self.best_rec_loss: float = float("inf")
         self.best_val_loss: float = float("inf")
@@ -147,28 +147,27 @@ class PhaseTracker:
         return slope, y_mean, residual_std
 
     def get_global_progress(self, epoch: int, step_fraction: float = 0.0) -> float:
-        """Continuous, monotonic progress [0.0, 1.0] from Step 1 to final epoch."""
         return min(1.0, max(0.0, (epoch + step_fraction) / float(self.total_epochs)))
 
     def get_squeeze_progress(self) -> float:
-        """Closed-loop adaptive cosine progress for Phase 2 sparsity pressure."""
         if self.phase == 1:
             return 0.0
         return float(0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure)))))
 
     def get_schedules(self, epoch: int, step_fraction: float = 0.0) -> dict[str, float]:
-        """Provides unified, non-zero schedules across all model components from Step 1."""
         global_prog = self.get_global_progress(epoch, step_fraction)
         squeeze_prog = self.get_squeeze_progress()
 
-        # Phase 1 transitions smoothly from 0.05 to 0.50; Phase 2 transitions from 0.50 to 1.0
         if self.phase == 1:
             p1_fraction = min(1.0, (epoch + step_fraction) / max(1.0, float(self.min_p1_epochs)))
             spatial_prog = 0.10 + 0.40 * p1_fraction
-            gamma_prog = 0.05 + 0.45 * global_prog  # Non-zero floor prevents gamma=0 singularity
+            # FIX: Gamma must never drop below 0.55 (to yield effective >= 0.50). 
+            # We hold it steady during Phase 1 so the network masters sparse biology first.
+            gamma_prog = 0.56 
         else:
             spatial_prog = 0.50 + 0.50 * squeeze_prog
-            gamma_prog = 0.50 + 0.50 * squeeze_prog  # Fully reaches 1.0 (gamma -> 0.99)
+            # Phase 2 ramps gamma from 0.56 to 1.0 based on PID pressure
+            gamma_prog = 0.56 + 0.44 * squeeze_prog
 
         return {
             "global_progress": global_prog,
@@ -188,13 +187,18 @@ class PhaseTracker:
         epoch: int,
         val_loss: float | None = None,
     ) -> bool:
-        current_rec = float(epoch_telemetry.get("l_rec", 0.0))
+        # FIX: Fetch the correct reconstruction key based on your telemetry output
+        current_rec = float(epoch_telemetry.get("l_recon_x", epoch_telemetry.get("l_recon", 0.0)))
         current_val = float(val_loss if val_loss is not None else current_rec)
-        max_corr = float(epoch_telemetry.get("dict/max_cross_corr", epoch_telemetry.get("d_max_cross_corr", 0.0)))
+        
+        max_corr = float(epoch_telemetry.get("d_max_cross_corr", 0.0))
+        # FIX: Track minimum alignment to trigger PID panic if dictionaries tear
+        min_align = float(epoch_telemetry.get("d_alignment_min", 1.0))
 
         self.rec_history.append(current_rec)
         self.val_history.append(current_val)
         self.corr_history.append(max_corr)
+        self.align_history.append(min_align)
 
         if self.phase == 2 and current_rec < self.best_rec_loss:
             self.best_rec_loss = current_rec
@@ -212,7 +216,7 @@ class PhaseTracker:
         # =============================================================
         if self.phase == 1:
             relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
-            if relative_drop_rate < 0.015:  # Flat exploration detected
+            if relative_drop_rate < 0.015:
                 self.p1_plateau_count += 1
             else:
                 self.p1_plateau_count = 0
@@ -235,13 +239,13 @@ class PhaseTracker:
         dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.0 * rec_sigma)
         loss_overshoot = max(0.0, (current_rec - (self.best_rec_loss + dynamic_budget)) / max(1e-5, dynamic_budget))
 
-        # 2. Dynamic Correlation Shock Tracking (Relative to local mean)
-        corr_window = self.corr_history[-min(len(self.corr_history), 10):]
-        corr_baseline = float(np.mean(corr_window[:-1])) if len(corr_window) > 1 else max_corr
+        # 2. Dictionary Health Constraints (Correlation + Alignment)
+        corr_baseline = float(np.mean(self.corr_history[-10:-1])) if len(self.corr_history) > 1 else max_corr
         corr_spike = max(0.0, (max_corr - corr_baseline) / max(1e-3, corr_baseline))
-
-        # 3. Smooth Proportional Adjustment (No binary throttling)
-        panic_factor = max(0.0, (max_corr - 0.60) * 5.0)
+        
+        # Panic if correlation goes above 0.50 OR if alignment drops below 0.75
+        panic_factor = max(0.0, (max_corr - 0.50) * 5.0) + max(0.0, (0.75 - min_align) * 10.0)
+        
         stress_factor = (loss_overshoot * 1.5) + (corr_spike * 2.0) + panic_factor
 
         if stress_factor > 0.05:
@@ -258,7 +262,6 @@ class PhaseTracker:
         # =============================================================
         # ADAPTIVE EARLY STOPPING
         # =============================================================
-        # Dynamically lower progress gate if validation plateau is strongly established
         val_slope, val_mu, _ = self._fit_ols(self.val_history[-self.cycle_window:])
         val_flat = abs(val_slope * self.cycle_window) / max(1e-5, val_mu) < 0.005
 
@@ -401,6 +404,7 @@ def export_latents_from_graphs(
       2. Exact 1:1 cell index and barcode alignment with graph.pt.
       3. Embeds barcodes directly into libella_latent.npz for automated benchmark subsetting.
     """
+    import gc
     import warnings
     from .data import SpatialBatcher, pad_mps_shapes, pt_to_scipy_csr
 
@@ -497,13 +501,12 @@ def export_latents_from_graphs(
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
-                # Forward inference
-                forward_eval = model(chunk_x, src, dst, weights)
-                z = forward_eval[1]
+                # Direct encoder inference (bypasses decoder reconstruction FLOPs)
+                z_contextual, *_ = model.encode(chunk_x, src, dst, weights)
 
                 # Slice ONLY core nodes (drops halo receptive field)
                 local_core = chunk["local_core_idx"]
-                z_core = z[local_core].detach().cpu().numpy()
+                z_core = z_contextual[local_core].detach().cpu().numpy()
 
                 patient_z_chunks.append(sp.csr_matrix(z_core))
                 patient_cell_indices.extend(core_idx)
