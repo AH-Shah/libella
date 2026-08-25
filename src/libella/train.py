@@ -456,22 +456,8 @@ def _train_loop(
                 spatial_progress = schedules.get("spatial_progress", 0.0)
 
                 if len(src_loss) > 0 and delta_h is not None and spatial_progress > 0.0:
-                    # Normalized biological expression vectors for cosine distance calculation
-                    x_norm_cells = F.normalize(x, p=2, dim=-1)
-                    edge_bio_cos = (x_norm_cells[src_loss] * x_norm_cells[dst_loss]).sum(dim=-1)
-                    bio_dist = 1.0 - edge_bio_cos
-
-                    # Hard negative pairs: Spatially proximal (within radius graph) but biologically distinct
-                    hard_neg_mask = bio_dist > getattr(cfg, "spatial_hard_neg_thresh", 0.80)
-                    hard_neg_src = src_loss[hard_neg_mask]
-                    hard_neg_dst = dst_loss[hard_neg_mask]
-
-                    # Positive pairs: Spatially proximal and biologically consistent
-                    pos_src = src_loss[~hard_neg_mask]
-                    pos_dst = dst_loss[~hard_neg_mask]
-
                     l_spatial_rel = model.calc_spatial_loss(
-                        delta_h, pos_src, pos_dst, hard_neg_src, hard_neg_dst
+                        delta_h, src_loss, dst_loss, A_ij_loss
                     )
                     spatial_loss_weight = getattr(cfg, "spatial_loss_weight", 15.0) * spatial_progress
                     spatial_loss_val = spatial_loss_weight * l_spatial_rel

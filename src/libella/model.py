@@ -706,28 +706,28 @@ class LibellaGNN(nn.Module):
     def calc_spatial_loss(
         self,
         delta_h: torch.Tensor,
-        pos_src: torch.Tensor,
-        pos_dst: torch.Tensor,
-        hard_neg_src: torch.Tensor,
-        hard_neg_dst: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        raw_gate: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Supervises the neighborhood-induced delta embeddings."""
-        # Correct epsilon placement via F.normalize built-in parameter
+        """Supervises the neighborhood-induced delta embeddings using gate sign routing."""
         d_norm = F.normalize(delta_h, p=2, dim=-1, eps=1e-6)
 
-        if len(pos_src) > 0:
-            pos_sim = (d_norm[pos_src] * d_norm[pos_dst]).sum(dim=-1)
-            l_pos = torch.mean(F.relu(0.50 - pos_sim))
-        else:
-            l_pos = torch.tensor(0.0, device=delta_h.device)
+        if len(src) > 0 and raw_gate is not None:
+            sim = (d_norm[src] * d_norm[dst]).sum(dim=-1, keepdim=True)
+            gate_sign = torch.sign(raw_gate.detach())
 
-        if len(hard_neg_src) > 0:
-            neg_sim = (d_norm[hard_neg_src] * d_norm[hard_neg_dst]).sum(dim=-1)
-            l_neg = torch.mean(F.relu(neg_sim - 0.20))
-        else:
-            l_neg = torch.tensor(0.0, device=delta_h.device)
+            mask_homo = (gate_sign > 0.0).float()
+            mask_hetero = (gate_sign < 0.0).float()
 
-        return l_pos + l_neg
+            pull_loss = mask_homo * F.relu(0.60 - sim)
+            push_loss = mask_hetero * F.relu(sim - 0.10)
+
+            l_spatial = (pull_loss.sum() + push_loss.sum()) / max(1.0, float(len(src)))
+        else:
+            l_spatial = torch.tensor(0.0, device=delta_h.device)
+
+        return l_spatial
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
