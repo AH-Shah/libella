@@ -313,11 +313,11 @@ def _train_loop(
         gpu_telemetry = {
             "l_rec": torch.tensor(0.0, device=device),
             "l_ort": torch.tensor(0.0, device=device),
-            "l_sparse": torch.tensor(0.0, device=device),
-            "l_aux": torch.tensor(0.0, device=device),
             "l_budget": torch.tensor(0.0, device=device),
-            "l_spatial": torch.tensor(0.0, device=device),
+            "l_aux": torch.tensor(0.0, device=device),
             "l_align": torch.tensor(0.0, device=device),
+            "l_gate_sparse": torch.tensor(0.0, device=device),
+            "l_spatial": torch.tensor(0.0, device=device),
             "k_pred_mean": torch.tensor(0.0, device=device),
             "k_pred_std": torch.tensor(0.0, device=device),
             "k_pred_min": torch.tensor(0.0, device=device),
@@ -381,7 +381,7 @@ def _train_loop(
                 model.current_global_progress = schedules["global_progress"]
                 model.current_spatial_progress = schedules["spatial_progress"]
                 model.current_gamma_progress = schedules["gamma_progress"]
-                model.target_k = getattr(cfg, "topk_k", 64)
+                model.target_k = float(getattr(cfg, "target_k", getattr(cfg, "topk_k", 38.0)))
 
                 # 1. Forward Pass
                 (
@@ -447,10 +447,10 @@ def _train_loop(
                 base_sae_loss = loss_res[0]
                 base_recon_val = loss_res[1]
                 base_ort_val = loss_res[2]
-                base_sparse_val = loss_res[3]
+                base_budget_val = loss_res[3]
                 base_aux_val = loss_res[4]
                 base_align_val = loss_res[5]
-                base_budget_val = loss_res[6]
+                base_gate_sparse_val = loss_res[6]
 
                 # 3. Dedicated Contrastive Spatial Relation Loss with Warm-up Gate
                 spatial_progress = schedules.get("spatial_progress", 0.0)
@@ -517,22 +517,17 @@ def _train_loop(
                         gpu_telemetry["shift_mean"] += spatial_context.mean()
                         gpu_telemetry["shift_mag"] += spatial_context.abs().mean()
 
-                    if hasattr(model, "listen_gate") and hasattr(model, "broadcast_gate"):
-                        with torch.no_grad():
-                            w_enc_dir = F.normalize(model.encoder_weight, p=2, dim=1)
-                            x_c = (x[train_idx] / torch.clamp(x[train_idx].norm(p=2, dim=-1, keepdim=True), min=1e-5)) - model.decoder_bias
-                            bio_sc = torch.exp(model.b_scale) * torch.mm(x_c, w_enc_dir.t()) + model.b_enc
-                            h_cur = torch.tanh(bio_sc)
-                            gpu_telemetry["csnn_listen"] += (0.40 * torch.sigmoid(model.listen_gate(h_cur))).mean()
-                            gpu_telemetry["csnn_broadcast"] += (0.40 * torch.sigmoid(model.broadcast_gate(h_cur))).mean()
+                    if model.last_listen_prob is not None and model.last_broadcast_prob is not None:
+                        gpu_telemetry["csnn_listen"] += model.last_listen_prob[train_idx].mean()
+                        gpu_telemetry["csnn_broadcast"] += model.last_broadcast_prob[train_idx].mean()
 
                     gpu_telemetry["l_rec"] += base_recon_val
                     gpu_telemetry["l_ort"] += base_ort_val
-                    gpu_telemetry["l_sparse"] += base_sparse_val
-                    gpu_telemetry["l_aux"] += base_aux_val
                     gpu_telemetry["l_budget"] += base_budget_val
-                    gpu_telemetry["l_spatial"] += l_spatial_rel.detach()
+                    gpu_telemetry["l_aux"] += base_aux_val
                     gpu_telemetry["l_align"] += base_align_val
+                    gpu_telemetry["l_gate_sparse"] += base_gate_sparse_val
+                    gpu_telemetry["l_spatial"] += l_spatial_rel.detach()
                     if k_i_train is not None:
                         k_detached = k_i_train.detach()
                         gpu_telemetry["k_pred_mean"] += k_detached.mean()
@@ -680,11 +675,11 @@ def _train_loop(
             "loss_components": {
                 "rec": round(current_rec, 4),
                 "ort": round(epoch_telemetry.get("l_ort", 0.0), 4),
-                "sparse": round(epoch_telemetry.get("l_sparse", 0.0), 4),
                 "budget": round(epoch_telemetry.get("l_budget", 0.0), 4),
                 "aux": round(epoch_telemetry.get("l_aux", 0.0), 4),
                 "spatial": round(epoch_telemetry.get("l_spatial", 0.0), 4),
                 "align": round(epoch_telemetry.get("l_align", 0.0), 4),
+                "gate_sparse": round(epoch_telemetry.get("l_gate_sparse", 0.0), 4),
                 "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
             },
             "k_pred_mean": round(epoch_telemetry.get("k_pred_mean", float(getattr(model, "target_k", 64))), 2),
@@ -754,8 +749,9 @@ def _train_loop(
             "sign_gt/heterophilic_edge_pct": epoch_telemetry.get("a_neg_frac", 0.0) * 100.0,
             "spatial/shift_mean": epoch_telemetry.get("shift_mean", 0.0),
             "spatial/shift_mag": epoch_telemetry.get("shift_mag", 0.0),
-            "csnn/listen_prob_mean": epoch_telemetry.get("csnn_listen", 1.0),
-            "csnn/broadcast_prob_mean": epoch_telemetry.get("csnn_broadcast", 1.0),
+            "csnn/listen_prob_mean": epoch_telemetry.get("csnn_listen", 0.0),
+            "csnn/broadcast_prob_mean": epoch_telemetry.get("csnn_broadcast", 0.0),
+            "loss/gate_sparse": epoch_telemetry.get("l_gate_sparse", 0.0),
             "sae/l0_total": current_l0,
             "sae/dead_latents": current_dead,
             "sae/z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),

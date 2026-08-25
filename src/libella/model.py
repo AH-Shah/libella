@@ -697,10 +697,10 @@ class LibellaGNN(nn.Module):
             total_loss,
             l_recon.detach(),
             l_ortho.detach(),
-            l_sparse.detach(),
+            l_budget.detach(),
             l_aux.detach(),
             l_align.detach(),
-            l_budget.detach(),
+            l_gate_sparse.detach(),
         )
 
     def calc_spatial_loss(
