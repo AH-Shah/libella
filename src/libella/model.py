@@ -237,7 +237,7 @@ class LibellaGNN(nn.Module):
         self.register_buffer("coact_ema", torch.zeros((self.n_latents, self.n_latents), dtype=torch.float32))
         self.register_buffer("marginal_ema", torch.zeros(self.n_latents, dtype=torch.float32))
         self.coact_ema_initialized = False
-        self.ema_momentum = getattr(cfg, "coact_ema_momentum", 0.95)  # Tracks ~last 20 batches
+        self.ema_momentum = 0.95  # Remembers roughly the last 20 batches
 
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
 
@@ -538,6 +538,7 @@ class LibellaGNN(nn.Module):
             k_i_float,
             delta_h,
             z_canonical,
+            bio_scores,
         )
 
     def calc_loss(
@@ -546,6 +547,8 @@ class LibellaGNN(nn.Module):
         x_true: torch.Tensor,
         z: torch.Tensor,
         w_dec_norm: torch.Tensor,
+        routed_scores: torch.Tensor | None = None,
+        k_i_float: torch.Tensor | None = None,
         aux_recon: torch.Tensor | None = None,
         r_norm: torch.Tensor | None = None,
         ghost_logits: torch.Tensor | None = None,
@@ -556,9 +559,7 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor | None = None,
         z_full: torch.Tensor | None = None,
         A_ij: torch.Tensor | None = None,
-        k_i_float: torch.Tensor | None = None,
         x_full: torch.Tensor | None = None,
-        bio_scores: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = x_true > 0
@@ -608,11 +609,11 @@ class LibellaGNN(nn.Module):
         # ---------------------------------------------------------
         with torch.no_grad():
             # 1. Compute Exact Hard Support (Ignore soft-routed noise)
-            if bio_scores is not None and k_i_float is not None:
+            if routed_scores is not None and k_i_float is not None:
                 k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
-                sorted_scores, _ = torch.sort(bio_scores, dim=-1, descending=True)
+                sorted_scores, _ = torch.sort(routed_scores, dim=-1, descending=True)
                 hard_thresh = torch.gather(sorted_scores, dim=1, index=k_discrete - 1)
-                hard_mask = (bio_scores >= hard_thresh).float()
+                hard_mask = (routed_scores >= hard_thresh).float()
             else:
                 hard_mask = (z > 1e-4).float()
 
@@ -628,23 +629,24 @@ class LibellaGNN(nn.Module):
                     self.marginal_ema.copy_(batch_marginals)
                     self.coact_ema_initialized = True
                 else:
-                    self.coact_ema.lerp_(batch_coact, weight=1.0 - self.ema_momentum)
-                    self.marginal_ema.lerp_(batch_marginals, weight=1.0 - self.ema_momentum)
+                    self.coact_ema.lerp_(batch_coact, 1.0 - self.ema_momentum)
+                    self.marginal_ema.lerp_(batch_marginals, 1.0 - self.ema_momentum)
 
             # 4. Compute Jaccard Overlap: P(A & B) / (P(A) + P(B) - P(A & B))
             m_i = self.marginal_ema.unsqueeze(1)  # (N, 1)
             m_j = self.marginal_ema.unsqueeze(0)  # (1, N)
+            # Add eps to prevent division by zero
             union_prob = torch.clamp(m_i + m_j - self.coact_ema, min=1e-5)
-            jaccard_ema = (self.coact_ema / union_prob) * self.ortho_mask
+            jaccard_ema = self.coact_ema / union_prob
 
-        # 5. Decoder Weight Similarity (POSITIVE ONLY - anti-parallel is biologically valid)
+        # 5. Decoder Weight Similarity (POSITIVE ONLY)
         gram_dec = torch.mm(w_dec_norm, w_dec_norm.t())
         positive_sim = F.relu(gram_dec * self.ortho_mask)
         
         ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
         excess_sim = F.relu(positive_sim - ortho_thresh)
         
-        # 6. Apply Jaccard Scaling (Zero Jaccard -> Zero Penalty)
+        # 6. Apply Jaccard Scaling
         redundancy_matrix = jaccard_ema * excess_sim.pow(2)
         l_ortho_mean = redundancy_matrix.sum() / max(1.0, self.ortho_mask.sum())
         
@@ -652,13 +654,7 @@ class LibellaGNN(nn.Module):
         max_corr = positive_sim.max()
         l_ortho_max = F.relu(max_corr - 0.60).pow(2) * 20.0
 
-        # 8. Symmetric Encoder Guard (Positive only with Jaccard)
-        gram_enc = torch.mm(w_enc_norm, w_enc_norm.t())
-        pos_enc_sim = F.relu(gram_enc * self.ortho_mask)
-        excess_enc_sim = F.relu(pos_enc_sim - ortho_thresh)
-        l_ortho_enc = (jaccard_ema * excess_enc_sim.pow(2)).sum() / max(1.0, self.ortho_mask.sum())
-
-        l_ortho = l_ortho_mean + l_ortho_max + l_ortho_enc
+        l_ortho = l_ortho_mean + l_ortho_max
 
         # 4. Batch-Mean Quadratic K-Budget Loss (Penalizes batch-level deviation, allows per-cell variance)
         if k_i_float is not None:

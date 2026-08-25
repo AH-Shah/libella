@@ -398,6 +398,7 @@ def _train_loop(
                     k_i_float,
                     delta_h,
                     z_canonical,
+                    routed_scores,
                 ) = model(x, src, dst, weights)
 
                 last_r_pos = r_pos
@@ -410,6 +411,7 @@ def _train_loop(
                 aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
                 r_norm_train = r_norm[train_idx] if r_norm is not None else None
                 k_i_train = k_i_float[train_idx] if k_i_float is not None else None
+                routed_scores_train = routed_scores[train_idx] if routed_scores is not None else None
 
                 # Filter edges incident to training core cells
                 if len(src) > 0:
@@ -430,6 +432,8 @@ def _train_loop(
                     x_train,
                     z_train,
                     w_dec_norm,
+                    routed_scores=routed_scores_train,
+                    k_i_float=k_i_train,
                     aux_recon=aux_recon_train,
                     r_norm=r_norm_train,
                     progress=schedules["global_progress"],
@@ -438,7 +442,6 @@ def _train_loop(
                     dst=dst_loss,
                     z_full=z,
                     A_ij=A_ij_loss,
-                    k_i_float=k_i_train,
                     x_full=x,
                 )
                 base_sae_loss = loss_res[0]
@@ -545,7 +548,7 @@ def _train_loop(
                         gpu_telemetry["cell_mass_mean"] += cell_mass[train_idx].detach().mean()
 
                 train_chunk_count += 1
-                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, base_sae_loss, base_align_val, true_batch_loss, src_loss, dst_loss, A_ij_loss
+                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, routed_scores_train, base_sae_loss, base_align_val, true_batch_loss, src_loss, dst_loss, A_ij_loss
                 if len(src) > 0:
                     del core_mask, edge_mask, edge_bio_cos, bio_dist, hard_neg_mask, hard_neg_src, hard_neg_dst, pos_src, pos_dst, l_spatial_rel, spatial_loss_val
 
@@ -583,7 +586,7 @@ def _train_loop(
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
 
-                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
