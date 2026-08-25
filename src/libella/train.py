@@ -287,7 +287,12 @@ def _train_loop(
     accumulation_steps = getattr(cfg, "meta_batch_size", 4)
     total_epochs = getattr(cfg, "epochs", 100)
 
-    tracker = PhaseTracker(total_epochs=total_epochs)
+    tracker = PhaseTracker(
+        total_epochs=total_epochs,
+        surge_tolerance=getattr(cfg, "surge_tolerance", 0.50),
+        divergence_threshold=getattr(cfg, "divergence_threshold", 0.25),
+        ramp_divergence_slack=getattr(cfg, "ramp_divergence_slack", 1.00),
+    )
     if tracker_state is not None:
         tracker.__dict__.update(tracker_state)
         print(
@@ -753,7 +758,8 @@ def _train_loop(
         logger.log_metrics(epoch, epoch_log)
         logger.log_model_telemetry(epoch, model, log_histograms=False)
 
-        if composite_score < best_composite_score and not nan_detected:
+        # Only capture Pareto best checkpoints during Phase 2 (Hard Sparsity) or final epoch
+        if (tracker.phase == 2 or epoch == total_epochs - 1) and composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
             torch.save(
                 {
@@ -820,6 +826,7 @@ def _train_loop(
         is_done = tracker.step(epoch_telemetry, epoch, val_loss=current_val_loss)
 
         if was_phase_1 and tracker.phase == 2:
+            best_composite_score = float("inf")  # Reset so Phase 1 soft metrics do not block Phase 2 checkpoints
             tqdm.write(
                 f"\n[↳] Phase 1 Complete at Epoch {epoch} (Baseline Rec: {tracker.p1_baseline_rec:.2f}). "
                 f"\n    Engaging Adaptive Loss-Gated Sparsification across {tracker.total_epochs - tracker.p2_start_epoch} epochs..."
