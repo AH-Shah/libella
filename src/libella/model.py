@@ -710,26 +710,21 @@ class LibellaGNN(nn.Module):
         delta_h: torch.Tensor,
         src: torch.Tensor,
         dst: torch.Tensor,
-        raw_gate: torch.Tensor | None,
+        x_norm: torch.Tensor,
     ) -> torch.Tensor:
-        """Supervises the neighborhood-induced delta embeddings using gate sign routing."""
+        """Supervises neighborhood-induced delta embeddings against continuous biological similarity targets."""
+        if src.numel() == 0:
+            return delta_h.new_zeros(())
+
+        with torch.no_grad():
+            bio_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
+            y_target = torch.tanh((bio_sim - 0.40) * 2.5)
+
         d_norm = F.normalize(delta_h, p=2, dim=-1, eps=1e-6)
+        spatial_sim = (d_norm[src] * d_norm[dst]).sum(dim=-1, keepdim=True)
 
-        if len(src) > 0 and raw_gate is not None:
-            sim = (d_norm[src] * d_norm[dst]).sum(dim=-1, keepdim=True)
-            gate_sign = torch.sign(raw_gate.detach())
-
-            mask_homo = (gate_sign > 0.0).float()
-            mask_hetero = (gate_sign < 0.0).float()
-
-            pull_loss = mask_homo * F.relu(0.60 - sim)
-            push_loss = mask_hetero * F.relu(sim - 0.10)
-
-            l_spatial = (pull_loss.sum() + push_loss.sum()) / max(1.0, float(len(src)))
-        else:
-            l_spatial = torch.tensor(0.0, device=delta_h.device)
-
-        return l_spatial
+        raw_loss = F.huber_loss(spatial_sim, y_target, delta=0.5, reduction="none")
+        return raw_loss.mean()
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
