@@ -301,7 +301,7 @@ class LibellaGNN(nn.Module):
         H_0 = torch.tanh(bio_scores)
         
         # Spatial Gradient Firewall: Passes forward activations, throttles backward gradients into SAE to 5%
-        rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.05)
+        rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.2)
         H_0_spatial = H_0.detach() + rho_spatial * (H_0 - H_0.detach())
 
         if len(src) > 0:

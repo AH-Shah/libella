@@ -80,15 +80,17 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
 
 
 
-"""Adaptive Elastic Phase Controller with Dual-Horizon Oscillation Filtering."""
+from __future__ import annotations
 
 import math
-from typing import Any
 import numpy as np
-from .config import cfg
+
 
 class PhaseTracker:
-    """Adaptive training governor with PID-like pressure modulation and automated early stopping."""
+    """
+    Adaptive training governor with monotonic pressure progression,
+    dictionary-aware stress throttling, and hard-gate early stopping.
+    """
 
     def __init__(
         self,
@@ -113,7 +115,7 @@ class PhaseTracker:
         self.rec_history: list[float] = []
         self.val_history: list[float] = []
         self.corr_history: list[float] = []
-        self.align_history: list[float] = [] # NEW: Track dictionary alignment
+        self.align_history: list[float] = []
 
         self.best_rec_loss: float = float("inf")
         self.best_val_loss: float = float("inf")
@@ -152,6 +154,7 @@ class PhaseTracker:
     def get_squeeze_progress(self) -> float:
         if self.phase == 1:
             return 0.0
+        # Smooth S-curve transition over pressure [0, 1]
         return float(0.5 * (1.0 - math.cos(math.pi * min(1.0, max(0.0, self.pressure)))))
 
     def get_schedules(self, epoch: int, step_fraction: float = 0.0) -> dict[str, float]:
@@ -161,12 +164,11 @@ class PhaseTracker:
         if self.phase == 1:
             p1_fraction = min(1.0, (epoch + step_fraction) / max(1.0, float(self.min_p1_epochs)))
             spatial_prog = 0.10 + 0.40 * p1_fraction
-            # FIX: Gamma must never drop below 0.55 (to yield effective >= 0.50). 
-            # We hold it steady during Phase 1 so the network masters sparse biology first.
-            gamma_prog = 0.56 
+            # Phase 1: Hold gamma at 0.56 to establish strong biological manifold
+            gamma_prog = 0.56
         else:
             spatial_prog = 0.50 + 0.50 * squeeze_prog
-            # Phase 2 ramps gamma from 0.56 to 1.0 based on PID pressure
+            # Phase 2: Smoothly ramp gamma from 0.56 to 1.0 with squeeze pressure
             gamma_prog = 0.56 + 0.44 * squeeze_prog
 
         return {
@@ -187,13 +189,18 @@ class PhaseTracker:
         epoch: int,
         val_loss: float | None = None,
     ) -> bool:
-        # FIX: Fetch the correct reconstruction key based on your telemetry output
-        current_rec = float(epoch_telemetry.get("l_recon_x", epoch_telemetry.get("l_recon", 0.0)))
+        # Flexible metric resolution across flat and nested telemetry dicts
+        current_rec = float(
+            epoch_telemetry.get("l_rec", epoch_telemetry.get("l_recon_x", epoch_telemetry.get("l_recon", 0.0)))
+        )
         current_val = float(val_loss if val_loss is not None else current_rec)
-        
-        max_corr = float(epoch_telemetry.get("d_max_cross_corr", 0.0))
-        # FIX: Track minimum alignment to trigger PID panic if dictionaries tear
-        min_align = float(epoch_telemetry.get("d_alignment_min", 1.0))
+
+        max_corr = float(
+            epoch_telemetry.get("dict/max_cross_corr", epoch_telemetry.get("d_max_cross_corr", 0.0))
+        )
+        min_align = float(
+            epoch_telemetry.get("dict/alignment_min", epoch_telemetry.get("d_alignment_min", 1.0))
+        )
 
         self.rec_history.append(current_rec)
         self.val_history.append(current_val)
@@ -212,7 +219,7 @@ class PhaseTracker:
         rec_slope, rec_mu, rec_sigma = self._fit_ols(window_rec)
 
         # =============================================================
-        # PHASE 1: Manifold Alignment
+        # PHASE 1: Biological Manifold Establishment
         # =============================================================
         if self.phase == 1:
             relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
@@ -230,7 +237,7 @@ class PhaseTracker:
             return False
 
         # =============================================================
-        # PHASE 2: Dynamic Closed-Loop Proportional Tuning
+        # PHASE 2: Monotonic Aggressive Pressure Governor
         # =============================================================
         remaining_epochs = max(1, self.total_epochs - self.p2_start_epoch)
         base_step = 1.0 / remaining_epochs
@@ -239,33 +246,33 @@ class PhaseTracker:
         dynamic_budget = max(self.best_rec_loss * self.rel_tolerance, 2.0 * rec_sigma)
         loss_overshoot = max(0.0, (current_rec - (self.best_rec_loss + dynamic_budget)) / max(1e-5, dynamic_budget))
 
-        # 2. Dictionary Health Constraints (Correlation + Alignment)
+        # 2. Dictionary Health & Alignment Constraints
         corr_baseline = float(np.mean(self.corr_history[-10:-1])) if len(self.corr_history) > 1 else max_corr
         corr_spike = max(0.0, (max_corr - corr_baseline) / max(1e-3, corr_baseline))
-        
-        # Panic if correlation goes above 0.50 OR if alignment drops below 0.75
-        panic_factor = max(0.0, (max_corr - 0.50) * 5.0) + max(0.0, (0.75 - min_align) * 10.0)
-        
-        stress_factor = (loss_overshoot * 1.5) + (corr_spike * 2.0) + panic_factor
 
+        # Sensitive panic penalties: atom overlap (>0.40) or encoder-decoder drift (<0.80)
+        panic_corr = max(0.0, (max_corr - 0.40) * 5.0)
+        panic_align = max(0.0, (0.80 - min_align) * 10.0)
+        stress_factor = (loss_overshoot * 1.5) + (corr_spike * 2.0) + panic_corr + panic_align
+
+        # 3. Monotonic Progression: Pressure NEVER reverses
         if stress_factor > 0.05:
-            # Scale down pressure smoothly relative to stress intensity
-            pressure_delta = -base_step * min(2.0, stress_factor)
+            # Under stress, throttle forward speed (guaranteed minimum floor of 10% base step)
+            pressure_delta = base_step * max(0.10, 1.0 - min(0.90, stress_factor))
         else:
-            # Healthy training: Boost progression if loss is dropping rapidly
-            velocity_boost = min(1.5, max(1.0, -rec_slope * 5.0))
+            # Healthy regime: Aggressive velocity boost scaled with reconstruction drop rate
+            normalized_slope_drop = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
+            velocity_boost = min(2.0, max(1.0, 1.0 + normalized_slope_drop * 10.0))
             pressure_delta = base_step * velocity_boost
 
-        self.pressure = min(1.0, max(0.0, self.pressure + pressure_delta))
+        self.pressure = min(1.0, self.pressure + pressure_delta)
         self._update_schedules(epoch)
 
         # =============================================================
-        # ADAPTIVE EARLY STOPPING
+        # HARD-GATE EARLY STOPPING
         # =============================================================
-        val_slope, val_mu, _ = self._fit_ols(self.val_history[-self.cycle_window:])
-        val_flat = abs(val_slope * self.cycle_window) / max(1e-5, val_mu) < 0.005
-
-        active_gate = 0.50 if val_flat else 0.75
+        # Early stopping is strictly locked until squeeze progress reaches 90%
+        active_gate = 0.90
 
         if self._progress >= active_gate:
             rel_improvement = (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss)
@@ -294,7 +301,7 @@ class PhaseTracker:
             self.pressure = 0.0
             self.no_improve_count = 0
             self._update_schedules(epoch)
-
+            
 class UnifiedLogger:
     """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
     def __init__(self, backend: str, run_name: str, log_dir: str):
