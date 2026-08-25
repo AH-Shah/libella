@@ -657,6 +657,32 @@ def _train_loop(
         deep_stats = model.get_deep_telemetry()
         epoch_telemetry.update(deep_stats)
 
+        # --- Multimodal Robust Pareto Composite Score ---
+        val_recon = history["val_loss"][-1]
+
+        target_k = float(getattr(model, "target_k", 38.0))
+        k_error_ratio = abs(current_l0 - target_k) / max(1.0, target_k)
+        phi_budget = 1.0 + 0.50 * (k_error_ratio ** 2)
+
+        dead_ratio = float(current_dead) / float(model.n_latents)
+        max_corr = float(deep_stats.get("dict/max_cross_corr", 0.0))
+        twin_excess = max(0.0, max_corr - 0.55)
+        phi_dict = (1.0 + 2.0 * dead_ratio) * (1.0 + 5.0 * (twin_excess ** 2))
+
+        align_mean = float(deep_stats.get("dict/alignment_mean", 1.0))
+        align_deficit = max(0.0, 0.85 - align_mean)
+        phi_align = 1.0 + 2.0 * align_deficit
+
+        delta_ratio = float(deep_stats.get("spatial/delta_ratio", 0.45))
+        spatial_collapse = max(0.0, 0.15 - delta_ratio)
+        spatial_explosion = max(0.0, delta_ratio - 0.75)
+        phi_spatial = 1.0 + 1.5 * (spatial_collapse + spatial_explosion)
+
+        pade_inv = float(deep_stats.get("pade/rank_inversion_pct", 0.0))
+        phi_pade = 1.0 + 0.02 * pade_inv
+
+        composite_score = val_recon * phi_budget * phi_dict * phi_align * phi_spatial * phi_pade
+
         epoch_metrics = {
             "epoch": epoch,
             "phase": tracker.phase,
