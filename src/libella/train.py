@@ -662,8 +662,9 @@ def _train_loop(
         current_l0 = epoch_telemetry.get("l0_avg", 0.0)
         current_dead = int(epoch_telemetry.get("dead_cnt", 0))
 
-        # Harvest deep telemetry before dictionary population to ensure deep_stats is defined
+        # Harvest deep telemetry and merge into epoch_telemetry for PhaseTracker PID governor
         deep_stats = model.get_deep_telemetry()
+        epoch_telemetry.update(deep_stats)
 
         epoch_metrics = {
             "epoch": epoch,

@@ -80,11 +80,6 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
 
 
 
-from __future__ import annotations
-
-import math
-import numpy as np
-
 
 class PhaseTracker:
     """
@@ -301,7 +296,7 @@ class PhaseTracker:
             self.pressure = 0.0
             self.no_improve_count = 0
             self._update_schedules(epoch)
-            
+
 class UnifiedLogger:
     """Zero-overhead logger for Gradients, Trajectory, and Hardware Memory."""
     def __init__(self, backend: str, run_name: str, log_dir: str):
