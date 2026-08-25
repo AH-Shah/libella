@@ -806,7 +806,7 @@ class LibellaGNN(nn.Module):
         if hasattr(self, "last_spatial_delta_ratio"):
             stats["spatial/delta_ratio"] = self.last_spatial_delta_ratio.item()
         if hasattr(self, "spatial_gain"):
-            alpha_max = getattr(cfg, "spatial_alpha_max", 0.40)
+            alpha_max = float(getattr(cfg, "spatial_alpha_max", 0.40))
             stats["spatial/gain_raw"] = self.spatial_gain.item()
             stats["spatial/effective_gain"] = (torch.sigmoid(self.spatial_gain) * alpha_max).item()
         if hasattr(self, "sign_tau"):
