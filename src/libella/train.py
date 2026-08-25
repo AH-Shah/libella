@@ -543,11 +543,11 @@ def _train_loop(
                         gpu_telemetry["cell_mass_mean"] += cell_mass[train_idx].detach().mean()
 
                 train_chunk_count += 1
-                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, routed_scores_train, base_sae_loss, base_align_val, true_batch_loss, src_loss, dst_loss, A_ij_loss, l_spatial_rel, spatial_loss_val
                 if len(src) > 0:
                     del core_mask, edge_mask
                 if len(src_loss) > 0 and delta_h is not None and spatial_progress > 0.0:
                     del edge_bio_cos, bio_dist, hard_neg_mask, hard_neg_src, hard_neg_dst, pos_src, pos_dst
+                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, routed_scores_train, base_sae_loss, base_align_val, true_batch_loss, src_loss, dst_loss, A_ij_loss, l_spatial_rel, spatial_loss_val
 
                 # Validation Evaluation
                 val_core_idx_cpu = batch.get("val_core_idx")
