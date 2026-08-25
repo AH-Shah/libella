@@ -807,6 +807,7 @@ class LibellaGNN(nn.Module):
             stats["spatial/delta_ratio"] = self.last_spatial_delta_ratio.item()
         if hasattr(self, "spatial_gain"):
             alpha_max = float(getattr(cfg, "spatial_alpha_max", 0.40))
+            stats["spatial/alpha_max"] = alpha_max
             stats["spatial/gain_raw"] = self.spatial_gain.item()
             stats["spatial/effective_gain"] = (torch.sigmoid(self.spatial_gain) * alpha_max).item()
         if hasattr(self, "sign_tau"):
@@ -853,11 +854,11 @@ class LibellaGNN(nn.Module):
                 stats["pade/output_max"] = y_grid.max().item()
 
         if hasattr(self, "laprune_gamma"):
-            gamma_scale = getattr(self, "current_gamma_progress", 1.0)
+            gamma_scale = float(getattr(self, "current_gamma_progress", 1.0))
             stats["laprune/gamma_effective"] = float(self.laprune_gamma) * gamma_scale
             stats["schedules/global_progress"] = float(getattr(self, "current_global_progress", 1.0))
             stats["schedules/spatial_progress"] = float(getattr(self, "current_spatial_progress", 1.0))
             stats["schedules/squeeze_progress"] = float(getattr(self, "current_progress", 0.0))
-            stats["schedules/gamma_progress"] = float(gamma_scale)
+            stats["schedules/gamma_progress"] = gamma_scale
 
         return stats
