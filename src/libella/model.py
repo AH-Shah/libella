@@ -13,29 +13,32 @@ from .config import cfg
 
 class SafePadeActivation(nn.Module):
     """
-    Direct Safe-Padé rational activation unit.
-    Initialized as an identity pass-through to prevent Dead-ReLU collapse.
+    Direct Safe-Padé rational activation unit (Yin & Yu, 2026).
+    Inputs are softly bounded to [-1, 1] to prevent runaway polynomial oscillation (Runge's Phenomenon).
     """
     def __init__(self, p_deg: int = 3, q_deg: int = 2) -> None:
         super().__init__()
-        
-        # FIX: Start the numerator close to f(x) = x (Identity Function)
+        # Initialize near Identity function (f(x) = x)
         p_init = torch.zeros(p_deg + 1)
-        p_init[1] = 1.0  # Set the linear coefficient to 1.0
+        p_init[1] = 1.0  
         
-        # Add small symmetry-breaking noise
-        self.p_coeffs = nn.Parameter(p_init + torch.randn(p_deg + 1) * 0.02)
+        self.p_coeffs = nn.Parameter(p_init + torch.randn(p_deg + 1) * 0.01)
+        self.q_coeffs = nn.Parameter(torch.abs(torch.randn(q_deg) * 0.01))
         
-        # Denominator starts near 1.0
-        self.q_coeffs = nn.Parameter(torch.randn(q_deg) * 0.02)
+        # RSAE C_in scale to map raw scores into the safe [-1, 1] polynomial design space
+        self.c_in = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Softly bind inputs into [-1, 1] to prevent x^3 from exploding/inverting
+        # This forces Padé to behave purely as a smooth shape inside its stable domain
+        x_safe = torch.tanh(x / F.softplus(self.c_in))
+        
         p_val = self.p_coeffs[0]
         for i in range(1, len(self.p_coeffs)):
-            p_val = p_val + self.p_coeffs[i] * (x ** i)
-        
+            p_val = p_val + self.p_coeffs[i] * (x_safe ** i)
+            
         q_val = 1.0
-        abs_x = torch.abs(x)
+        abs_x = torch.abs(x_safe)
         for i in range(len(self.q_coeffs)):
             q_val = q_val + torch.abs(self.q_coeffs[i]) * (abs_x ** (i + 1))
             
