@@ -806,6 +806,7 @@ def _train_loop(
             with torch.no_grad():
                 l0_val = epoch_telemetry.get("l0_avg", 0.0)
                 l0_pct = (l0_val / model.n_latents) * 100.0
+                pade_inv = deep_stats.get("pade/rank_inversion_pct", 0.0)
                 d_ratio = deep_stats.get("spatial/delta_ratio", 0.0)
                 tqdm.write(
                     f" [Ep {(epoch+1):03d}] Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
@@ -816,6 +817,7 @@ def _train_loop(
                     f"Dead:{int(epoch_telemetry.get('dead_cnt', 0)):<3d} | "
                     f"A_ij:{epoch_telemetry.get('a_ij_mean', 0.0):<+5.3f} "
                     f"Δ_ratio:{d_ratio:<4.3f} "
+                    f"Padé_Inv:{pade_inv:<4.1f}% "
                     f"Shift:{epoch_telemetry.get('shift_mag', 0.0):<4.2f}"
                 )
 
