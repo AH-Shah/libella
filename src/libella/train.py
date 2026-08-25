@@ -658,100 +658,9 @@ def _train_loop(
         epoch_telemetry.update(deep_stats)
 
         # --- Multimodal Robust Pareto Composite Score ---
-        val_recon = history["val_loss"][-1]
-
-        target_k = float(getattr(model, "target_k", 38.0))
-        k_error_ratio = abs(current_l0 - target_k) / max(1.0, target_k)
-        phi_budget = 1.0 + 0.50 * (k_error_ratio ** 2)
-
-        dead_ratio = float(current_dead) / float(model.n_latents)
-        max_corr = float(deep_stats.get("dict/max_cross_corr", 0.0))
-        twin_excess = max(0.0, max_corr - 0.55)
-        phi_dict = (1.0 + 2.0 * dead_ratio) * (1.0 + 5.0 * (twin_excess ** 2))
-
-        align_mean = float(deep_stats.get("dict/alignment_mean", 1.0))
-        align_deficit = max(0.0, 0.85 - align_mean)
-        phi_align = 1.0 + 2.0 * align_deficit
-
-        delta_ratio = float(deep_stats.get("spatial/delta_ratio", 0.45))
-        spatial_collapse = max(0.0, 0.15 - delta_ratio)
-        spatial_explosion = max(0.0, delta_ratio - 0.75)
-        phi_spatial = 1.0 + 1.5 * (spatial_collapse + spatial_explosion)
-
-        pade_inv = float(deep_stats.get("pade/rank_inversion_pct", 0.0))
-        phi_pade = 1.0 + 0.02 * pade_inv
-
-        composite_score = val_recon * phi_budget * phi_dict * phi_align * phi_spatial * phi_pade
-
-        epoch_metrics = {
-            "epoch": epoch,
-            "phase": tracker.phase,
-            "train_loss": round(history["train_loss"][-1], 4),
-            "val_loss": round(history["val_loss"][-1], 4),
-            "lr": current_lr,
-            "loss_components": {
-                "rec": round(current_rec, 4),
-                "ort": round(epoch_telemetry.get("l_ort", 0.0), 4),
-                "budget": round(epoch_telemetry.get("l_budget", 0.0), 4),
-                "aux": round(epoch_telemetry.get("l_aux", 0.0), 4),
-                "spatial": round(epoch_telemetry.get("l_spatial", 0.0), 4),
-                "align": round(epoch_telemetry.get("l_align", 0.0), 4),
-                "gate_sparse": round(epoch_telemetry.get("l_gate_sparse", 0.0), 4),
-                "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
-            },
-            "k_pred_mean": round(epoch_telemetry.get("k_pred_mean", float(getattr(model, "target_k", 64))), 2),
-            "k_pred_std": round(epoch_telemetry.get("k_pred_std", 0.0), 2),
-            "k_pred_min": round(epoch_telemetry.get("k_pred_min", 0.0), 2),
-            "k_pred_max": round(epoch_telemetry.get("k_pred_max", 0.0), 2),
-            "pade_diagnostics": {
-                "neg_deriv_pct": round(deep_stats.get("pade/negative_derivative_pct", 0.0), 2),
-                "rank_inversion_pct": round(deep_stats.get("pade/rank_inversion_pct", 0.0), 2),
-                "deriv_min": round(deep_stats.get("pade/derivative_min", 0.0), 4),
-                "output_min": round(deep_stats.get("pade/output_min", 0.0), 4),
-                "output_max": round(deep_stats.get("pade/output_max", 0.0), 4),
-            },
-            "spatial_topology": {
-                "a_ij_mean": round(epoch_telemetry.get("a_ij_mean", 0.0), 4),
-                "delta_ratio": round(deep_stats.get("spatial/delta_ratio", 0.0), 4),
-                "active_edge_pct": round(epoch_telemetry.get("a_ij_density", 0.0) * 100.0, 2),
-                "homophilic_edge_pct": round(epoch_telemetry.get("a_pos_frac", 0.0) * 100.0, 2),
-                "heterophilic_edge_pct": round(epoch_telemetry.get("a_neg_frac", 0.0) * 100.0, 2),
-                "acmp_beta_effective": round(deep_stats.get("acmp/beta_effective", 0.50), 4),
-                "shift_mean": round(epoch_telemetry.get("shift_mean", 0.0), 4),
-                "shift_magnitude": round(epoch_telemetry.get("shift_mag", 0.0), 4),
-                "csnn_listen_mean": round(epoch_telemetry.get("csnn_listen", 0.5), 4),
-                "csnn_broadcast_mean": round(epoch_telemetry.get("csnn_broadcast", 0.5), 4),
-            },
-            "dead_latents": current_dead,
-            "entropy": round(epoch_telemetry.get("ent", 0.0), 4),
-            "l0_avg": round(current_l0, 2),
-            "p_w_sparsity_pct": round(epoch_telemetry.get("p_w", 0.0), 2),
-            "max_activation": round(epoch_telemetry.get("max_act", 0.0), 2),
-            "z_mag_mean": round(epoch_telemetry.get("z_mag_mean", 0.0), 4),
-            "cell_mass_mean": round(epoch_telemetry.get("cell_mass_mean", 0.0), 4),
-            "laprune_gamma_effective": round(float(getattr(model, "laprune_gamma", 0.99)) * schedules["gamma_progress"], 4),
-            "composite_score": round(composite_score, 4),
-            "composite_factors": {
-                "phi_budget": round(phi_budget, 4),
-                "phi_dict": round(phi_dict, 4),
-                "phi_align": round(phi_align, 4),
-                "phi_spatial": round(phi_spatial, 4),
-                "phi_pade": round(phi_pade, 4),
-            },
-            "tracker": {
-                "global_progress": round(schedules["global_progress"], 4),
-                "spatial_progress": round(schedules["spatial_progress"], 4),
-                "squeeze_progress": round(schedules["squeeze_progress"], 4),
-                "pressure": round(getattr(tracker, "pressure", 0.0), 4),
-                "target_k": getattr(model, "target_k", 64),
-            },
-        }
-        history.setdefault("autopsy_metrics", []).append(epoch_metrics)
-
-        # --- Multimodal Robust Pareto Composite Score ---
         # 1. Base Generalization Anchor (Validation Loss)
         val_recon = history["val_loss"][-1]
-        
+
         # 2. Target Sparsity Compliance (Penalize deviation from Target-K)
         target_k = float(getattr(model, "target_k", 38.0))
         k_error_ratio = abs(current_l0 - target_k) / max(1.0, target_k)
@@ -781,6 +690,71 @@ def _train_loop(
         # Unified Multiplicative Pareto Composite Score
         composite_score = val_recon * phi_budget * phi_dict * phi_align * phi_spatial * phi_pade
 
+        epoch_metrics = {
+            "epoch": epoch,
+            "phase": tracker.phase,
+            "train_loss": round(history["train_loss"][-1], 4),
+            "val_loss": round(history["val_loss"][-1], 4),
+            "lr": current_lr,
+            "composite_score": round(composite_score, 4),
+            "composite_factors": {
+                "phi_budget": round(phi_budget, 4),
+                "phi_dict": round(phi_dict, 4),
+                "phi_align": round(phi_align, 4),
+                "phi_spatial": round(phi_spatial, 4),
+                "phi_pade": round(phi_pade, 4),
+            },
+            "loss_components": {
+                "rec": round(current_rec, 4),
+                "ort": round(epoch_telemetry.get("l_ort", 0.0), 4),
+                "budget": round(epoch_telemetry.get("l_budget", 0.0), 4),
+                "aux": round(epoch_telemetry.get("l_aux", 0.0), 4),
+                "spatial": round(epoch_telemetry.get("l_spatial", 0.0), 4),
+                "align": round(epoch_telemetry.get("l_align", 0.0), 4),
+                "gate_sparse": round(epoch_telemetry.get("l_gate_sparse", 0.0), 4),
+                "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
+            },
+            "k_pred_mean": round(epoch_telemetry.get("k_pred_mean", target_k), 2),
+            "k_pred_std": round(epoch_telemetry.get("k_pred_std", 0.0), 2),
+            "k_pred_min": round(epoch_telemetry.get("k_pred_min", 0.0), 2),
+            "k_pred_max": round(epoch_telemetry.get("k_pred_max", 0.0), 2),
+            "pade_diagnostics": {
+                "neg_deriv_pct": round(deep_stats.get("pade/negative_derivative_pct", 0.0), 2),
+                "rank_inversion_pct": round(deep_stats.get("pade/rank_inversion_pct", 0.0), 2),
+                "deriv_min": round(deep_stats.get("pade/derivative_min", 0.0), 4),
+                "output_min": round(deep_stats.get("pade/output_min", 0.0), 4),
+                "output_max": round(deep_stats.get("pade/output_max", 0.0), 4),
+            },
+            "spatial_topology": {
+                "a_ij_mean": round(epoch_telemetry.get("a_ij_mean", 0.0), 4),
+                "delta_ratio": round(deep_stats.get("spatial/delta_ratio", 0.0), 4),
+                "active_edge_pct": round(epoch_telemetry.get("a_ij_density", 0.0) * 100.0, 2),
+                "homophilic_edge_pct": round(epoch_telemetry.get("a_pos_frac", 0.0) * 100.0, 2),
+                "heterophilic_edge_pct": round(epoch_telemetry.get("a_neg_frac", 0.0) * 100.0, 2),
+                "acmp_beta_effective": round(deep_stats.get("acmp/beta_effective", 0.50), 4),
+                "shift_mean": round(epoch_telemetry.get("shift_mean", 0.0), 4),
+                "shift_magnitude": round(epoch_telemetry.get("shift_mag", 0.0), 4),
+                "csnn_listen_mean": round(epoch_telemetry.get("csnn_listen", 0.0), 4),
+                "csnn_broadcast_mean": round(epoch_telemetry.get("csnn_broadcast", 0.0), 4),
+            },
+            "dead_latents": current_dead,
+            "entropy": round(epoch_telemetry.get("ent", 0.0), 4),
+            "l0_avg": round(current_l0, 2),
+            "p_w_sparsity_pct": round(epoch_telemetry.get("p_w", 0.0), 2),
+            "max_activation": round(epoch_telemetry.get("max_act", 0.0), 2),
+            "z_mag_mean": round(epoch_telemetry.get("z_mag_mean", 0.0), 4),
+            "cell_mass_mean": round(epoch_telemetry.get("cell_mass_mean", 0.0), 4),
+            "laprune_gamma_effective": round(float(getattr(model, "laprune_gamma", 0.99)) * epoch_schedules["gamma_progress"], 4),
+            "tracker": {
+                "global_progress": round(epoch_schedules["global_progress"], 4),
+                "spatial_progress": round(epoch_schedules["spatial_progress"], 4),
+                "squeeze_progress": round(epoch_schedules["squeeze_progress"], 4),
+                "pressure": round(getattr(tracker, "pressure", 0.0), 4),
+                "target_k": target_k,
+            },
+        }
+        history.setdefault("autopsy_metrics", []).append(epoch_metrics)
+
         epoch_log = {
             "epoch/train_loss": history["train_loss"][-1],
             "epoch/val_loss": history["val_loss"][-1],
@@ -792,11 +766,11 @@ def _train_loop(
             "composite/phi_pade": phi_pade,
             "loss/recon": epoch_telemetry.get("l_rec", 0.0),
             "loss/ort": epoch_telemetry.get("l_ort", 0.0),
-            "loss/sparse": epoch_telemetry.get("l_sparse", 0.0),
             "loss/budget": epoch_telemetry.get("l_budget", 0.0),
             "loss/aux": epoch_telemetry.get("l_aux", 0.0),
             "loss/spatial": epoch_telemetry.get("l_spatial", 0.0),
             "loss/align": epoch_telemetry.get("l_align", 0.0),
+            "loss/gate_sparse": epoch_telemetry.get("l_gate_sparse", 0.0),
             "loss/dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
             "sae/k_pred_mean": epoch_telemetry.get("k_pred_mean", 0.0),
             "sae/k_pred_std": epoch_telemetry.get("k_pred_std", 0.0),
@@ -812,16 +786,15 @@ def _train_loop(
             "spatial/shift_mag": epoch_telemetry.get("shift_mag", 0.0),
             "csnn/listen_prob_mean": epoch_telemetry.get("csnn_listen", 0.0),
             "csnn/broadcast_prob_mean": epoch_telemetry.get("csnn_broadcast", 0.0),
-            "loss/gate_sparse": epoch_telemetry.get("l_gate_sparse", 0.0),
             "sae/l0_total": current_l0,
             "sae/dead_latents": current_dead,
             "sae/z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),
             "sae/cell_mass_mean": epoch_telemetry.get("cell_mass_mean", 0.0),
             "sae/laprune_gamma": float(getattr(model, "laprune_gamma", 0.99)) * epoch_schedules["gamma_progress"],
             "spatial/delta_ratio": deep_stats.get("spatial/delta_ratio", 0.0),
-            "tracker/global_progress": schedules["global_progress"],
-            "tracker/spatial_progress": schedules["spatial_progress"],
-            "tracker/squeeze_progress": schedules["squeeze_progress"],
+            "tracker/global_progress": epoch_schedules["global_progress"],
+            "tracker/spatial_progress": epoch_schedules["spatial_progress"],
+            "tracker/squeeze_progress": epoch_schedules["squeeze_progress"],
             "tracker/pressure": getattr(tracker, "pressure", 0.0),
             **deep_stats,
         }
