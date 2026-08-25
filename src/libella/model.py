@@ -162,10 +162,11 @@ class LibellaGNN(nn.Module):
         self.k_hops = getattr(cfg, "k_hops", 2)
         self.n_latents = n_metaprograms
         self.in_channels = in_channels
-        self.target_k = float(getattr(cfg, "topk_k", 38))
-        self.k = self.target_k
-        self.max_k = float(self.target_k * 1.5)
-        self.laprune_gamma = float(getattr(cfg, "laprune_gamma", 0.90))
+        self.target_k = float(getattr(cfg, "target_k", 38.0))
+        # Limit dynamic budget bounds to [0.5x, 1.5x] of K goal
+        self.min_k = 0.5 * self.target_k
+        self.max_k = 1.5 * self.target_k
+        self.laprune_gamma = float(getattr(cfg, "laprune_gamma", 0.99))
 
         # SoftSAE Dynamic Sparsity & Cosine Scoring Parameterization
         self.k_predictor = nn.Sequential(
@@ -275,9 +276,9 @@ class LibellaGNN(nn.Module):
         cosine_sim = torch.mm(x_centered, w_enc_dir.t())
         bio_scores = torch.exp(self.b_scale) * cosine_sim + self.b_enc
 
-        # 2. DYNAMIC K-BUDGET ESTIMATION
+        # 2. DYNAMIC K-BUDGET ESTIMATION [0.5x -> 1.5x of target_k]
         k_ratio = self.k_predictor(x_centered)
-        k_i_float = 4.0 + k_ratio * (self.max_k - 4.0)
+        k_i_float = self.min_k + k_ratio * (self.max_k - self.min_k)
 
         # 3. EXACT-K ROUTING: Standardize Inputs for Solver Stability & Safe-Padé Amplitude
         bio_mean = bio_scores.mean(dim=-1, keepdim=True)
