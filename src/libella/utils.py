@@ -79,34 +79,45 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
     return exp_val / (sum_val[index] + 1e-9)
 
 
+
 class PhaseTracker:
     """
-    High-velocity training governor that ramps pressure to 1.0 as fast as
-    possible, maintaining maximum squeeze unless a catastrophic loss surge occurs.
+    High-velocity training governor that ramps to 100% squeeze rapidly,
+    then holds the network at max pressure for fine-tuning.
+    
+    Termination only occurs if:
+      1. Val loss diverges terribly (>15% above best), OR
+      2. The model has completed a burn-in at 100% squeeze AND budget loss has flatlined.
     """
 
     def __init__(
         self,
         total_epochs: int = 50,
-        surge_tolerance: float = 0.25,  # Only brake if loss surges >25% above best
+        surge_tolerance: float = 0.25,        # Halt pressure ramp if loss spikes >25%
+        divergence_threshold: float = 0.15,   # Early stop if val loss degrades >15% above best
     ) -> None:
         self.phase: int = 1
         self.total_epochs: int = max(1, total_epochs)
         self.surge_tolerance: float = surge_tolerance
+        self.divergence_threshold: float = divergence_threshold
 
-        # --- Aggressive Phase 1 Horizons (Exit in 2-4 epochs) ---
+        # --- Phase 1 Horizons ---
         self.min_p1_epochs: int = max(2, int(self.total_epochs * 0.05))
         self.max_p1_epochs: int = max(self.min_p1_epochs + 1, int(self.total_epochs * 0.08))
         self.p1_plateau_patience: int = 2
         self.p1_plateau_count: int = 0
 
-        # --- Dynamic Window Sizing ---
-        self.cycle_window: int = max(2, int(self.total_epochs * 0.05))
-        self.patience_epochs: int = max(4, int(self.total_epochs * 0.10))
+        # --- Dynamic Window Sizing & Max-Squeeze Horizons ---
+        self.cycle_window: int = max(3, int(self.total_epochs * 0.06))
+        # Must soak at 100% squeeze for at least 20% of training before budget stopping unlocks
+        self.min_max_squeeze_epochs: int = max(8, int(self.total_epochs * 0.20))
+        self.max_squeeze_epochs_count: int = 0
+        self.patience_epochs: int = max(6, int(self.total_epochs * 0.15))
 
         # --- Metric Histories ---
         self.rec_history: list[float] = []
         self.val_history: list[float] = []
+        self.budget_history: list[float] = []
         self.corr_history: list[float] = []
         self.align_history: list[float] = []
 
@@ -147,7 +158,6 @@ class PhaseTracker:
     def get_squeeze_progress(self) -> float:
         if self.phase == 1:
             return 0.0
-        # Direct 1:1 linear progression (zero S-curve lag)
         return float(min(1.0, max(0.0, self.pressure)))
 
     def get_schedules(self, epoch: int, step_fraction: float = 0.0) -> dict[str, float]:
@@ -184,17 +194,24 @@ class PhaseTracker:
             epoch_telemetry.get("l_rec", epoch_telemetry.get("l_recon_x", epoch_telemetry.get("l_recon", 0.0)))
         )
         current_val = float(val_loss if val_loss is not None else current_rec)
+        current_budget = float(
+            epoch_telemetry.get("l_budget", epoch_telemetry.get("loss/budget", epoch_telemetry.get("l_sparse", 0.0)))
+        )
 
         max_corr = float(epoch_telemetry.get("dict/max_cross_corr", epoch_telemetry.get("d_max_cross_corr", 0.0)))
         min_align = float(epoch_telemetry.get("dict/alignment_min", epoch_telemetry.get("d_alignment_min", 1.0)))
 
         self.rec_history.append(current_rec)
         self.val_history.append(current_val)
+        self.budget_history.append(current_budget)
         self.corr_history.append(max_corr)
         self.align_history.append(min_align)
 
         if self.phase == 2 and current_rec < self.best_rec_loss:
             self.best_rec_loss = current_rec
+
+        if current_val < self.best_val_loss:
+            self.best_val_loss = current_val
 
         self._update_schedules(epoch)
 
@@ -205,7 +222,7 @@ class PhaseTracker:
         rec_slope, rec_mu, _ = self._fit_ols(window_rec)
 
         # =============================================================
-        # PHASE 1: Fast Exit (Max 2-4 Epochs)
+        # PHASE 1: Rapid Manifold Alignment
         # =============================================================
         if self.phase == 1:
             relative_drop_rate = (-rec_slope * self.cycle_window) / max(1e-5, rec_mu)
@@ -223,45 +240,49 @@ class PhaseTracker:
             return False
 
         # =============================================================
-        # PHASE 2: Uncapped Rapid Squeeze Ramp
+        # PHASE 2: Fast-Track to Max Pressure (1.0)
         # =============================================================
-        # Target reaching full 1.0 squeeze by ~55% of the Phase 2 timeline
-        target_ramp_epochs = max(1, int((self.total_epochs - self.p2_start_epoch) * 0.55))
+        target_ramp_epochs = max(1, int((self.total_epochs - self.p2_start_epoch) * 0.50))
         base_step = 1.0 / target_ramp_epochs
 
-        # Catastrophic Surge Check: Only brake on actual loss explosions (>25% spike)
+        # Surge brake: only pause ramp if reconstruction loss jumps >25%
         surge_threshold = self.best_rec_loss * (1.0 + self.surge_tolerance)
-        is_surging = current_rec > surge_threshold
+        if current_rec <= surge_threshold:
+            self.pressure = min(1.0, self.pressure + base_step)
 
-        if is_surging:
-            # Severe loss explosion: halt progression until the model recovers
-            pressure_delta = 0.0
-        else:
-            # Full speed ahead: march directly toward 1.0
-            pressure_delta = base_step
-
-        self.pressure = min(1.0, self.pressure + pressure_delta)
         self._update_schedules(epoch)
 
-        # =============================================================
-        # EARLY STOPPING (Locked until 95% Squeeze)
-        # =============================================================
-        active_gate = 0.95
+        if self._progress >= 1.0:
+            self.max_squeeze_epochs_count += 1
 
-        if self._progress >= active_gate:
-            rel_improvement = (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss)
-            if rel_improvement > 1e-3:
-                self.best_val_loss = current_val
-                self.no_improve_count = 0
-            else:
+        # =============================================================
+        # SOAK MODE TERMINATION GOVERNOR
+        # =============================================================
+
+        # 1. Catastrophic Divergence Guard: Abort if val loss blows out >15% above best
+        if current_val > self.best_val_loss * (1.0 + self.divergence_threshold):
+            return True
+
+        # 2. Budget Flatline Gate: Only evaluate convergence when 100% squeeze has soaked
+        if self._progress >= 1.0 and self.max_squeeze_epochs_count >= self.min_max_squeeze_epochs:
+            # Check if budget loss is stationary
+            window_budget = self.budget_history[-self.cycle_window:]
+            b_slope, b_mu, _ = self._fit_ols(window_budget)
+            budget_relative_velocity = abs(b_slope * self.cycle_window) / max(1e-5, b_mu)
+            
+            # Budget loss is stationary (< 0.5% change over window)
+            budget_flat = budget_relative_velocity < 0.005
+
+            rel_val_improvement = (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss)
+            val_stagnant = rel_val_improvement <= 1e-3
+
+            if budget_flat and val_stagnant:
                 self.no_improve_count += 1
+            else:
+                self.no_improve_count = 0
 
             if self.no_improve_count >= self.patience_epochs:
                 return True
-        else:
-            if current_val < self.best_val_loss:
-                self.best_val_loss = current_val
-            self.no_improve_count = 0
 
         return False
 
@@ -273,6 +294,7 @@ class PhaseTracker:
             self.best_rec_loss = float(current_baseline)
             self.best_val_loss = float("inf")
             self.pressure = 0.0
+            self.max_squeeze_epochs_count = 0
             self.no_improve_count = 0
             self._update_schedules(epoch)
 
