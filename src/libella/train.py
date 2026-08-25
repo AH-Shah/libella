@@ -849,14 +849,14 @@ def _train_loop(
                 pade_inv = deep_stats.get("pade/rank_inversion_pct", 0.0)
                 d_ratio = deep_stats.get("spatial/delta_ratio", 0.0)
                 tqdm.write(
-                    f" [Ep {(epoch+1):03d}] Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
-                    f"Align:{epoch_telemetry.get('l_align', 0.0):<5.3f} "
+                    f" [Ep {(epoch+1):03d}] Score:{composite_score:<6.2f} "
+                    f"Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
                     f"V_Loss:{history['val_loss'][-1]:<5.3f} | "
                     f"L0:{l0_val:<4.1f}/{model.n_latents} ({l0_pct:<4.1f}%) "
                     f"K_Pred:{epoch_telemetry.get('k_pred_mean', 0.0):<4.1f} "
                     f"Dead:{int(epoch_telemetry.get('dead_cnt', 0)):<3d} | "
-                    f"A_ij:{epoch_telemetry.get('a_ij_mean', 0.0):<+5.3f} "
                     f"Δ_ratio:{d_ratio:<4.3f} "
+                    f"Spat_Loss:{epoch_telemetry.get('l_spatial', 0.0):<5.3f} "
                     f"Padé_Inv:{pade_inv:<4.1f}% "
                     f"Shift:{epoch_telemetry.get('shift_mag', 0.0):<4.2f}"
                 )
