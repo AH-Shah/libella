@@ -704,6 +704,14 @@ def _train_loop(
             "z_mag_mean": round(epoch_telemetry.get("z_mag_mean", 0.0), 4),
             "cell_mass_mean": round(epoch_telemetry.get("cell_mass_mean", 0.0), 4),
             "laprune_gamma_effective": round(float(getattr(model, "laprune_gamma", 0.99)) * schedules["gamma_progress"], 4),
+            "composite_score": round(composite_score, 4),
+            "composite_factors": {
+                "phi_budget": round(phi_budget, 4),
+                "phi_dict": round(phi_dict, 4),
+                "phi_align": round(phi_align, 4),
+                "phi_spatial": round(phi_spatial, 4),
+                "phi_pade": round(phi_pade, 4),
+            },
             "tracker": {
                 "global_progress": round(schedules["global_progress"], 4),
                 "spatial_progress": round(schedules["spatial_progress"], 4),
@@ -714,12 +722,48 @@ def _train_loop(
         }
         history.setdefault("autopsy_metrics", []).append(epoch_metrics)
 
-        composite_score = current_rec * math.sqrt(1.0 + (current_l0 / float(model.n_latents)))
+        # --- Multimodal Robust Pareto Composite Score ---
+        # 1. Base Generalization Anchor (Validation Loss)
+        val_recon = history["val_loss"][-1]
+        
+        # 2. Target Sparsity Compliance (Penalize deviation from Target-K)
+        target_k = float(getattr(model, "target_k", 38.0))
+        k_error_ratio = abs(current_l0 - target_k) / max(1.0, target_k)
+        phi_budget = 1.0 + 0.50 * (k_error_ratio ** 2)
+
+        # 3. Dictionary Health & Non-Redundancy (Dead Latents & Max Twin Correlation)
+        dead_ratio = float(current_dead) / float(model.n_latents)
+        max_corr = float(deep_stats.get("dict/max_cross_corr", 0.0))
+        twin_excess = max(0.0, max_corr - 0.55)
+        phi_dict = (1.0 + 2.0 * dead_ratio) * (1.0 + 5.0 * (twin_excess ** 2))
+
+        # 4. Encoder-Decoder Alignment Tether
+        align_mean = float(deep_stats.get("dict/alignment_mean", 1.0))
+        align_deficit = max(0.0, 0.85 - align_mean)
+        phi_align = 1.0 + 2.0 * align_deficit
+
+        # 5. Spatial GNN Residual Stability (Expect healthy delta ratio in [0.15, 0.75])
+        delta_ratio = float(deep_stats.get("spatial/delta_ratio", 0.45))
+        spatial_collapse = max(0.0, 0.15 - delta_ratio)
+        spatial_explosion = max(0.0, delta_ratio - 0.75)
+        phi_spatial = 1.0 + 1.5 * (spatial_collapse + spatial_explosion)
+
+        # 6. Padé Numerical Monotonicity
+        pade_inv = float(deep_stats.get("pade/rank_inversion_pct", 0.0))
+        phi_pade = 1.0 + 0.02 * pade_inv
+
+        # Unified Multiplicative Pareto Composite Score
+        composite_score = val_recon * phi_budget * phi_dict * phi_align * phi_spatial * phi_pade
 
         epoch_log = {
             "epoch/train_loss": history["train_loss"][-1],
             "epoch/val_loss": history["val_loss"][-1],
             "epoch/composite_score": composite_score,
+            "composite/phi_budget": phi_budget,
+            "composite/phi_dict": phi_dict,
+            "composite/phi_align": phi_align,
+            "composite/phi_spatial": phi_spatial,
+            "composite/phi_pade": phi_pade,
             "loss/recon": epoch_telemetry.get("l_rec", 0.0),
             "loss/ort": epoch_telemetry.get("l_ort", 0.0),
             "loss/sparse": epoch_telemetry.get("l_sparse", 0.0),
