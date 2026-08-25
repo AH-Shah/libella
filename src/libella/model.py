@@ -164,7 +164,7 @@ class LibellaGNN(nn.Module):
         self.in_channels = in_channels
         self.target_k = float(getattr(cfg, "topk_k", 38))
         self.k = self.target_k
-        self.max_k = float(self.target_k * 2.0)
+        self.max_k = float(self.target_k * 1.5)
         self.laprune_gamma = float(getattr(cfg, "laprune_gamma", 0.90))
 
         # SoftSAE Dynamic Sparsity & Cosine Scoring Parameterization
