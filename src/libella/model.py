@@ -232,10 +232,12 @@ class LibellaGNN(nn.Module):
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
         self.register_buffer("dynamic_w_ema", torch.tensor(1.0, dtype=torch.float32))
-        
-        # Track historical co-activation probabilities of all latent pairs
+
+        # EMA Buffers for Jaccard Redundancy Tracking
         self.register_buffer("coact_ema", torch.zeros((self.n_latents, self.n_latents), dtype=torch.float32))
-        self.coact_ema_momentum = getattr(cfg, "coact_ema_momentum", 0.99)
+        self.register_buffer("marginal_ema", torch.zeros(self.n_latents, dtype=torch.float32))
+        self.coact_ema_initialized = False
+        self.ema_momentum = getattr(cfg, "coact_ema_momentum", 0.95)  # Tracks ~last 20 batches
 
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
 
@@ -556,6 +558,7 @@ class LibellaGNN(nn.Module):
         A_ij: torch.Tensor | None = None,
         k_i_float: torch.Tensor | None = None,
         x_full: torch.Tensor | None = None,
+        bio_scores: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = x_true > 0
@@ -600,36 +603,60 @@ class LibellaGNN(nn.Module):
         else:
             l_gate_sparse = torch.tensor(0.0, device=x_true.device)
 
-        # 3. CONTEXT-AWARE REDUNDANCY PENALTY (Co-Activation Orthogonality)
+        # ---------------------------------------------------------
+        # JACCARD-SCALED REDUNDANCY PENALTY
+        # ---------------------------------------------------------
         with torch.no_grad():
-            # Vectorized pairwise co-activation frequency for the current batch
-            active_mask = (z > 1e-4).float()
-            batch_coact = torch.mm(active_mask.t(), active_mask) / max(1.0, float(active_mask.size(0)))
-            
-            # Update running co-activation graph
-            if self.training:
-                self.coact_ema.lerp_(batch_coact, weight=1.0 - self.coact_ema_momentum)
+            # 1. Compute Exact Hard Support (Ignore soft-routed noise)
+            if bio_scores is not None and k_i_float is not None:
+                k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
+                sorted_scores, _ = torch.sort(bio_scores, dim=-1, descending=True)
+                hard_thresh = torch.gather(sorted_scores, dim=1, index=k_discrete - 1)
+                hard_mask = (bio_scores >= hard_thresh).float()
+            else:
+                hard_mask = (z > 1e-4).float()
 
-        # Decoder Weight Similarity
+            # 2. Batch Co-activation & Marginals
+            batch_size = max(1.0, float(hard_mask.size(0)))
+            batch_coact = torch.mm(hard_mask.t(), hard_mask) / batch_size
+            batch_marginals = hard_mask.sum(dim=0) / batch_size
+
+            # 3. EMA Updates with Warm Start
+            if self.training:
+                if not self.coact_ema_initialized:
+                    self.coact_ema.copy_(batch_coact)
+                    self.marginal_ema.copy_(batch_marginals)
+                    self.coact_ema_initialized = True
+                else:
+                    self.coact_ema.lerp_(batch_coact, weight=1.0 - self.ema_momentum)
+                    self.marginal_ema.lerp_(batch_marginals, weight=1.0 - self.ema_momentum)
+
+            # 4. Compute Jaccard Overlap: P(A & B) / (P(A) + P(B) - P(A & B))
+            m_i = self.marginal_ema.unsqueeze(1)  # (N, 1)
+            m_j = self.marginal_ema.unsqueeze(0)  # (1, N)
+            union_prob = torch.clamp(m_i + m_j - self.coact_ema, min=1e-5)
+            jaccard_ema = (self.coact_ema / union_prob) * self.ortho_mask
+
+        # 5. Decoder Weight Similarity (POSITIVE ONLY - anti-parallel is biologically valid)
         gram_dec = torch.mm(w_dec_norm, w_dec_norm.t())
-        weight_sim = gram_dec.abs() * self.ortho_mask
+        positive_sim = F.relu(gram_dec * self.ortho_mask)
         
         ortho_thresh = getattr(cfg, "ortho_overlap_threshold", 0.30)
-        excess_sim = F.relu(weight_sim - ortho_thresh)
+        excess_sim = F.relu(positive_sim - ortho_thresh)
         
-        # Scale excess similarity by co-activation: Mutually exclusive pairs receive 0 penalty
-        redundancy_matrix = self.coact_ema * excess_sim.pow(2)
+        # 6. Apply Jaccard Scaling (Zero Jaccard -> Zero Penalty)
+        redundancy_matrix = jaccard_ema * excess_sim.pow(2)
         l_ortho_mean = redundancy_matrix.sum() / max(1.0, self.ortho_mask.sum())
         
-        # Hard clone guard: prevent literal duplicate atoms (>0.60) regardless of firing state
-        max_corr = weight_sim.max()
+        # 7. Clone Guard (Emergency brake for literal twins)
+        max_corr = positive_sim.max()
         l_ortho_max = F.relu(max_corr - 0.60).pow(2) * 20.0
 
-        # Encoder Weight Redundancy (Symmetric Guard)
+        # 8. Symmetric Encoder Guard (Positive only with Jaccard)
         gram_enc = torch.mm(w_enc_norm, w_enc_norm.t())
-        enc_sim = gram_enc.abs() * self.ortho_mask
-        excess_enc_sim = F.relu(enc_sim - ortho_thresh)
-        l_ortho_enc = (self.coact_ema * excess_enc_sim.pow(2)).sum() / max(1.0, self.ortho_mask.sum())
+        pos_enc_sim = F.relu(gram_enc * self.ortho_mask)
+        excess_enc_sim = F.relu(pos_enc_sim - ortho_thresh)
+        l_ortho_enc = (jaccard_ema * excess_enc_sim.pow(2)).sum() / max(1.0, self.ortho_mask.sum())
 
         l_ortho = l_ortho_mean + l_ortho_max + l_ortho_enc
 
@@ -753,10 +780,17 @@ class LibellaGNN(nn.Module):
             stats["dict/svd_sigma_2"] = s_dec[1].item() if s_dec.numel() > 1 else 0.0
             stats["dict/svd_sigma_3"] = s_dec[2].item() if s_dec.numel() > 2 else 0.0
 
-        if hasattr(self, "coact_ema"):
+        if hasattr(self, "coact_ema") and hasattr(self, "marginal_ema"):
             off_diag_coact = self.coact_ema * self.ortho_mask
             stats["dict/coact_ema_mean"] = off_diag_coact.mean().item()
             stats["dict/coact_ema_max"] = off_diag_coact.max().item()
+
+            m_i = self.marginal_ema.unsqueeze(1)
+            m_j = self.marginal_ema.unsqueeze(0)
+            union_p = torch.clamp(m_i + m_j - self.coact_ema, min=1e-5)
+            jaccard_mat = (self.coact_ema / union_p) * self.ortho_mask
+            stats["dict/jaccard_ema_mean"] = jaccard_mat.mean().item()
+            stats["dict/jaccard_ema_max"] = jaccard_mat.max().item()
 
         # Untied Encoder-Decoder Feature Alignment Telemetry
         if hasattr(self, "encoder_weight") and hasattr(self, "decoder_weight"):
