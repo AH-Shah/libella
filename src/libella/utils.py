@@ -93,13 +93,15 @@ class PhaseTracker:
     def __init__(
         self,
         total_epochs: int = 50,
-        surge_tolerance: float = 0.25,        # Halt pressure ramp if loss spikes >25%
-        divergence_threshold: float = 0.15,   # Early stop if val loss degrades >15% above best
+        surge_tolerance: float = 0.50,        # Allow up to 50% loss fluctuation during pressure changes
+        divergence_threshold: float = 0.25,   # Soak early stop: val loss degrades >25% above hard baseline
+        ramp_divergence_slack: float = 1.00,  # Ramp early stop: allow up to 100% surge during compression
     ) -> None:
         self.phase: int = 1
         self.total_epochs: int = max(1, total_epochs)
         self.surge_tolerance: float = surge_tolerance
         self.divergence_threshold: float = divergence_threshold
+        self.ramp_divergence_slack: float = ramp_divergence_slack
 
         # --- Phase 1 Horizons ---
         self.min_p1_epochs: int = max(2, int(self.total_epochs * 0.05))
@@ -109,8 +111,8 @@ class PhaseTracker:
 
         # --- Dynamic Window Sizing & Max-Squeeze Horizons ---
         self.cycle_window: int = max(3, int(self.total_epochs * 0.06))
-        # Must soak at 100% squeeze for at least 20% of training before budget stopping unlocks
-        self.min_max_squeeze_epochs: int = max(8, int(self.total_epochs * 0.20))
+        # Soak at 100% squeeze for at least 25% of training before convergence stopping unlocks
+        self.min_max_squeeze_epochs: int = max(8, int(self.total_epochs * 0.25))
         self.max_squeeze_epochs_count: int = 0
         self.patience_epochs: int = max(6, int(self.total_epochs * 0.15))
 
@@ -123,6 +125,8 @@ class PhaseTracker:
 
         self.best_rec_loss: float = float("inf")
         self.best_val_loss: float = float("inf")
+        self.hard_baseline_val_loss: float = float("inf")
+        self.hard_baseline_established: bool = False
         self.p1_baseline_rec: float = 0.0
         self.p2_start_epoch: int = 0
 
@@ -173,7 +177,9 @@ class PhaseTracker:
         if self.phase == 1:
             gamma_prog = 0.56
         else:
-            gamma_prog = 0.56 + 0.44 * squeeze_prog
+            # Cosine-smoothed hardness ramp to prevent sudden cliff at gamma=0.99
+            smooth_squeeze = 0.5 * (1.0 - math.cos(math.pi * squeeze_prog))
+            gamma_prog = 0.56 + 0.44 * smooth_squeeze
 
         return {
             "global_progress": global_prog,
@@ -262,13 +268,28 @@ class PhaseTracker:
         # SOAK MODE TERMINATION GOVERNOR
         # =============================================================
 
-        # 1. Catastrophic Divergence Guard: Abort if val loss blows out >15% above best
-        if current_val > self.best_val_loss * (1.0 + self.divergence_threshold):
-            return True
+        # 1. Recalibrate baseline once entering full hard-sparsity regime (pressure == 1.0)
+        if self._progress >= 1.0:
+            if not self.hard_baseline_established:
+                self.hard_baseline_val_loss = current_val
+                self.best_val_loss = current_val
+                self.best_rec_loss = current_rec
+                self.hard_baseline_established = True
+            elif current_val < self.hard_baseline_val_loss:
+                self.hard_baseline_val_loss = current_val
 
-        # 2. Budget Flatline Gate: Only evaluate convergence when 100% squeeze has soaked
+        # 2. Catastrophic Divergence Guard
+        if self._progress < 1.0:
+            # During compression ramp: allow wider margin to absorb discretization shock
+            if current_val > self.best_val_loss * (1.0 + self.ramp_divergence_slack):
+                return True
+        else:
+            # During max squeeze soak: evaluate divergence against hard baseline only
+            if current_val > self.hard_baseline_val_loss * (1.0 + self.divergence_threshold):
+                return True
+
+        # 3. Budget Flatline Gate: Only evaluate convergence when 100% squeeze has soaked
         if self._progress >= 1.0 and self.max_squeeze_epochs_count >= self.min_max_squeeze_epochs:
-            # Check if budget loss is stationary
             window_budget = self.budget_history[-self.cycle_window:]
             b_slope, b_mu, _ = self._fit_ols(window_budget)
             budget_relative_velocity = abs(b_slope * self.cycle_window) / max(1e-5, b_mu)
@@ -276,7 +297,7 @@ class PhaseTracker:
             # Budget loss is stationary (< 0.5% change over window)
             budget_flat = budget_relative_velocity < 0.005
 
-            rel_val_improvement = (self.best_val_loss - current_val) / max(1e-5, self.best_val_loss)
+            rel_val_improvement = (self.hard_baseline_val_loss - current_val) / max(1e-5, self.hard_baseline_val_loss)
             val_stagnant = rel_val_improvement <= 1e-3
 
             if budget_flat and val_stagnant:
@@ -296,6 +317,8 @@ class PhaseTracker:
             self.p1_baseline_rec = float(current_baseline)
             self.best_rec_loss = float(current_baseline)
             self.best_val_loss = float("inf")
+            self.hard_baseline_val_loss = float("inf")
+            self.hard_baseline_established = False
             self.pressure = 0.0
             self.max_squeeze_epochs_count = 0
             self.no_improve_count = 0
