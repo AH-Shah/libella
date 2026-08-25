@@ -377,9 +377,11 @@ class LibellaGNN(nn.Module):
         spatial_context = torch.tanh(centered_context)
 
         spatial_prog = getattr(self, "current_spatial_progress", 1.0) if self.training else 1.0
-        # Cap modulation at 15% maximum
-        alpha = torch.sigmoid(self.spatial_gain) * 0.15 * spatial_prog
+        # Let the GNN swing the volume by up to +/- 40% (or cfg-defined ceiling)
+        alpha_max = getattr(cfg, "spatial_alpha_max", 0.40)
+        alpha = torch.sigmoid(self.spatial_gain) * alpha_max * spatial_prog
 
+        # z_contextual now has the dynamic range to deeply suppress or heavily boost
         z_contextual = z_canonical * (1.0 + alpha * spatial_context)
 
         return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float
@@ -809,8 +811,9 @@ class LibellaGNN(nn.Module):
         if hasattr(self, "last_spatial_delta_ratio"):
             stats["spatial/delta_ratio"] = self.last_spatial_delta_ratio.item()
         if hasattr(self, "spatial_gain"):
+            alpha_max = getattr(cfg, "spatial_alpha_max", 0.40)
             stats["spatial/gain_raw"] = self.spatial_gain.item()
-            stats["spatial/effective_gain"] = (torch.sigmoid(self.spatial_gain) * 0.10).item()
+            stats["spatial/effective_gain"] = (torch.sigmoid(self.spatial_gain) * alpha_max).item()
         if hasattr(self, "sign_tau"):
             stats["sign_gt/tau_effective"] = (F.softplus(self.sign_tau) + 1e-3).item()
             stats["sign_gt/tau_raw"] = self.sign_tau.item()
