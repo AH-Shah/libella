@@ -164,12 +164,15 @@ class PhaseTracker:
         global_prog = self.get_global_progress(epoch, step_fraction)
         squeeze_prog = self.get_squeeze_progress()
 
+        # Spatial Warm-up: 0.0 for first 10% of run, then linear ramp to 1.0 from [0.10 -> 0.50]
+        if global_prog < 0.10:
+            spatial_prog = 0.0
+        else:
+            spatial_prog = min(1.0, (global_prog - 0.10) / 0.40)
+
         if self.phase == 1:
-            p1_fraction = min(1.0, (epoch + step_fraction) / max(1.0, float(self.min_p1_epochs)))
-            spatial_prog = 0.10 + 0.40 * p1_fraction
             gamma_prog = 0.56
         else:
-            spatial_prog = 0.50 + 0.50 * squeeze_prog
             gamma_prog = 0.56 + 0.44 * squeeze_prog
 
         return {
