@@ -9,144 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import cfg
-
-
-class SafePadeActivation(nn.Module):
-    """
-    Direct Safe-Padé rational activation unit (Yin & Yu, 2026).
-    Inputs are softly bounded to [-1, 1] to prevent runaway polynomial oscillation (Runge's Phenomenon).
-    """
-    def __init__(self, p_deg: int = 3, q_deg: int = 2) -> None:
-        super().__init__()
-        # Initialize near Identity function (f(x) = x)
-        p_init = torch.zeros(p_deg + 1)
-        p_init[1] = 1.0  
-        
-        self.p_coeffs = nn.Parameter(p_init + torch.randn(p_deg + 1) * 0.01)
-        self.q_coeffs = nn.Parameter(torch.abs(torch.randn(q_deg) * 0.01))
-        
-        # RSAE C_in scale to map raw scores into the safe [-1, 1] polynomial design space
-        self.c_in = nn.Parameter(torch.tensor(1.0))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Softly bind inputs into [-1, 1] to prevent x^3 from exploding/inverting
-        # This forces Padé to behave purely as a smooth shape inside its stable domain
-        x_safe = torch.tanh(x / F.softplus(self.c_in))
-        
-        p_val = self.p_coeffs[0]
-        for i in range(1, len(self.p_coeffs)):
-            p_val = p_val + self.p_coeffs[i] * (x_safe ** i)
-            
-        q_val = 1.0
-        abs_x = torch.abs(x_safe)
-        for i in range(len(self.q_coeffs)):
-            q_val = q_val + torch.abs(self.q_coeffs[i]) * (abs_x ** (i + 1))
-            
-        return p_val / q_val
-
-class ExactLaPruneFunction(torch.autograd.Function):
-    """
-    Exact-budget differentiable Top-K layer with normalized second-moment hardness control (Antczak et al., 2026).
-    Executes a 2D Newton-Raphson root solve in forward and an exact 2x2 IFT VJP in backward.
-    """
-    @staticmethod
-    def forward(
-        ctx,
-        scores: torch.Tensor,
-        k_target: torch.Tensor,
-        gamma: torch.Tensor | float,
-        max_iters: int = 25,
-        tol: float = 1e-6,
-    ) -> torch.Tensor:
-        B, N = scores.shape
-        device = scores.device
-        dtype = scores.dtype
-
-        if not isinstance(gamma, torch.Tensor):
-            gamma = torch.tensor(gamma, device=device, dtype=dtype)
-        if gamma.dim() == 0:
-            gamma = gamma.view(1, 1).expand(B, 1)
-
-        a = k_target / float(N)
-        beta = a + (1.0 - a) * gamma
-        target_m1 = k_target
-        target_m2 = beta * k_target
-
-        mean_s = scores.mean(dim=-1, keepdim=True)
-        std_s = scores.std(dim=-1, keepdim=True).clamp(min=1e-4)
-
-        b = mean_s + std_s * torch.clamp(1.0 - 2.0 * a, min=-2.5, max=2.5)
-        tau = torch.zeros((B, 1), device=device, dtype=dtype)
-
-        for _ in range(max_iters):
-            t = torch.exp(tau).clamp(min=1e-5, max=100.0)
-            u = (scores - b) / t
-            p = torch.where(u <= 0.0, 0.5 * torch.exp(u), 1.0 - 0.5 * torch.exp(-u))
-            q = 0.5 * torch.exp(-torch.abs(u))
-
-            F1 = p.sum(dim=-1, keepdim=True) - target_m1
-            F2 = (p ** 2).sum(dim=-1, keepdim=True) - target_m2
-
-            if torch.max(F1.abs()) < tol and torch.max(F2.abs()) < tol:
-                break
-
-            inv_t = 1.0 / t
-            J11 = -inv_t * q.sum(dim=-1, keepdim=True)
-            J12 = -(u * q).sum(dim=-1, keepdim=True)
-            J21 = -2.0 * inv_t * (p * q).sum(dim=-1, keepdim=True)
-            J22 = -2.0 * (u * p * q).sum(dim=-1, keepdim=True)
-
-            det = J11 * J22 - J12 * J21
-            det_stable = torch.where(det.abs() < 1e-7, torch.sign(det + 1e-7) * 1e-7, det)
-
-            delta_b = -(J22 * F1 - J12 * F2) / det_stable
-            delta_tau = -(-J21 * F1 + J11 * F2) / det_stable
-
-            b = b + delta_b.clamp(min=-5.0, max=5.0)
-            tau = (tau + delta_tau.clamp(min=-2.0, max=2.0)).clamp(min=-10.0, max=5.0)
-
-        t_final = torch.exp(tau).clamp(min=1e-5, max=100.0)
-        u_final = (scores - b) / t_final
-        p_final = torch.where(u_final <= 0.0, 0.5 * torch.exp(u_final), 1.0 - 0.5 * torch.exp(-u_final))
-
-        ctx.save_for_backward(p_final, t_final, scores, b, k_target, gamma)
-        return p_final
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        p, t, scores, b, k_target, gamma = ctx.saved_tensors
-        B, N = scores.shape
-
-        u = (scores - b) / t
-        q = 0.5 * torch.exp(-torch.abs(u))
-        inv_t = 1.0 / t
-
-        v_b = -inv_t * (grad_output * q).sum(dim=-1, keepdim=True)
-        v_tau = -(grad_output * u * q).sum(dim=-1, keepdim=True)
-
-        J11 = -inv_t * q.sum(dim=-1, keepdim=True)
-        J12 = -(u * q).sum(dim=-1, keepdim=True)
-        J21 = -2.0 * inv_t * (p * q).sum(dim=-1, keepdim=True)
-        J22 = -2.0 * (u * p * q).sum(dim=-1, keepdim=True)
-
-        det = J11 * J22 - J12 * J21
-        det_stable = torch.where(det.abs() < 1e-7, torch.sign(det + 1e-7) * 1e-7, det)
-
-        lambda_1 = (v_b * J22 - v_tau * J21) / det_stable
-        lambda_2 = (-v_b * J12 + v_tau * J11) / det_stable
-
-        grad_scores = inv_t * q * (grad_output - lambda_1 - 2.0 * lambda_2 * p)
-
-        a = k_target / float(N)
-        c_a = 2.0 * a + (1.0 - 2.0 * a) * gamma
-        grad_k = lambda_1 + c_a * lambda_2
-
-        grad_gamma = lambda_2 * (1.0 - a) * k_target
-
-        if ctx.needs_input_grad[2]:
-            return grad_scores, grad_k, grad_gamma, None, None
-        return grad_scores, grad_k, None, None, None
-
+from .utils import ExactLaPruneFunction, SafePadeActivation
 
 class LibellaGNN(nn.Module):
     """Core Libella Spatial GNN architecture with Top-K Hard Sparsity and Residual AuxK Revival."""
@@ -181,20 +44,32 @@ class LibellaGNN(nn.Module):
         self.pade_gate = SafePadeActivation(p_deg=3, q_deg=2)
 
         # --- NATIVE ARCHITECTURE (Unified on n_latents) ---
+        # 1. Microsoft Differential Transformer: 2x Head Dimension
         self.head_dim = max(16, self.hidden_dim // 2)
-        self.q_proj = nn.Linear(self.n_latents, self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.n_latents, self.head_dim, bias=False)
-        
+        self.q_proj = nn.Linear(self.n_latents, 2 * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.n_latents, 2 * self.head_dim, bias=False)
+
+        # Differential Lambda Reparameterization (Learnable Vectors)
+        self.lambda_q1 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
+        self.lambda_k1 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
+        self.lambda_q2 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
+        self.lambda_k2 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
+        self.lambda_init = 0.8  # Microsoft's recommended constant
+
+        # 2. Alibaba Qwen: Element-wise, Query-Dependent Gate
+        self.qwen_gate = nn.Linear(self.n_latents, self.n_latents)
+
+        # 3. Microsoft: Headwise Normalization
+        self.diff_norm = nn.RMSNorm(self.n_latents)
+
         self.sign_tau = nn.Parameter(torch.tensor(-2.0))
-        self.acmp_beta = nn.Parameter(torch.tensor(0.0))
         self.ac_delta = nn.Parameter(torch.tensor(0.0))
-        
+
         self.listen_gate = nn.Linear(self.n_latents, 1)
         self.broadcast_gate = nn.Linear(self.n_latents, 1)
         
         with torch.no_grad():
             # Start at 50/50 probability (0.0 raw) to maximize initial gradient flow
-            nn.init.constant_(self.acmp_beta, 0.0)
             nn.init.constant_(self.listen_gate.bias, 0.0)
             nn.init.constant_(self.broadcast_gate.bias, 0.0)
 
@@ -296,7 +171,7 @@ class LibellaGNN(nn.Module):
             gamma_effective = max(0.05, self.laprune_gamma * gamma_scale)
             soft_mask = ExactLaPruneFunction.apply(laprune_inputs, k_i_float, gamma_effective)
             # Safe-Padé rational pre-conditioner with ReLU positivity guard
-            z_canonical = F.relu(self.pade_gate(bio_scores)) * soft_mask
+            z_canonical = F.relu(self.pade_gate(bio_scores)- 1e-4) * soft_mask
         else:
             k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
             # Double-argsort guarantees EXACTLY K non-zeros by breaking ties deterministically
@@ -314,17 +189,29 @@ class LibellaGNN(nn.Module):
         if len(src) > 0:
             W_bil = edge_weights.unsqueeze(1)
 
-            # Cosine Attention directly on firewall-shielded latents
-            q = F.normalize(self.q_proj(H_0_spatial), p=2, dim=-1)
-            k = F.normalize(self.k_proj(H_0_spatial), p=2, dim=-1)
-            sim = (q[dst] * k[src]).sum(dim=-1, keepdim=True)
+            # Microsoft DiffAttn: Split Projections
+            Q = F.normalize(self.q_proj(H_0_spatial), p=2, dim=-1)
+            K = F.normalize(self.k_proj(H_0_spatial), p=2, dim=-1)
+            Q1, Q2 = Q.chunk(2, dim=-1)
+            K1, K2 = K.chunk(2, dim=-1)
 
-            # Reconnect tau for learned temperature sharpness
+            # Compute Signal 1 (Correlation) and Signal 2 (Common-Mode Noise)
+            sim_1 = (Q1[dst] * K1[src]).sum(dim=-1, keepdim=True)
+            sim_2 = (Q2[dst] * K2[src]).sum(dim=-1, keepdim=True)
+
+            # Synchronized Lambda Reparameterization
+            lambda_val = (
+                torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+                - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+                + self.lambda_init
+            )
+
+            # Differential Subtraction
+            diff_sim = sim_1 - lambda_val * sim_2
+
             tau = F.softplus(self.sign_tau) + 1e-3
-            a_ij_raw = torch.sigmoid(sim / tau)
-            beta = torch.sigmoid(self.acmp_beta)
-            edge_sign = torch.tanh((a_ij_raw - beta) * 4.0)
-            edge_mag = torch.exp(torch.clamp(torch.abs(sim / tau), max=20.0))
+            edge_sign = torch.tanh(diff_sim / tau)
+            edge_mag = torch.exp(torch.clamp(torch.abs(diff_sim / tau), max=20.0))
 
             mag_sum = torch.zeros((N, 1), device=x_dense.device)
             mag_sum.index_add_(0, dst, edge_mag)
@@ -364,6 +251,7 @@ class LibellaGNN(nn.Module):
             self.last_broadcast_prob = None
             delta_h = torch.zeros_like(H_0_spatial)
             A_ij = None
+            edge_sign = None
 
         # Track GNN activity telemetry
         if self.training:
@@ -371,9 +259,15 @@ class LibellaGNN(nn.Module):
                 d_ratio = delta_h.norm(p=2, dim=-1).mean() / (H_0_spatial.norm(p=2, dim=-1).mean() + 1e-5)
                 self.last_spatial_delta_ratio.copy_(d_ratio)
 
-        # 5. ZERO-CENTERED CONTEXTUAL MODULATION (Center BEFORE Tanh)
-        raw_context = self.spatial_gate_head(delta_h)
-        centered_context = raw_context - raw_context.mean(dim=-1, keepdim=True)
+        # 5. ZERO-CENTERED CONTEXTUAL MODULATION (DeepSeek Soft Severance + Qwen Gating + RMSNorm)
+        rho_recon_to_gnn = getattr(cfg, "recon_to_gnn_scale", 0.10)
+        delta_h_for_sae = delta_h.detach() + rho_recon_to_gnn * (delta_h - delta_h.detach())
+        g_qwen = torch.sigmoid(self.qwen_gate(H_0_spatial))
+        delta_h_gated = delta_h_for_sae * g_qwen
+
+        raw_context = self.spatial_gate_head(delta_h_gated)
+        norm_context = (1.0 - self.lambda_init) * self.diff_norm(raw_context)
+        centered_context = norm_context - norm_context.mean(dim=-1, keepdim=True)
         spatial_context = torch.tanh(centered_context)
 
         spatial_prog = getattr(self, "current_spatial_progress", 1.0) if self.training else 1.0
@@ -384,7 +278,7 @@ class LibellaGNN(nn.Module):
         # z_contextual now has the dynamic range to deeply suppress or heavily boost
         z_contextual = z_canonical * (1.0 + alpha * spatial_context)
 
-        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float
+        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float, edge_sign
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -481,6 +375,7 @@ class LibellaGNN(nn.Module):
             dst,
             A_ij,
             k_i_float,
+            edge_sign,
         ) = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=-1)
 
@@ -541,6 +436,7 @@ class LibellaGNN(nn.Module):
             delta_h,
             z_canonical,
             bio_scores,
+            edge_sign,
         )
 
     def calc_loss(
@@ -708,23 +604,45 @@ class LibellaGNN(nn.Module):
     def calc_spatial_loss(
         self,
         delta_h: torch.Tensor,
+        edge_sign: torch.Tensor | None,
         src: torch.Tensor,
         dst: torch.Tensor,
         x_norm: torch.Tensor,
     ) -> torch.Tensor:
-        """Supervises neighborhood-induced delta embeddings against continuous biological similarity targets."""
-        if src.numel() == 0:
+        if src.numel() == 0 or edge_sign is None or edge_sign.numel() == 0:
             return delta_h.new_zeros(())
+
+        N = x_norm.size(0)
 
         with torch.no_grad():
             bio_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
-            y_target = torch.tanh((bio_sim - 0.40) * 2.5)
 
+            degree = torch.zeros((N, 1), device=x_norm.device).index_add_(0, dst, torch.ones_like(bio_sim))
+            degree_clamped = degree.clamp(min=1)
+
+            node_bio_sum = torch.zeros((N, 1), device=x_norm.device).index_add_(0, dst, bio_sim)
+            local_mean = (node_bio_sum / degree_clamped)[dst]
+
+            var_components = (bio_sim - local_mean) ** 2
+            node_var_sum = torch.zeros((N, 1), device=x_norm.device).index_add_(0, dst, var_components)
+
+            local_std = torch.clamp(torch.sqrt(node_var_sum / degree_clamped)[dst], min=0.05)
+
+            z_score = (bio_sim - local_mean) / local_std
+            y_target = torch.tanh(z_score)
+
+            variance_mask = (node_var_sum / degree_clamped)[dst] > 1e-4
+
+        # 1. Edge Anchor (Directly trains Q/K attention matrices)
+        loss_edges = F.mse_loss(edge_sign, y_target, reduction="none")
+
+        # 2. PDE Smoothing Supervision
         d_norm = F.normalize(delta_h, p=2, dim=-1, eps=1e-6)
         spatial_sim = (d_norm[src] * d_norm[dst]).sum(dim=-1, keepdim=True)
+        loss_pde = F.huber_loss(spatial_sim, y_target, delta=0.5, reduction="none")
 
-        raw_loss = F.huber_loss(spatial_sim, y_target, delta=0.5, reduction="none")
-        return raw_loss.mean()
+        total_raw_loss = loss_edges + loss_pde
+        return (total_raw_loss * variance_mask.float()).sum() / torch.clamp(variance_mask.float().sum(), min=1.0)
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
@@ -813,9 +731,6 @@ class LibellaGNN(nn.Module):
         if hasattr(self, "sign_tau"):
             stats["sign_gt/tau_effective"] = (F.softplus(self.sign_tau) + 1e-3).item()
             stats["sign_gt/tau_raw"] = self.sign_tau.item()
-        if hasattr(self, "acmp_beta"):
-            stats["acmp/beta_effective"] = torch.sigmoid(self.acmp_beta).item()
-            stats["acmp/beta_raw"] = self.acmp_beta.item()
         if hasattr(self, "ac_delta"):
             stats["acmp/delta_effective"] = (torch.sigmoid(self.ac_delta) * 0.45).item()
             stats["acmp/delta_raw"] = self.ac_delta.item()
@@ -824,9 +739,15 @@ class LibellaGNN(nn.Module):
             gate_w_broad = self.broadcast_gate.weight.detach()
             stats["csnn/listen_gate_norm"] = gate_w_listen.norm(2).item()
             stats["csnn/broadcast_gate_norm"] = gate_w_broad.norm(2).item()
-        if hasattr(self, "last_a_ij_mean"):
-            stats["graph/a_ij_mean"] = self.last_a_ij_mean.item()
-            stats["graph/a_ij_active_density"] = self.last_a_ij_density.item()
+        if hasattr(self, "qwen_gate"):
+            stats["qwen/gate_norm"] = self.qwen_gate.weight.detach().norm(2).item()
+        if hasattr(self, "lambda_q1") and hasattr(self, "lambda_k1"):
+            lambda_val = (
+                torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
+                - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
+                + self.lambda_init
+            ).item()
+            stats["diff_attn/lambda_effective"] = lambda_val
 
         # Cosine Scoring, Safe-Padé & LaPrune Exact Telemetry
         if hasattr(self, "b_scale"):
@@ -838,7 +759,7 @@ class LibellaGNN(nn.Module):
             stats["rsae/pade_p0"] = self.pade_gate.p_coeffs[0].item()
             stats["rsae/pade_q0"] = self.pade_gate.q_coeffs[0].item()
 
-            # Dynamic Padé Monotonicity and Rank Inversion Audit (1D Grid over [0, 10])
+            # Dynamic Padé Monotonicity Audit (1D Grid over [0, 10])
             with torch.enable_grad():
                 s_grid = torch.linspace(
                     0.0, 10.0, 500, device=self.pade_gate.p_coeffs.device, requires_grad=True
@@ -847,7 +768,6 @@ class LibellaGNN(nn.Module):
                 dy_ds = torch.autograd.grad(y_grid.sum(), s_grid)[0]
 
                 neg_mask = dy_ds < 0.0
-                stats["pade/negative_derivative_pct"] = neg_mask.float().mean().item() * 100.0
                 stats["pade/rank_inversion_pct"] = neg_mask.float().mean().item() * 100.0
                 stats["pade/derivative_min"] = dy_ds.min().item()
                 stats["pade/output_min"] = y_grid.min().item()
@@ -856,9 +776,5 @@ class LibellaGNN(nn.Module):
         if hasattr(self, "laprune_gamma"):
             gamma_scale = float(getattr(self, "current_gamma_progress", 1.0))
             stats["laprune/gamma_effective"] = float(self.laprune_gamma) * gamma_scale
-            stats["schedules/global_progress"] = float(getattr(self, "current_global_progress", 1.0))
-            stats["schedules/spatial_progress"] = float(getattr(self, "current_spatial_progress", 1.0))
-            stats["schedules/squeeze_progress"] = float(getattr(self, "current_progress", 0.0))
-            stats["schedules/gamma_progress"] = gamma_scale
 
         return stats

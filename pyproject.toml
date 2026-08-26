@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "libella"
-version = "0.1.8.2"
+version = "0.1.8.3"
 description = "Spatial Transcriptomics GNN Pipeline for Ecotype Discovery"
 readme = "README.md"
 requires-python = ">=3.10"

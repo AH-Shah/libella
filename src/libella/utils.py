@@ -7,7 +7,6 @@ import warnings
 
 import numpy as np
 import pandas as pd
-import torch
 import math
 from typing import Dict, List, Optional, Tuple, Any, Union
 from tqdm import tqdm
@@ -16,11 +15,13 @@ from typing import Any, List, Optional, Union
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-import torch
 from tqdm import tqdm
 import psutil
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import gc
+
 
 from collections.abc import Iterator
 import scipy.sparse as sp
@@ -595,3 +596,139 @@ def export_latents_from_graphs(
 
     return master_csr, master_meta_df
 
+
+class SafePadeActivation(nn.Module):
+    """
+    Direct Safe-Padé rational activation unit (Yin & Yu, 2026).
+    Inputs are softly bounded to [-1, 1] to prevent runaway polynomial oscillation (Runge's Phenomenon).
+    """
+    def __init__(self, p_deg: int = 3, q_deg: int = 2) -> None:
+        super().__init__()
+        # Initialize near Identity function (f(x) = x)
+        p_init = torch.zeros(p_deg + 1)
+        p_init[1] = 1.0  
+        
+        self.p_coeffs = nn.Parameter(p_init + torch.randn(p_deg + 1) * 0.01)
+        self.q_coeffs = nn.Parameter(torch.abs(torch.randn(q_deg) * 0.01))
+        
+        # RSAE C_in scale to map raw scores into the safe [-1, 1] polynomial design space
+        self.c_in = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Softly bind inputs into [-1, 1] to prevent x^3 from exploding/inverting
+        # This forces Padé to behave purely as a smooth shape inside its stable domain
+        x_safe = torch.tanh(x / F.softplus(self.c_in))
+        
+        p_val = self.p_coeffs[0]
+        for i in range(1, len(self.p_coeffs)):
+            p_val = p_val + self.p_coeffs[i] * (x_safe ** i)
+            
+        q_val = 1.0
+        abs_x = torch.abs(x_safe)
+        for i in range(len(self.q_coeffs)):
+            q_val = q_val + torch.abs(self.q_coeffs[i]) * (abs_x ** (i + 1))
+            
+        return p_val / q_val
+
+class ExactLaPruneFunction(torch.autograd.Function):
+    """
+    Exact-budget differentiable Top-K layer with normalized second-moment hardness control (Antczak et al., 2026).
+    Executes a 2D Newton-Raphson root solve in forward and an exact 2x2 IFT VJP in backward.
+    """
+    @staticmethod
+    def forward(
+        ctx,
+        scores: torch.Tensor,
+        k_target: torch.Tensor,
+        gamma: torch.Tensor | float,
+        max_iters: int = 25,
+        tol: float = 1e-6,
+    ) -> torch.Tensor:
+        B, N = scores.shape
+        device = scores.device
+        dtype = scores.dtype
+
+        if not isinstance(gamma, torch.Tensor):
+            gamma = torch.tensor(gamma, device=device, dtype=dtype)
+        if gamma.dim() == 0:
+            gamma = gamma.view(1, 1).expand(B, 1)
+
+        a = k_target / float(N)
+        beta = a + (1.0 - a) * gamma
+        target_m1 = k_target
+        target_m2 = beta * k_target
+
+        mean_s = scores.mean(dim=-1, keepdim=True)
+        std_s = scores.std(dim=-1, keepdim=True).clamp(min=1e-4)
+
+        b = mean_s + std_s * torch.clamp(1.0 - 2.0 * a, min=-2.5, max=2.5)
+        tau = torch.zeros((B, 1), device=device, dtype=dtype)
+
+        for _ in range(max_iters):
+            t = torch.exp(tau).clamp(min=1e-5, max=100.0)
+            u = (scores - b) / t
+            p = torch.where(u <= 0.0, 0.5 * torch.exp(u), 1.0 - 0.5 * torch.exp(-u))
+            q = 0.5 * torch.exp(-torch.abs(u))
+
+            F1 = p.sum(dim=-1, keepdim=True) - target_m1
+            F2 = (p ** 2).sum(dim=-1, keepdim=True) - target_m2
+
+            if torch.max(F1.abs()) < tol and torch.max(F2.abs()) < tol:
+                break
+
+            inv_t = 1.0 / t
+            J11 = -inv_t * q.sum(dim=-1, keepdim=True)
+            J12 = -(u * q).sum(dim=-1, keepdim=True)
+            J21 = -2.0 * inv_t * (p * q).sum(dim=-1, keepdim=True)
+            J22 = -2.0 * (u * p * q).sum(dim=-1, keepdim=True)
+
+            det = J11 * J22 - J12 * J21
+            det_stable = torch.where(det.abs() < 1e-7, torch.sign(det + 1e-7) * 1e-7, det)
+
+            delta_b = -(J22 * F1 - J12 * F2) / det_stable
+            delta_tau = -(-J21 * F1 + J11 * F2) / det_stable
+
+            b = b + delta_b.clamp(min=-5.0, max=5.0)
+            tau = (tau + delta_tau.clamp(min=-2.0, max=2.0)).clamp(min=-10.0, max=5.0)
+
+        t_final = torch.exp(tau).clamp(min=1e-5, max=100.0)
+        u_final = (scores - b) / t_final
+        p_final = torch.where(u_final <= 0.0, 0.5 * torch.exp(u_final), 1.0 - 0.5 * torch.exp(-u_final))
+
+        ctx.save_for_backward(p_final, t_final, scores, b, k_target, gamma)
+        return p_final
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        p, t, scores, b, k_target, gamma = ctx.saved_tensors
+        B, N = scores.shape
+
+        u = (scores - b) / t
+        q = 0.5 * torch.exp(-torch.abs(u))
+        inv_t = 1.0 / t
+
+        v_b = -inv_t * (grad_output * q).sum(dim=-1, keepdim=True)
+        v_tau = -(grad_output * u * q).sum(dim=-1, keepdim=True)
+
+        J11 = -inv_t * q.sum(dim=-1, keepdim=True)
+        J12 = -(u * q).sum(dim=-1, keepdim=True)
+        J21 = -2.0 * inv_t * (p * q).sum(dim=-1, keepdim=True)
+        J22 = -2.0 * (u * p * q).sum(dim=-1, keepdim=True)
+
+        det = J11 * J22 - J12 * J21
+        det_stable = torch.where(det.abs() < 1e-7, torch.sign(det + 1e-7) * 1e-7, det)
+
+        lambda_1 = (v_b * J22 - v_tau * J21) / det_stable
+        lambda_2 = (-v_b * J12 + v_tau * J11) / det_stable
+
+        grad_scores = inv_t * q * (grad_output - lambda_1 - 2.0 * lambda_2 * p)
+
+        a = k_target / float(N)
+        c_a = 2.0 * a + (1.0 - 2.0 * a) * gamma
+        grad_k = lambda_1 + c_a * lambda_2
+
+        grad_gamma = lambda_2 * (1.0 - a) * k_target
+
+        if ctx.needs_input_grad[2]:
+            return grad_scores, grad_k, grad_gamma, None, None
+        return grad_scores, grad_k, None, None, None
