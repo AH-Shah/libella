@@ -648,20 +648,19 @@ def _train_loop(
         scheduler.step()
         gc.collect()
 
-        # Telemetry Resolution
-        epoch_telemetry = {}
-        if train_chunk_count > 0:
-            for k, val in epoch_telemetry_acc.items():
-                epoch_telemetry[k] = val / train_chunk_count
+        # Telemetry Resolution (Zero-Division Safe)
+        divisor = max(1, train_chunk_count)
+        epoch_telemetry = {k: val / divisor for k, val in epoch_telemetry_acc.items()}
 
-            current_l0_val = epoch_telemetry.get("l0_avg", float(model.n_latents))
-            epoch_telemetry["p_w"] = (1.0 - (current_l0_val / float(model.n_latents))) * 100.0
+        current_l0_val = epoch_telemetry.get("l0_avg", float(model.n_latents))
+        denom_latents = max(1.0, float(model.n_latents))
+        epoch_telemetry["p_w"] = (1.0 - (current_l0_val / denom_latents)) * 100.0
 
-            if ema_latent_freq is not None:
-                p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
-                epoch_telemetry["ent"] = -(p_norm * torch.log(p_norm + 1e-9)).sum().item()
-            else:
-                epoch_telemetry["ent"] = 0.0
+        if ema_latent_freq is not None and ema_latent_freq.sum() > 0:
+            p_norm = ema_latent_freq / torch.clamp(ema_latent_freq.sum(), min=1e-6)
+            epoch_telemetry["ent"] = -(p_norm * torch.log(p_norm + 1e-9)).sum().item()
+        else:
+            epoch_telemetry["ent"] = 0.0
 
         epoch_schedules = tracker.get_schedules(epoch)
 
