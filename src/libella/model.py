@@ -111,7 +111,7 @@ class LibellaGNN(nn.Module):
         self.register_buffer("coact_ema", torch.zeros((self.n_latents, self.n_latents), dtype=torch.float32))
         self.register_buffer("marginal_ema", torch.zeros(self.n_latents, dtype=torch.float32))
         self.coact_ema_initialized = False
-        self.ema_momentum = 0.95  # Remembers roughly the last 20 batches
+        self.ema_momentum = 0.95 
 
         self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
 
@@ -131,17 +131,17 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
     ) -> tuple[
-        torch.Tensor,              # z_contextual
-        torch.Tensor,              # z_canonical
-        torch.Tensor,              # bio_scores
-        torch.Tensor,              # cell_mass
-        torch.Tensor,              # spatial_context
-        torch.Tensor,              # delta_h
-        torch.Tensor,              # src
-        torch.Tensor,              # dst
-        torch.Tensor | None,       # A_ij
-        torch.Tensor,              # k_i_float
-        torch.Tensor | None,       # edge_sign
+        torch.Tensor,              
+        torch.Tensor,              
+        torch.Tensor,              
+        torch.Tensor,              
+        torch.Tensor,              
+        torch.Tensor,             
+        torch.Tensor,       
+        torch.Tensor,          
+        torch.Tensor | None,    
+        torch.Tensor,         
+        torch.Tensor | None,    
     ]:
         if len(src) > 0:
             src = src.contiguous()
