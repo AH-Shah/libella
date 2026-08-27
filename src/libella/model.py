@@ -586,8 +586,6 @@ class LibellaGNN(nn.Module):
         else:
             l_budget = torch.tensor(0.0, device=x_true.device)
 
-        l_sparse = l_budget
-
         # 5. Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
@@ -763,4 +761,3 @@ class LibellaGNN(nn.Module):
             stats["rsae_pade_q0"] = float(self.pade_gate.q_coeffs[0].item())
 
         return stats
-        
