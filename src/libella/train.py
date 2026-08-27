@@ -584,7 +584,7 @@ def _train_loop(
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            # 1. Dual-Group Gradient Clipping (Include encoder_weight in dictionary group)
+            # 1. Dual-Group Gradient Clipping & Grad Telemetry Extraction
             recon_keys = ("decoder_bias", "decoder_weight", "encoder_weight")
             recon_params = [
                 p for n, p in model.named_parameters()
@@ -603,6 +603,14 @@ def _train_loop(
                 torch.nn.utils.clip_grad_norm_(
                     spatial_params, max_norm=getattr(cfg, "grad_clip_spatial", 15.0)
                 )
+
+            # Extract active gradient norms BEFORE zero_grad / optimizer step clears them
+            last_grad_stats = {}
+            for p_name, p_val in model.named_parameters():
+                if p_val.grad is not None:
+                    p_clean = p_name.replace(".", "_")
+                    last_grad_stats[f"g_{p_clean}"] = float(p_val.grad.detach().norm(2).item())
+                    last_grad_stats[f"z_{p_clean}_pct"] = float((p_val.grad == 0).float().mean().item() * 100.0)
 
             # 2. Optimizer Step & Unit Sphere Normalization
             optimizer.step()
