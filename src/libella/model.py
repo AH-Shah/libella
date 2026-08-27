@@ -630,13 +630,13 @@ class LibellaGNN(nn.Module):
     def calc_spatial_loss(
         self,
         delta_h: torch.Tensor,
-        diff_sim: torch.Tensor | None,
+        edge_sign: torch.Tensor | None,
         src: torch.Tensor,
         dst: torch.Tensor,
         x_norm: torch.Tensor,
         edge_mask_float: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if src.numel() == 0 or diff_sim is None or diff_sim.numel() == 0:
+        if src.numel() == 0 or edge_sign is None or edge_sign.numel() == 0:
             return delta_h.new_zeros(())
 
         N = x_norm.size(0)
