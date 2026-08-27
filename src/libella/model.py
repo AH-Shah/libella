@@ -672,138 +672,95 @@ class LibellaGNN(nn.Module):
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
-        """Harvests parameter/gradient norms, SVD spectrum, effective rank, and correlation."""
+        """Harvests clean, unified model diagnostics and parameter statistics."""
         stats: dict[str, float] = {}
-        total_g_norm_sq = 0.0
 
         for name, param in self.named_parameters():
-            p_clean = name.replace(".", "/")
-            stats[f"param_norm/{p_clean}"] = param.detach().norm(2).item()
+            p_clean = name.replace(".", "_")
+            stats[f"p_{p_clean}"] = float(param.detach().norm(2).item())
             if param.grad is not None:
-                g_norm = param.grad.detach().norm(2).item()
-                total_g_norm_sq += g_norm**2
-                stats[f"grad_norm/{p_clean}"] = g_norm
-                stats[f"grad_zeros/{p_clean}_pct"] = (
-                    (param.grad == 0).float().mean().item() * 100.0
-                )
+                stats[f"g_{p_clean}"] = float(param.grad.detach().norm(2).item())
+                stats[f"z_{p_clean}_pct"] = float((param.grad == 0).float().mean().item() * 100.0)
 
-        stats["grad_norm/global_l2"] = total_g_norm_sq**0.5
-
+        # Dictionary telemetry
         if hasattr(self, "encoder_weight"):
-            w_enc = F.normalize(self.encoder_weight, p=2, dim=1)
-            stats["dict/encoder_norm"] = self.encoder_weight.detach().norm(2).item()
-            w_enc_cpu = w_enc.detach().cpu()
-            s_enc = torch.linalg.svdvals(w_enc_cpu)
-            stats["dict/encoder_effective_rank"] = (
-                ((s_enc.sum() ** 2) / torch.clamp((s_enc**2).sum(), min=1e-9)).item()
-            )
+            w_enc = F.normalize(self.encoder_weight, p=2, dim=-1)
+            stats["d_encoder_norm"] = float(self.encoder_weight.detach().norm(2).item())
+            s_enc = torch.linalg.svdvals(w_enc.detach().cpu())
+            stats["d_encoder_effective_rank"] = float(((s_enc.sum() ** 2) / torch.clamp((s_enc**2).sum(), min=1e-9)).item())
 
         if hasattr(self, "decoder_weight"):
-            w_dec = F.normalize(self.decoder_weight, p=2, dim=1)
-            stats["dict/decoder_norm"] = self.decoder_weight.detach().norm(2).item()
+            w_dec = F.normalize(self.decoder_weight, p=2, dim=-1)
+            stats["d_decoder_norm"] = float(self.decoder_weight.detach().norm(2).item())
 
             sim = torch.mm(w_dec, w_dec.t())
             off_diag_mask = ~torch.eye(w_dec.size(0), dtype=torch.bool, device=w_dec.device)
             off_diag_vals = sim.masked_select(off_diag_mask)
             if off_diag_vals.numel() > 0:
-                stats["dict/max_cross_corr"] = off_diag_vals.max().item()
-                stats["dict/mean_cross_corr"] = off_diag_vals.abs().mean().item()
+                stats["d_max_cross_corr"] = float(off_diag_vals.max().item())
+                stats["d_mean_cross_corr"] = float(off_diag_vals.abs().mean().item())
 
-            w_dec_cpu = w_dec.detach().cpu()
-            s_dec = torch.linalg.svdvals(w_dec_cpu)
-            eff_rank = (s_dec.sum() ** 2) / torch.clamp((s_dec**2).sum(), min=1e-9)
-            stats["dict/effective_rank"] = eff_rank.item()
-            stats["dict/svd_sigma_1"] = s_dec[0].item()
-            stats["dict/svd_sigma_2"] = s_dec[1].item() if s_dec.numel() > 1 else 0.0
-            stats["dict/svd_sigma_3"] = s_dec[2].item() if s_dec.numel() > 2 else 0.0
+            s_dec = torch.linalg.svdvals(w_dec.detach().cpu())
+            stats["d_effective_rank"] = float(((s_dec.sum() ** 2) / torch.clamp((s_dec**2).sum(), min=1e-9)).item())
+            stats["d_svd_sigma_1"] = float(s_dec[0].item())
+            stats["d_svd_sigma_2"] = float(s_dec[1].item() if s_dec.numel() > 1 else 0.0)
+            stats["d_svd_sigma_3"] = float(s_dec[2].item() if s_dec.numel() > 2 else 0.0)
 
+        # Co-activation and Jaccard metrics
         if hasattr(self, "coact_ema") and hasattr(self, "marginal_ema"):
             off_diag_coact = self.coact_ema * self.ortho_mask
-            stats["dict/coact_ema_mean"] = off_diag_coact.mean().item()
-            stats["dict/coact_ema_max"] = off_diag_coact.max().item()
+            stats["d_coact_ema_mean"] = float(off_diag_coact.mean().item())
+            stats["d_coact_ema_max"] = float(off_diag_coact.max().item())
 
             m_i = self.marginal_ema.unsqueeze(1)
             m_j = self.marginal_ema.unsqueeze(0)
             union_p = torch.clamp(m_i + m_j - self.coact_ema, min=1e-5)
             jaccard_mat = (self.coact_ema / union_p) * self.ortho_mask
-            stats["dict/jaccard_ema_mean"] = jaccard_mat.mean().item()
-            stats["dict/jaccard_ema_max"] = jaccard_mat.max().item()
+            stats["d_jaccard_ema_mean"] = float(jaccard_mat.mean().item())
+            stats["d_jaccard_ema_max"] = float(jaccard_mat.max().item())
 
-        # Untied Encoder-Decoder Feature Alignment Telemetry
+        # Encoder-Decoder Alignment
         if hasattr(self, "encoder_weight") and hasattr(self, "decoder_weight"):
-            w_enc = F.normalize(self.encoder_weight, p=2, dim=1)
-            w_dec = F.normalize(self.decoder_weight, p=2, dim=1)
+            w_enc = F.normalize(self.encoder_weight, p=2, dim=-1)
+            w_dec = F.normalize(self.decoder_weight, p=2, dim=-1)
             align_cos = (w_enc * w_dec).sum(dim=-1)
-            
-            stats["dict/alignment_mean"] = align_cos.mean().item()
-            stats["dict/alignment_min"] = align_cos.min().item()
-            
+            stats["d_alignment_mean"] = float(align_cos.mean().item())
+            stats["d_alignment_min"] = float(align_cos.min().item())
             quantiles = torch.quantile(align_cos, torch.tensor([0.10, 0.90], device=align_cos.device))
-            stats["dict/alignment_p10"] = quantiles[0].item()
-            stats["dict/alignment_p90"] = quantiles[1].item()
+            stats["d_alignment_p10"] = float(quantiles[0].item())
+            stats["d_alignment_p90"] = float(quantiles[1].item())
 
-        dead_count = (self.steps_since_active >= self.dead_step_threshold).sum().item()
-        stats["latents/dead_count"] = float(dead_count)
-        stats["latents/active_pct"] = (1.0 - (dead_count / self.n_latents)) * 100.0
-
-        # SignGT, ACMP, Spatial Gain, Delta Ratio, and CSNN Telemetry
+        # Topology and Differential Attention
         if hasattr(self, "last_spatial_delta_ratio"):
-            stats["spatial/delta_ratio"] = self.last_spatial_delta_ratio.item()
+            stats["spatial_delta_ratio"] = float(self.last_spatial_delta_ratio.item())
         if hasattr(self, "spatial_gain"):
             alpha_max = float(getattr(cfg, "spatial_alpha_max", 0.40))
-            stats["spatial/alpha_max"] = alpha_max
-            stats["spatial/gain_raw"] = self.spatial_gain.item()
-            stats["spatial/effective_gain"] = (torch.sigmoid(self.spatial_gain) * alpha_max).item()
+            stats["spatial_alpha_max"] = alpha_max
+            stats["spatial_gain_raw"] = float(self.spatial_gain.item())
+            stats["spatial_effective_gain"] = float((torch.sigmoid(self.spatial_gain) * alpha_max).item())
         if hasattr(self, "sign_tau"):
-            stats["sign_gt/tau_effective"] = (F.softplus(self.sign_tau) + 1e-3).item()
-            stats["sign_gt/tau_raw"] = self.sign_tau.item()
+            stats["sign_gt_tau_effective"] = float((F.softplus(self.sign_tau) + 1e-3).item())
+            stats["sign_gt_tau_raw"] = float(self.sign_tau.item())
         if hasattr(self, "ac_delta"):
-            stats["acmp/delta_effective"] = (torch.sigmoid(self.ac_delta) * 0.8).item()
-            stats["acmp/delta_raw"] = self.ac_delta.item()
-        if hasattr(self, "listen_gate"):
-            gate_w_listen = self.listen_gate.weight.detach()
-            gate_w_broad = self.broadcast_gate.weight.detach()
-            stats["csnn/listen_gate_norm"] = gate_w_listen.norm(2).item()
-            stats["csnn/broadcast_gate_norm"] = gate_w_broad.norm(2).item()
-        if hasattr(self, "qwen_gate"):
-            stats["qwen/gate_norm"] = self.qwen_gate.weight.detach().norm(2).item()
+            stats["acmp_delta_effective"] = float((torch.sigmoid(self.ac_delta) * 0.8).item())
+            stats["acmp_delta_raw"] = float(self.ac_delta.item())
         if hasattr(self, "lambda_q1") and hasattr(self, "lambda_k1"):
             lambda_val = (
                 torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
                 - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
                 + self.lambda_init
             ).item()
-            stats["diff_attn/lambda_effective"] = lambda_val
+            stats["diff_attn_lambda_effective"] = float(lambda_val)
 
-        # Cosine Scoring, Safe-Padé & LaPrune Exact Telemetry
+        # Padé and Latent Routing
         if hasattr(self, "b_scale"):
-            stats["softsae/b_scale_mean"] = self.b_scale.mean().item()
-            stats["softsae/b_enc_mean"] = self.b_enc.mean().item()
+            stats["softsae_b_scale_mean"] = float(self.b_scale.mean().item())
+            stats["softsae_b_enc_mean"] = float(self.b_enc.mean().item())
         if hasattr(self, "pade_gate"):
-            stats["rsae/pade_p_norm"] = self.pade_gate.p_coeffs.norm(2).item()
-            stats["rsae/pade_q_norm"] = self.pade_gate.q_coeffs.norm(2).item()
-            stats["rsae/pade_p0"] = self.pade_gate.p_coeffs[0].item()
-            stats["rsae/pade_q0"] = self.pade_gate.q_coeffs[0].item()
-
-            # Dynamic Padé Monotonicity Audit (1D Grid over [0, 10])
-            with torch.enable_grad():
-                s_grid = torch.linspace(
-                    0.0, 10.0, 500, device=self.pade_gate.p_coeffs.device, requires_grad=True
-                )
-                y_grid = self.pade_gate(s_grid)
-                dy_ds = torch.autograd.grad(y_grid.sum(), s_grid)[0]
-
-                neg_mask = dy_ds < 0.0
-                stats["pade/rank_inversion_pct"] = float(neg_mask.float().mean().item() * 100.0)
-                stats["pade/derivative_min"] = float(dy_ds.min().item())
-                stats["pade/output_min"] = float(y_grid.min().item())
-                stats["pade/output_max"] = float(y_grid.max().item())
-
-                # Explicitly clean up autograd computation graph
-                del s_grid, y_grid, dy_ds, neg_mask
-
-        if hasattr(self, "laprune_gamma"):
-            gamma_scale = float(getattr(self, "current_gamma_progress", 1.0))
-            stats["laprune/gamma_effective"] = float(self.laprune_gamma) * gamma_scale
+            stats["rsae_pade_p_norm"] = float(self.pade_gate.p_coeffs.norm(2).item())
+            stats["rsae_pade_q_norm"] = float(self.pade_gate.q_coeffs.norm(2).item())
+            stats["rsae_pade_p0"] = float(self.pade_gate.p_coeffs[0].item())
+            stats["rsae_pade_q0"] = float(self.pade_gate.q_coeffs[0].item())
 
         return stats
+        
