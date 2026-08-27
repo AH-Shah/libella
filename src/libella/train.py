@@ -591,7 +591,6 @@ def _train_loop(
                     spatial_params, max_norm=getattr(cfg, "grad_clip_spatial", 15.0)
                 )
 
-            # Extract active gradient norms BEFORE zero_grad / optimizer step clears them
             last_grad_stats = {}
             for p_name, p_val in model.named_parameters():
                 if p_val.grad is not None:
@@ -656,25 +655,21 @@ def _train_loop(
         current_l0 = epoch_telemetry.get("l0_avg", 0.0)
         current_dead = int(epoch_telemetry.get("dead_cnt", 0))
 
-        # Harvest deep telemetry and merge into epoch_telemetry for PhaseTracker PID governor
         deep_stats = model.get_deep_telemetry()
         epoch_telemetry.update(deep_stats)
 
-        # --- Multimodal Robust Pareto Composite Score ---
         current_recon = epoch_telemetry.get("l_rec", float("inf"))
 
         target_k = float(getattr(model, "target_k", 38.0))
         k_error_ratio = abs(current_l0 - target_k) / max(1.0, target_k)
         phi_budget = 1.0 + 1.5 * k_error_ratio
 
-        # 3. Schedule Completion Gate (Governor Alignment)
-        # Heavily penalizes checkpoints taken before max squeeze and spatial warmups are finished.
-        # This mathematically forces the "best" model to be selected from the soak phase.
+        # 3. Schedule Completion Gate
         squeeze_deficit = max(0.0, 1.0 - epoch_schedules["squeeze_progress"])
         spatial_deficit = max(0.0, 1.0 - epoch_schedules["spatial_progress"])
         phi_schedule = 1.0 + 10.0 * (squeeze_deficit + spatial_deficit)
 
-        # 4. Dictionary Health (Dead Latents)
+        # 4. Dictionary Health
         dead_ratio = float(current_dead) / float(model.n_latents)
         phi_dict = 1.0 + 2.0 * dead_ratio
 
@@ -778,10 +773,8 @@ def _train_loop(
             **deep_stats,
         }
 
-        # Log flat metrics once per epoch
         logger.log_metrics(epoch, unified_epoch_log)
 
-        # Only capture Pareto best checkpoints during the Soak Phase (Max Squeeze) or final epoch
         if (epoch_schedules["squeeze_progress"] >= 1.0 or epoch == total_epochs - 1) and composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
             torch.save(
