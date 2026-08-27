@@ -403,7 +403,7 @@ def _train_loop(
                     delta_h,
                     z_canonical,
                     routed_scores,
-                    diff_sim,
+                    edge_sign,
                 ) = model(x, src, dst, weights)
 
                 last_r_pos = r_pos
@@ -452,7 +452,7 @@ def _train_loop(
                 if len(src) > 0 and delta_h is not None and spatial_progress > 0.0:
                     x_norm = F.normalize(x, p=2, dim=-1)
                     l_spatial_rel = model.calc_spatial_loss(
-                        delta_h, diff_sim, src, dst, x_norm, edge_mask_float=edge_mask_float
+                        delta_h, edge_sign, src, dst, x_norm, edge_mask_float=edge_mask_float
                     )
                     spatial_loss_weight = getattr(cfg, "spatial_loss_weight", 15.0) * spatial_progress
                     spatial_loss_val = spatial_loss_weight * l_spatial_rel
@@ -565,7 +565,7 @@ def _train_loop(
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
 
-                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores, diff_sim
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores, edge_sign
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
