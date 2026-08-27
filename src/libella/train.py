@@ -116,17 +116,13 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
 
 def prefetch_batches(
     meta_batches: list[list[dict[str, Any]]]
-) -> Iterator[tuple[list[dict[str, Any]], list[Any]]]:
-    """Direct synchronous loader: 0 threads, 0 locks, 0 deadlocks on Apple Silicon."""
+) -> Iterator[list[dict[str, Any]]]:
+    """Direct synchronous generator: yields meta-batch chunk descriptors without loading tensors."""
     if not meta_batches:
         return
 
     for meta_meta in meta_batches:
-        chunks = []
-        for b in meta_meta:
-            chunk = torch.load(b["chunk_file"], map_location="cpu", weights_only=False)
-            chunks.append(chunk)
-        yield meta_meta, chunks
+        yield meta_meta
 
 
 
@@ -139,13 +135,16 @@ def init_decoder_bias_from_data(
 ) -> None:
     """Initializes decoder_bias directly to the empirical cell-normalized mean of real core cells (CPU-resident)."""
     model.eval()
-    # Compute on CPU to prevent MPS asynchronous indexing and memory-race crashes
     total_normed = torch.zeros(model.in_channels, dtype=torch.float32, device="cpu")
     total_samples = 0
     meta_batches = make_meta_batches(training_cache, meta_batch_size=batch_size)
 
-    for meta_meta, chunk_iter in prefetch_batches(meta_batches):
-        for batch_ref, batch in zip(meta_meta, chunk_iter):
+    for meta_meta in prefetch_batches(meta_batches):
+        # Support both tuple/list yields and direct meta_meta generator
+        batch_refs = meta_meta[0] if isinstance(meta_meta, tuple) else meta_meta
+
+        for batch_ref in batch_refs:
+            batch = torch.load(batch_ref["chunk_file"], map_location="cpu", weights_only=False)
             x_cpu = batch["x"].detach().to(device="cpu", dtype=torch.float32)
             
             # Extract core indices safely on CPU with explicit int64 casting
@@ -166,12 +165,13 @@ def init_decoder_bias_from_data(
                 total_normed += (x_core / cell_mass).sum(dim=0)
                 total_samples += x_core.size(0)
 
+            del batch, x_cpu, core_idx, train_idx
+
     if total_samples > 0:
         empirical_mean = (total_normed / total_samples).to(device=device)
         model.decoder_bias.data.copy_(empirical_mean)
         print(f"  ↳ Initialized decoder_bias to empirical mean (L2 norm: {model.decoder_bias.norm(2).item():.4f}, across {total_samples} core cells)")
     model.train()
-
 
 def _init_model(
     common_genes: list[str],
@@ -311,30 +311,29 @@ def _train_loop(
         train_steps, val_steps = 0, 0
         train_chunk_count = 0
 
-        # GPU-resident telemetry accumulator buffers
-        train_loss_acc = torch.tensor(0.0, device=device)
-        val_loss_acc = torch.tensor(0.0, device=device)
+        train_loss_acc = 0.0
+        val_loss_acc = 0.0
 
-        gpu_telemetry = {
-            "l_rec": torch.tensor(0.0, device=device),
-            "l_ort": torch.tensor(0.0, device=device),
-            "l_budget": torch.tensor(0.0, device=device),
-            "l_aux": torch.tensor(0.0, device=device),
-            "l_align": torch.tensor(0.0, device=device),
-            "l_gate_sparse": torch.tensor(0.0, device=device),
-            "l_spatial": torch.tensor(0.0, device=device),
-            "k_pred_mean": torch.tensor(0.0, device=device),
-            "a_ij_mean": torch.tensor(0.0, device=device),
-            "a_ij_density": torch.tensor(0.0, device=device),
-            "shift_mag": torch.tensor(0.0, device=device),
-            "csnn_listen": torch.tensor(0.0, device=device),
-            "csnn_broadcast": torch.tensor(0.0, device=device),
-            "l0_avg": torch.tensor(0.0, device=device),
-            "dead_cnt": torch.tensor(0.0, device=device),
-            "max_act": torch.tensor(0.0, device=device),
-            "dyn_w": torch.tensor(0.0, device=device),
-            "z_mag_mean": torch.tensor(0.0, device=device),
-            "cell_mass_mean": torch.tensor(0.0, device=device),
+        epoch_telemetry_acc = {
+            "l_rec": 0.0,
+            "l_ort": 0.0,
+            "l_budget": 0.0,
+            "l_aux": 0.0,
+            "l_align": 0.0,
+            "l_gate_sparse": 0.0,
+            "l_spatial": 0.0,
+            "k_pred_mean": 0.0,
+            "a_ij_mean": 0.0,
+            "a_ij_density": 0.0,
+            "shift_mag": 0.0,
+            "csnn_listen": 0.0,
+            "csnn_broadcast": 0.0,
+            "l0_avg": 0.0,
+            "dead_cnt": 0.0,
+            "max_act": 0.0,
+            "dyn_w": 0.0,
+            "z_mag_mean": 0.0,
+            "cell_mass_mean": 0.0,
         }
 
         meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
@@ -346,13 +345,19 @@ def _train_loop(
         ema_latent_freq = None
         nan_detected = False
 
-        for step, (meta_meta, chunk_iter) in enumerate(prefetch_batches(meta_batches)):
+        for step, meta_meta in enumerate(prefetch_batches(meta_batches)):
+            # Robust to both direct list or tuple yields
+            batch_refs = meta_meta[0] if isinstance(meta_meta, tuple) else meta_meta
+
             optimizer.zero_grad(set_to_none=True)
             current_step_loss = 0.0
             last_r_pos = None
             last_dead_mask = None
+            num_accum = len(batch_refs)
 
-            for chunk_idx, (batch_ref, batch) in enumerate(zip(meta_meta, chunk_iter)):
+            for chunk_idx, batch_ref in enumerate(batch_refs):
+                batch = torch.load(batch_ref["chunk_file"], map_location="cpu", weights_only=False)
+
                 x = batch["x"].to(device=device, non_blocking=True)
                 src = batch["src"].to(device=device, non_blocking=True)
                 dst = batch["dst"].to(device=device, non_blocking=True)
@@ -474,15 +479,15 @@ def _train_loop(
                     nan_detected = True
                     break
 
-                (true_batch_loss / len(meta_meta)).backward()
+                (true_batch_loss / num_accum).backward()
 
-                current_step_loss += true_batch_loss.detach().item() / len(meta_meta)
-                train_loss_acc += true_batch_loss.detach()
+                current_step_loss += true_batch_loss.detach().item() / num_accum
+                train_loss_acc += true_batch_loss.detach().item()
                 train_steps += 1
 
-                # 3. GPU Telemetry Tracking
                 with torch.no_grad():
-                    batch_active = (z_train > 0.01).float()
+                    z_det = z_train.detach()
+                    batch_active = (z_det > 0.01).float()
                     current_freq = batch_active.mean(dim=0)
 
                     if ema_latent_freq is None:
@@ -491,38 +496,42 @@ def _train_loop(
                         ema_latent_freq.lerp_(current_freq, weight=alpha_ema)
 
                     dead_count_val = (
-                        (model.steps_since_active >= model.dead_step_threshold).float().sum()
+                        float((model.steps_since_active >= model.dead_step_threshold).sum().item())
                         if hasattr(model, "steps_since_active")
-                        else torch.tensor(0.0, device=device)
+                        else 0.0
                     )
 
                     if len(src) > 0 and A_ij is not None:
-                        gpu_telemetry["a_ij_mean"] += A_ij.mean()
-                        gpu_telemetry["a_ij_density"] += (A_ij.abs() > 0.01).float().mean()
+                        a_det = A_ij.detach()
+                        epoch_telemetry_acc["a_ij_mean"] += float(a_det.mean().item())
+                        epoch_telemetry_acc["a_ij_density"] += float((a_det.abs() > 0.01).float().mean().item())
+                        del a_det
 
                     if spatial_context is not None:
-                        gpu_telemetry["shift_mag"] += spatial_context.abs().mean()
+                        epoch_telemetry_acc["shift_mag"] += float(spatial_context.detach().abs().mean().item())
 
                     if model.last_listen_prob is not None and model.last_broadcast_prob is not None:
-                        gpu_telemetry["csnn_listen"] += model.last_listen_prob[train_idx].mean()
-                        gpu_telemetry["csnn_broadcast"] += model.last_broadcast_prob[train_idx].mean()
+                        epoch_telemetry_acc["csnn_listen"] += float(model.last_listen_prob[train_idx].detach().mean().item())
+                        epoch_telemetry_acc["csnn_broadcast"] += float(model.last_broadcast_prob[train_idx].detach().mean().item())
 
-                    gpu_telemetry["l_rec"] += base_recon_val
-                    gpu_telemetry["l_ort"] += base_ort_val
-                    gpu_telemetry["l_budget"] += base_budget_val
-                    gpu_telemetry["l_aux"] += base_aux_val
-                    gpu_telemetry["l_align"] += base_align_val
-                    gpu_telemetry["l_gate_sparse"] += base_gate_sparse_val
-                    gpu_telemetry["l_spatial"] += l_spatial_rel.detach()
+                    epoch_telemetry_acc["l_rec"] += float(base_recon_val.item())
+                    epoch_telemetry_acc["l_ort"] += float(base_ort_val.item())
+                    epoch_telemetry_acc["l_budget"] += float(base_budget_val.item())
+                    epoch_telemetry_acc["l_aux"] += float(base_aux_val.item())
+                    epoch_telemetry_acc["l_align"] += float(base_align_val.item())
+                    epoch_telemetry_acc["l_gate_sparse"] += float(base_gate_sparse_val.item())
+                    epoch_telemetry_acc["l_spatial"] += float(l_spatial_rel.item())
                     if k_i_train is not None:
-                        gpu_telemetry["k_pred_mean"] += k_i_train.detach().mean()
-                    gpu_telemetry["l0_avg"] += batch_active.sum(dim=-1).mean()
-                    gpu_telemetry["dead_cnt"] += dead_count_val
-                    gpu_telemetry["max_act"] += z_train.max()
-                    gpu_telemetry["dyn_w"] += model.dynamic_w_ema.detach()
-                    gpu_telemetry["z_mag_mean"] += z_train.detach().mean()
+                        epoch_telemetry_acc["k_pred_mean"] += float(k_i_train.detach().mean().item())
+                    epoch_telemetry_acc["l0_avg"] += float(batch_active.sum(dim=-1).mean().item())
+                    epoch_telemetry_acc["dead_cnt"] += dead_count_val
+                    epoch_telemetry_acc["max_act"] += float(z_det.max().item())
+                    epoch_telemetry_acc["dyn_w"] += float(model.dynamic_w_ema.item())
+                    epoch_telemetry_acc["z_mag_mean"] += float(z_det.mean().item())
                     if cell_mass is not None:
-                        gpu_telemetry["cell_mass_mean"] += cell_mass[train_idx].detach().mean()
+                        epoch_telemetry_acc["cell_mass_mean"] += float(cell_mass[train_idx].detach().mean().item())
+
+                    del z_det, batch_active, current_freq
 
                 train_chunk_count += 1
                 if len(src) > 0:
@@ -530,6 +539,10 @@ def _train_loop(
                 if len(src_loss) > 0 and delta_h is not None and spatial_progress > 0.0:
                     del x_norm
                 del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, routed_scores_train, base_sae_loss, base_align_val, true_batch_loss, src_loss, dst_loss, A_ij_loss, edge_sign_loss, l_spatial_rel, spatial_loss_val
+
+                # Release live autograd graph pointers held on model instance
+                model.last_listen_prob = None
+                model.last_broadcast_prob = None
 
                 # Validation Evaluation
                 val_core_idx_cpu = batch.get("val_core_idx")
@@ -560,7 +573,7 @@ def _train_loop(
                         per_cell_loss_val = torch.sum(variance_weight_val * (stable_log_cosh_val + peak_penalty_val), dim=-1)
                         val_recon_loss = torch.mean(per_cell_loss_val) / math.sqrt(x_val.shape[-1])
 
-                        val_loss_acc += val_recon_loss.detach()
+                        val_loss_acc += val_recon_loss.detach().item()
                         val_steps += 1
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
@@ -613,13 +626,16 @@ def _train_loop(
                 }
                 logger.log_metrics(global_step, step_metrics)
 
+            if device.type == "mps":
+                torch.mps.empty_cache()
+
         if nan_detected:
             print(f"\n  ↳ [!] NaN gradient detected at Epoch {epoch}. Halting training.")
             break
 
         # Epoch Synchronization
-        history["train_loss"].append((train_loss_acc / (train_steps + 1e-9)).item())
-        history["val_loss"].append((val_loss_acc / (val_steps + 1e-9)).item())
+        history["train_loss"].append(train_loss_acc / (train_steps + 1e-9))
+        history["val_loss"].append(val_loss_acc / (val_steps + 1e-9))
 
         scheduler.step()
         gc.collect()
@@ -627,8 +643,8 @@ def _train_loop(
         # Telemetry Resolution
         epoch_telemetry = {}
         if train_chunk_count > 0:
-            for k, v in gpu_telemetry.items():
-                epoch_telemetry[k] = (v / train_chunk_count).item()
+            for k, val in epoch_telemetry_acc.items():
+                epoch_telemetry[k] = val / train_chunk_count
 
             current_l0_val = epoch_telemetry.get("l0_avg", float(model.n_latents))
             epoch_telemetry["p_w"] = (1.0 - (current_l0_val / float(model.n_latents))) * 100.0
@@ -654,34 +670,26 @@ def _train_loop(
         # 1. Base Generalization Anchor (Validation Loss)
         val_recon = history["val_loss"][-1]
 
-        # 2. Target Sparsity Compliance (Penalize deviation from Target-K)
+        # 2. Strict Target Sparsity Compliance (Linear Penalty)
+        # Replaces the weak squared penalty. A strong linear penalty prevents the network 
+        # from "buying" a lower val_loss by inflating L0 early in Phase 2.
         target_k = float(getattr(model, "target_k", 38.0))
         k_error_ratio = abs(current_l0 - target_k) / max(1.0, target_k)
-        phi_budget = 1.0 + 0.50 * (k_error_ratio ** 2)
+        phi_budget = 1.0 + 5.0 * k_error_ratio
 
-        # 3. Dictionary Health & Non-Redundancy (Dead Latents & Max Twin Correlation)
+        # 3. Schedule Completion Gate (Governor Alignment)
+        # Heavily penalizes checkpoints taken before max squeeze and spatial warmups are finished.
+        # This mathematically forces the "best" model to be selected from the soak phase.
+        squeeze_deficit = max(0.0, 1.0 - epoch_schedules["squeeze_progress"])
+        spatial_deficit = max(0.0, 1.0 - epoch_schedules["spatial_progress"])
+        phi_schedule = 1.0 + 10.0 * (squeeze_deficit + spatial_deficit)
+
+        # 4. Dictionary Health (Dead Latents)
         dead_ratio = float(current_dead) / float(model.n_latents)
-        max_corr = float(deep_stats.get("dict/max_cross_corr", 0.0))
-        twin_excess = max(0.0, max_corr - 0.55)
-        phi_dict = (1.0 + 2.0 * dead_ratio) * (1.0 + 5.0 * (twin_excess ** 2))
-
-        # 4. Encoder-Decoder Alignment Tether
-        align_mean = float(deep_stats.get("dict/alignment_mean", 1.0))
-        align_deficit = max(0.0, 0.85 - align_mean)
-        phi_align = 1.0 + 2.0 * align_deficit
-
-        # 5. Spatial GNN Residual Stability (Expect healthy delta ratio in [0.15, 0.75])
-        delta_ratio = float(deep_stats.get("spatial/delta_ratio", 0.45))
-        spatial_collapse = max(0.0, 0.15 - delta_ratio)
-        spatial_explosion = max(0.0, delta_ratio - 0.75)
-        phi_spatial = 1.0 + 1.5 * (spatial_collapse + spatial_explosion)
-
-        # 6. Padé Numerical Monotonicity
-        pade_inv = float(deep_stats.get("pade/rank_inversion_pct", 0.0))
-        phi_pade = 1.0 + 0.02 * pade_inv
+        phi_dict = 1.0 + 2.0 * dead_ratio
 
         # Unified Multiplicative Pareto Composite Score
-        composite_score = val_recon * phi_budget * phi_dict * phi_align * phi_spatial * phi_pade
+        composite_score = val_recon * phi_budget * phi_schedule * phi_dict
 
         epoch_metrics = {
             "epoch": epoch,
@@ -692,10 +700,8 @@ def _train_loop(
             "composite_score": round(composite_score, 4),
             "composite_factors": {
                 "phi_budget": round(phi_budget, 4),
+                "phi_schedule": round(phi_schedule, 4),
                 "phi_dict": round(phi_dict, 4),
-                "phi_align": round(phi_align, 4),
-                "phi_spatial": round(phi_spatial, 4),
-                "phi_pade": round(phi_pade, 4),
             },
             "loss_components": {
                 "rec": round(current_rec, 4),
@@ -739,7 +745,14 @@ def _train_loop(
                 "target_k": target_k,
             },
         }
+        # Keep only the last 5 epochs in RAM history to prevent long-run heap inflation
         history.setdefault("autopsy_metrics", []).append(epoch_metrics)
+        if len(history["autopsy_metrics"]) > 5:
+            history["autopsy_metrics"].pop(0)
+
+        # Flush logger backend to disk
+        if hasattr(logger, "flush"):
+            logger.flush()
 
         epoch_log = {
             "epoch/train_loss": history["train_loss"][-1],
@@ -747,9 +760,7 @@ def _train_loop(
             "epoch/composite_score": composite_score,
             "composite/phi_budget": phi_budget,
             "composite/phi_dict": phi_dict,
-            "composite/phi_align": phi_align,
-            "composite/phi_spatial": phi_spatial,
-            "composite/phi_pade": phi_pade,
+            "composite/phi_schedule": phi_schedule,
             "loss/recon": epoch_telemetry.get("l_rec", 0.0),
             "loss/ort": epoch_telemetry.get("l_ort", 0.0),
             "loss/budget": epoch_telemetry.get("l_budget", 0.0),
@@ -779,8 +790,8 @@ def _train_loop(
         logger.log_metrics(epoch, epoch_log)
         logger.log_model_telemetry(epoch, model, log_histograms=False)
 
-        # Only capture Pareto best checkpoints during Phase 2 (Hard Sparsity) or final epoch
-        if (tracker.phase == 2 or epoch == total_epochs - 1) and composite_score < best_composite_score and not nan_detected:
+        # Only capture Pareto best checkpoints during the Soak Phase (Max Squeeze) or final epoch
+        if (epoch_schedules["squeeze_progress"] >= 1.0 or epoch == total_epochs - 1) and composite_score < best_composite_score and not nan_detected:
             best_composite_score = composite_score
             torch.save(
                 {

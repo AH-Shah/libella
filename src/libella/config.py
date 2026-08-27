@@ -39,7 +39,7 @@ class RunConfig:
     k_hops: int = 2
     n_prior_lineages: int = 30
     n_dict_components: int = 100
-    n_latents: int | None = 128
+    n_latents: int | None = 256
     extra_topics: int = 0
 
     # Training & Batches

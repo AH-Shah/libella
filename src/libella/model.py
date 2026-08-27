@@ -29,7 +29,7 @@ class LibellaGNN(nn.Module):
         # Limit dynamic budget bounds to [0.5x, 1.5x] of K goal
         self.min_k = 0.5 * self.target_k
         self.max_k = 1.5 * self.target_k
-        self.laprune_gamma = float(getattr(cfg, "laprune_gamma", 0.90))
+        self.laprune_gamma = float(getattr(cfg, "laprune_gamma", 0.95))
 
         # SoftSAE Dynamic Sparsity & Cosine Scoring Parameterization
         self.k_predictor = nn.Sequential(
@@ -171,7 +171,7 @@ class LibellaGNN(nn.Module):
             gamma_effective = max(0.05, self.laprune_gamma * gamma_scale)
             soft_mask = ExactLaPruneFunction.apply(laprune_inputs, k_i_float, gamma_effective)
             # Safe-Padé rational pre-conditioner with ReLU positivity guard
-            z_canonical = F.relu(self.pade_gate(bio_scores)- 1e-4) * soft_mask
+            z_canonical = F.relu(self.pade_gate(bio_scores)) * soft_mask
         else:
             k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
             # Double-argsort guarantees EXACTLY K non-zeros by breaking ties deterministically
@@ -183,7 +183,7 @@ class LibellaGNN(nn.Module):
         H_0 = torch.tanh(bio_scores)
         
         # Spatial Gradient Firewall: Passes forward activations, throttles backward gradients into SAE to 5%
-        rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.2)
+        rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.05)
         H_0_spatial = H_0.detach() + rho_spatial * (H_0 - H_0.detach())
 
         if len(src) > 0:
@@ -224,7 +224,7 @@ class LibellaGNN(nn.Module):
                     self.last_a_ij_mean.copy_(A_ij.mean())
 
             H_k = H_0_spatial
-            delta = torch.sigmoid(self.ac_delta) * 0.45
+            delta = torch.sigmoid(self.ac_delta) * 0.8
             eta = 0.5  # Explicit Euler step size to prevent overshooting
 
             for _ in range(self.k_hops):
@@ -234,10 +234,12 @@ class LibellaGNN(nn.Module):
                 W_edge = A_ij * g_broadcast[src] * g_listen[dst]
 
                 msg = W_edge * (H_k[src] - H_k[dst])
-                laplacian_agg = torch.zeros_like(H_k)
+
+                # ALLOCATE FRESH INSIDE THE LOOP
+                laplacian_agg = torch.zeros_like(H_0_spatial)
                 laplacian_agg.index_add_(0, dst, msg)
 
-                ac_force = H_k * (1.0 - H_k**2)
+                ac_force = H_k * (1.0 - H_k.square())
                 H_k = torch.tanh(H_k + eta * laplacian_agg + delta * ac_force)
 
             # Track gate probabilities for L1 sparsity regularizer
@@ -391,35 +393,38 @@ class LibellaGNN(nn.Module):
         if self.training:
             with torch.no_grad():
                 # Use top-K indices from raw scores to determine genuine usage
-                k_track = k_i_float.round().clamp(1, self.n_latents).long()
-                sorted_scores, _ = torch.sort(bio_scores, dim=-1, descending=True)
+                k_track = k_i_float.detach().round().clamp(1, self.n_latents).long()
+                sorted_scores, _ = torch.sort(bio_scores.detach(), dim=-1, descending=True)
                 hard_thresh = torch.gather(sorted_scores, dim=1, index=k_track - 1)
-                active_in_batch = (bio_scores >= hard_thresh).any(dim=0)
+                active_in_batch = (bio_scores.detach() >= hard_thresh).any(dim=0)
 
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
-                dead_mask_ret = self.steps_since_active >= self.dead_step_threshold
+                dead_mask_ret = (self.steps_since_active >= self.dead_step_threshold).detach()
 
-            x_norm = F.normalize(x_dense, p=2, dim=-1)
-            x_recon_norm = F.normalize(F.relu(x_recon) + 1e-6, p=2, dim=-1)
-            r_pos = F.relu(x_norm - x_recon_norm)
-            r_pos_ret = r_pos.detach()
-            r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1).detach()
-            residual_energy = r_pos.norm(p=2, dim=-1).mean()
+                x_norm = F.normalize(x_dense.detach(), p=2, dim=-1)
+                x_recon_norm = F.normalize(F.relu(x_recon.detach()) + 1e-6, p=2, dim=-1)
+                r_pos = F.relu(x_norm - x_recon_norm)
+                r_pos_ret = r_pos
+                r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1)
+                residual_energy = r_pos.norm(p=2, dim=-1).mean()
 
             if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
-                dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
-                num_dead = dead_indices.numel()
-                k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
+                with torch.no_grad():
+                    dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
+                    num_dead = dead_indices.numel()
+                    k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
 
-                w_dead = w_dec_norm[dead_indices]
-                aux_sim = torch.mm(r_norm, w_dead.t())
-                aux_scores = torch.exp(self.b_scale[dead_indices]) * aux_sim + self.b_enc[dead_indices]
-                topk_res = torch.topk(aux_scores, k=k_aux, dim=-1)
+                    w_dead = w_dec_norm[dead_indices].detach()
+                    aux_sim = torch.mm(r_norm, w_dead.t())
+                    aux_scores = torch.exp(self.b_scale[dead_indices]) * aux_sim + self.b_enc[dead_indices]
+                    topk_res = torch.topk(aux_scores, k=k_aux, dim=-1)
 
-                z_aux_weights = F.relu(topk_res.values)
-                z_aux = torch.zeros_like(aux_scores).scatter(-1, topk_res.indices, z_aux_weights)
-                aux_recon = torch.mm(z_aux, w_dead)
+                    z_aux_weights = F.relu(topk_res.values)
+                    z_aux = torch.zeros_like(aux_scores).scatter_(-1, topk_res.indices, z_aux_weights)
+                    aux_recon = torch.mm(z_aux, w_dead)
+
+                    del dead_indices, w_dead, aux_sim, aux_scores, topk_res, z_aux_weights, z_aux
 
         return (
             x_recon,
@@ -460,23 +465,24 @@ class LibellaGNN(nn.Module):
         x_full: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
-        is_non_zero = x_true > 0
+        is_non_zero = (x_true > 0).detach()
         num_pos = torch.clamp(is_non_zero.float().sum(), min=1.0)
         num_zeros = (x_true == 0).float().sum()
         current_dynamic_w = (num_zeros / num_pos).detach()
 
         if self.training:
-            self.dynamic_w_ema.lerp_(
-                current_dynamic_w, weight=getattr(cfg, "dynamic_w_ema_weight", 0.10)
-            )
+            with torch.no_grad():
+                self.dynamic_w_ema.lerp_(
+                    current_dynamic_w, weight=getattr(cfg, "dynamic_w_ema_weight", 0.10)
+                )
 
-        w_mat = torch.where(is_non_zero, self.dynamic_w_ema, 1.0)
-        variance_weight = w_mat * (1.0 + torch.log1p(x_true))
-        variance_weight = variance_weight / torch.clamp(variance_weight.mean(), min=1e-5)
+        w_mat = torch.where(is_non_zero, self.dynamic_w_ema.detach(), 1.0)
+        variance_weight = (w_mat * (1.0 + torch.log1p(x_true))).detach()
+        variance_weight = (variance_weight / torch.clamp(variance_weight.mean(), min=1e-5)).detach()
 
         raw_delta = recon_x - x_true
         asym_penalty = getattr(cfg, "asym_penalty_weight", 0.50)
-        asym_factor = 1.0 + (is_non_zero.float() * asym_penalty) * (raw_delta < 0).float()
+        asym_factor = (1.0 + (is_non_zero.float() * asym_penalty) * (raw_delta.detach() < 0).float()).detach()
 
         delta_clamp = getattr(cfg, "delta_clamp", 30.0)
         scaled_delta = torch.clamp(raw_delta * asym_factor, min=-delta_clamp, max=delta_clamp)
@@ -554,10 +560,23 @@ class LibellaGNN(nn.Module):
 
         l_ortho = l_ortho_mean + l_ortho_max
 
-        # 4. Batch-Mean Quadratic K-Budget Loss (Penalizes batch-level deviation, allows per-cell variance)
+        # 4. Phase-Gated Asymmetric Charbonnier K-Budget Loss
         if k_i_float is not None:
             mean_k = k_i_float.mean()
-            l_budget = (mean_k - self.target_k).pow(2) / self.target_k
+            k_err = mean_k - self.target_k
+            
+            # 1. Asymmetric Multiplier
+            asym_factor = torch.where(k_err > 0, 2.0, 1.0)
+            
+            # 2. Charbonnier / Smoothed L1 Penalty
+            eps = 0.1
+            smooth_l1 = torch.sqrt(k_err.pow(2) + eps**2) - eps
+            
+            # 3. Dynamic Phase Pressure
+            squeeze = getattr(self, "current_progress", 1.0)
+            pressure = 1.0 + 9.0 * squeeze
+            
+            l_budget = (asym_factor * smooth_l1 * pressure) / self.target_k
         else:
             l_budget = torch.tensor(0.0, device=x_true.device)
 
@@ -580,7 +599,7 @@ class LibellaGNN(nn.Module):
         aux_weight = getattr(cfg, "aux_weight", 0.50)
         budget_weight = getattr(cfg, "softsae_budget_weight", 1.0)
         align_weight = getattr(cfg, "enc_dec_align_weight", 15.0)
-        gate_weight = getattr(cfg, "gate_sparsity_weight", 0.05)
+        gate_weight = getattr(cfg, "gate_sparsity_weight", 0.30)
 
         total_loss = (
             l_recon
@@ -617,13 +636,14 @@ class LibellaGNN(nn.Module):
         with torch.no_grad():
             bio_sim = (x_norm[src] * x_norm[dst]).sum(dim=-1, keepdim=True)
 
-            degree = torch.zeros((N, 1), device=x_norm.device).index_add_(0, dst, torch.ones_like(bio_sim))
+            ones_sim = torch.ones_like(bio_sim)
+            degree = torch.zeros((N, 1), device=x_norm.device).index_add_(0, dst, ones_sim)
             degree_clamped = degree.clamp(min=1)
 
             node_bio_sum = torch.zeros((N, 1), device=x_norm.device).index_add_(0, dst, bio_sim)
             local_mean = (node_bio_sum / degree_clamped)[dst]
 
-            var_components = (bio_sim - local_mean) ** 2
+            var_components = (bio_sim - local_mean).square()
             node_var_sum = torch.zeros((N, 1), device=x_norm.device).index_add_(0, dst, var_components)
 
             local_std = torch.clamp(torch.sqrt(node_var_sum / degree_clamped)[dst], min=0.05)
@@ -768,10 +788,13 @@ class LibellaGNN(nn.Module):
                 dy_ds = torch.autograd.grad(y_grid.sum(), s_grid)[0]
 
                 neg_mask = dy_ds < 0.0
-                stats["pade/rank_inversion_pct"] = neg_mask.float().mean().item() * 100.0
-                stats["pade/derivative_min"] = dy_ds.min().item()
-                stats["pade/output_min"] = y_grid.min().item()
-                stats["pade/output_max"] = y_grid.max().item()
+                stats["pade/rank_inversion_pct"] = float(neg_mask.float().mean().item() * 100.0)
+                stats["pade/derivative_min"] = float(dy_ds.min().item())
+                stats["pade/output_min"] = float(y_grid.min().item())
+                stats["pade/output_max"] = float(y_grid.max().item())
+
+                # Explicitly clean up autograd computation graph
+                del s_grid, y_grid, dy_ds, neg_mask
 
         if hasattr(self, "laprune_gamma"):
             gamma_scale = float(getattr(self, "current_gamma_progress", 1.0))
