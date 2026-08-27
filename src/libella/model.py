@@ -501,8 +501,8 @@ class LibellaGNN(nn.Module):
         stable_log_cosh = abs_delta + torch.log1p(torch.exp(-2.0 * abs_delta)) - math.log(2.0)
         peak_penalty = (abs_delta + 1e-6).pow(1.5) * 0.05
 
-        per_cell_loss = torch.sum(variance_weight * (stable_log_cosh + peak_penalty), dim=-1)
-        l_recon = torch.mean(per_cell_loss) / math.sqrt(x_true.shape[-1])
+        per_cell_loss = torch.sum(variance_weight * (stable_log_cosh + peak_penalty), dim=-1, keepdim=True)
+        l_recon = torch.sum(per_cell_loss * mask) / (valid_nodes * math.sqrt(x_true.shape[-1]))
 
         # 2. DUAL-HINGE ALIGNMENT LOSS (500x hard boundary wall)
         w_enc_norm = F.normalize(self.encoder_weight, p=2, dim=-1)
@@ -572,7 +572,7 @@ class LibellaGNN(nn.Module):
 
         # 4. Phase-Gated Asymmetric Charbonnier K-Budget Loss
         if k_i_float is not None:
-            mean_k = k_i_float.mean()
+            mean_k = (k_i_float * mask).sum() / valid_nodes
             k_err = mean_k - self.target_k
             
             # 1. Asymmetric Multiplier
@@ -635,6 +635,7 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor,
         dst: torch.Tensor,
         x_norm: torch.Tensor,
+        edge_mask_float: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if src.numel() == 0 or diff_sim is None or diff_sim.numel() == 0:
             return delta_h.new_zeros(())
@@ -662,7 +663,9 @@ class LibellaGNN(nn.Module):
 
         # Pre-Activation Huber Loss matching raw attention logits to local Z-scores
         loss_edges = F.huber_loss(diff_sim, z_score, delta=1.0, reduction="none")
-        return (loss_edges * variance_mask.float()).sum() / torch.clamp(variance_mask.float().sum(), min=1.0)
+        mask = variance_mask.float() if edge_mask_float is None else variance_mask.float() * edge_mask_float
+        valid_edges = torch.clamp(mask.sum(), min=1.0)
+        return (loss_edges * mask).sum() / valid_edges
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:

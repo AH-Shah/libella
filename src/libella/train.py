@@ -410,45 +410,32 @@ def _train_loop(
                 last_dead_mask = dead_mask
 
                 train_idx = batch["train_core_idx"].to(device=device, non_blocking=True)
-                x_train = x[train_idx]
-                recon_train = recon[train_idx]
-                z_train = z[train_idx]
-                aux_recon_train = aux_recon[train_idx] if aux_recon is not None else None
-                r_norm_train = r_norm[train_idx] if r_norm is not None else None
-                k_i_train = k_i_float[train_idx] if k_i_float is not None else None
-                routed_scores_train = routed_scores[train_idx] if routed_scores is not None else None
+                train_mask = torch.zeros((x.size(0), 1), dtype=x.dtype, device=device)
+                train_mask[train_idx] = 1.0
 
-                # Filter edges incident to training core cells
+                edge_mask_float = torch.zeros((src.size(0), 1), dtype=torch.float32, device=device)
                 if len(src) > 0:
                     core_mask = torch.zeros(x.size(0), dtype=torch.bool, device=device)
                     core_mask[train_idx] = True
-                    edge_mask = core_mask[src] | core_mask[dst]
-                    src_loss = src[edge_mask]
-                    dst_loss = dst[edge_mask]
-                    A_ij_loss = A_ij[edge_mask] if A_ij is not None else None
-                    diff_sim_loss = diff_sim[edge_mask] if diff_sim is not None else None
-                else:
-                    src_loss = src
-                    dst_loss = dst
-                    A_ij_loss = A_ij
-                    diff_sim_loss = diff_sim
+                    edge_mask_float[(core_mask[src] | core_mask[dst]).unsqueeze(1)] = 1.0
 
                 # 2. Loss Calculation
                 loss_res = model.calc_loss(
-                    recon_train,
-                    x_train,
-                    z_train,
+                    recon,
+                    x,
+                    z,
                     w_dec_norm,
-                    routed_scores=routed_scores_train,
-                    k_i_float=k_i_train,
-                    aux_recon=aux_recon_train,
-                    r_norm=r_norm_train,
+                    routed_scores=routed_scores,
+                    k_i_float=k_i_float,
+                    aux_recon=aux_recon,
+                    r_norm=r_norm,
+                    train_mask=train_mask,
                     progress=schedules["global_progress"],
                     spatial_shift=spatial_context,
-                    src=src_loss,
-                    dst=dst_loss,
+                    src=src,
+                    dst=dst,
                     z_full=z,
-                    A_ij=A_ij_loss,
+                    A_ij=A_ij,
                     x_full=x,
                 )
                 base_sae_loss = loss_res[0]
@@ -462,10 +449,10 @@ def _train_loop(
                 # 3. Dedicated Contrastive Spatial Relation Loss with Warm-up Gate
                 spatial_progress = schedules.get("spatial_progress", 0.0)
 
-                if len(src_loss) > 0 and delta_h is not None and spatial_progress > 0.0:
+                if len(src) > 0 and delta_h is not None and spatial_progress > 0.0:
                     x_norm = F.normalize(x, p=2, dim=-1)
                     l_spatial_rel = model.calc_spatial_loss(
-                        delta_h, diff_sim_loss, src_loss, dst_loss, x_norm
+                        delta_h, diff_sim, src, dst, x_norm, edge_mask_float=edge_mask_float
                     )
                     spatial_loss_weight = getattr(cfg, "spatial_loss_weight", 15.0) * spatial_progress
                     spatial_loss_val = spatial_loss_weight * l_spatial_rel
@@ -486,7 +473,7 @@ def _train_loop(
                 train_steps += 1
 
                 with torch.no_grad():
-                    z_det = z_train.detach()
+                    z_det = z[train_idx].detach()
                     batch_active = (z_det > 0.01).float()
                     current_freq = batch_active.mean(dim=0)
 
