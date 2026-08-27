@@ -142,7 +142,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor,              # dst
         torch.Tensor | None,       # A_ij
         torch.Tensor,              # k_i_float
-        torch.Tensor | None,       # edge_sign
+        torch.Tensor | None,       # diff_sim
     ]:
         if len(src) > 0:
             src = src.contiguous()
@@ -213,7 +213,8 @@ class LibellaGNN(nn.Module):
 
             tau = F.softplus(self.sign_tau) + 1e-3
             edge_sign = torch.tanh(diff_sim / tau)
-            edge_mag = torch.exp(torch.clamp(torch.abs(diff_sim / tau), max=20.0))
+            mag_temp = getattr(cfg, "spatial_mag_temp", 1.0)
+            edge_mag = torch.exp(torch.clamp(torch.abs(diff_sim) / mag_temp, max=20.0))
 
             mag_sum = torch.zeros((N, 1), device=x_dense.device)
             mag_sum.index_add_(0, dst, edge_mag)
@@ -255,7 +256,7 @@ class LibellaGNN(nn.Module):
             self.last_broadcast_prob = None
             delta_h = torch.zeros_like(H_0_spatial)
             A_ij = None
-            edge_sign = None
+            diff_sim = None
 
         # Track GNN activity telemetry
         if self.training:
@@ -282,7 +283,7 @@ class LibellaGNN(nn.Module):
         # z_contextual now has the dynamic range to deeply suppress or heavily boost
         z_contextual = z_canonical * (1.0 + alpha * spatial_context)
 
-        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float, edge_sign
+        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float, diff_sim
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -370,7 +371,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor,              # delta_h
         torch.Tensor,              # z_canonical
         torch.Tensor,              # bio_scores
-        torch.Tensor | None,       # edge_sign
+        torch.Tensor | None,       # diff_sim
     ]:
         (
             z_contextual,
@@ -383,7 +384,7 @@ class LibellaGNN(nn.Module):
             dst,
             A_ij,
             k_i_float,
-            edge_sign,
+            diff_sim,
         ) = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=-1)
 
@@ -447,7 +448,7 @@ class LibellaGNN(nn.Module):
             delta_h,
             z_canonical,
             bio_scores,
-            edge_sign,
+            diff_sim,
         )
 
     def calc_loss(
@@ -603,7 +604,7 @@ class LibellaGNN(nn.Module):
         aux_weight = getattr(cfg, "aux_weight", 0.50)
         budget_weight = getattr(cfg, "softsae_budget_weight", 1.0)
         align_weight = getattr(cfg, "enc_dec_align_weight", 15.0)
-        gate_weight = getattr(cfg, "gate_sparsity_weight", 0.30)
+        gate_weight = getattr(cfg, "gate_sparsity_weight", 0.05)
 
         total_loss = (
             l_recon
@@ -627,12 +628,12 @@ class LibellaGNN(nn.Module):
     def calc_spatial_loss(
         self,
         delta_h: torch.Tensor,
-        edge_sign: torch.Tensor | None,
+        diff_sim: torch.Tensor | None,
         src: torch.Tensor,
         dst: torch.Tensor,
         x_norm: torch.Tensor,
     ) -> torch.Tensor:
-        if src.numel() == 0 or edge_sign is None or edge_sign.numel() == 0:
+        if src.numel() == 0 or diff_sim is None or diff_sim.numel() == 0:
             return delta_h.new_zeros(())
 
         N = x_norm.size(0)
@@ -653,20 +654,12 @@ class LibellaGNN(nn.Module):
             local_std = torch.clamp(torch.sqrt(node_var_sum / degree_clamped)[dst], min=0.05)
 
             z_score = (bio_sim - local_mean) / local_std
-            y_target = torch.tanh(z_score)
 
             variance_mask = (node_var_sum / degree_clamped)[dst] > 1e-4
 
-        # 1. Edge Anchor (Directly trains Q/K attention matrices)
-        loss_edges = F.mse_loss(edge_sign, y_target, reduction="none")
-
-        # 2. PDE Smoothing Supervision
-        d_norm = F.normalize(delta_h, p=2, dim=-1, eps=1e-6)
-        spatial_sim = (d_norm[src] * d_norm[dst]).sum(dim=-1, keepdim=True)
-        loss_pde = F.huber_loss(spatial_sim, y_target, delta=0.5, reduction="none")
-
-        total_raw_loss = loss_edges + loss_pde
-        return (total_raw_loss * variance_mask.float()).sum() / torch.clamp(variance_mask.float().sum(), min=1.0)
+        # Pre-Activation Huber Loss matching raw attention logits to local Z-scores
+        loss_edges = F.huber_loss(diff_sim, z_score, delta=1.0, reduction="none")
+        return (loss_edges * variance_mask.float()).sum() / torch.clamp(variance_mask.float().sum(), min=1.0)
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:

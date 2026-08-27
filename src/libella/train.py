@@ -403,7 +403,7 @@ def _train_loop(
                     delta_h,
                     z_canonical,
                     routed_scores,
-                    edge_sign,
+                    diff_sim,
                 ) = model(x, src, dst, weights)
 
                 last_r_pos = r_pos
@@ -426,12 +426,12 @@ def _train_loop(
                     src_loss = src[edge_mask]
                     dst_loss = dst[edge_mask]
                     A_ij_loss = A_ij[edge_mask] if A_ij is not None else None
-                    edge_sign_loss = edge_sign[edge_mask] if edge_sign is not None else None
+                    diff_sim_loss = diff_sim[edge_mask] if diff_sim is not None else None
                 else:
                     src_loss = src
                     dst_loss = dst
                     A_ij_loss = A_ij
-                    edge_sign_loss = edge_sign
+                    diff_sim_loss = diff_sim
 
                 # 2. Loss Calculation
                 loss_res = model.calc_loss(
@@ -465,7 +465,7 @@ def _train_loop(
                 if len(src_loss) > 0 and delta_h is not None and spatial_progress > 0.0:
                     x_norm = F.normalize(x, p=2, dim=-1)
                     l_spatial_rel = model.calc_spatial_loss(
-                        delta_h, edge_sign_loss, src_loss, dst_loss, x_norm
+                        delta_h, diff_sim_loss, src_loss, dst_loss, x_norm
                     )
                     spatial_loss_weight = getattr(cfg, "spatial_loss_weight", 15.0) * spatial_progress
                     spatial_loss_val = spatial_loss_weight * l_spatial_rel
@@ -538,7 +538,7 @@ def _train_loop(
                     del core_mask, edge_mask
                 if len(src_loss) > 0 and delta_h is not None and spatial_progress > 0.0:
                     del x_norm
-                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, routed_scores_train, base_sae_loss, base_align_val, true_batch_loss, src_loss, dst_loss, A_ij_loss, edge_sign_loss, l_spatial_rel, spatial_loss_val
+                del train_idx, x_train, recon_train, z_train, aux_recon_train, r_norm_train, k_i_train, routed_scores_train, base_sae_loss, base_align_val, true_batch_loss, src_loss, dst_loss, A_ij_loss, diff_sim_loss, l_spatial_rel, spatial_loss_val
 
                 # Release live autograd graph pointers held on model instance
                 model.last_listen_prob = None
@@ -578,7 +578,7 @@ def _train_loop(
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
 
-                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores, edge_sign
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores, diff_sim
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
