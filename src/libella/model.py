@@ -132,15 +132,17 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor,
+        torch.Tensor,              # z_contextual
+        torch.Tensor,              # z_canonical
+        torch.Tensor,              # bio_scores
+        torch.Tensor,              # cell_mass
+        torch.Tensor,              # spatial_context
+        torch.Tensor,              # delta_h
+        torch.Tensor,              # src
+        torch.Tensor,              # dst
+        torch.Tensor | None,       # A_ij
+        torch.Tensor,              # k_i_float
+        torch.Tensor | None,       # edge_sign
     ]:
         if len(src) > 0:
             src = src.contiguous()
@@ -354,17 +356,21 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor,
+        torch.Tensor,              # x_recon
+        torch.Tensor,              # z_contextual
+        torch.Tensor,              # w_dec_norm
+        torch.Tensor | None,       # aux_recon
+        torch.Tensor | None,       # r_norm
+        torch.Tensor,              # cell_mass
+        torch.Tensor | None,       # r_pos_ret
+        torch.Tensor,              # dead_mask_ret
+        torch.Tensor,              # spatial_context
+        torch.Tensor | None,       # A_ij
+        torch.Tensor,              # k_i_float
+        torch.Tensor,              # delta_h
+        torch.Tensor,              # z_canonical
+        torch.Tensor,              # bio_scores
+        torch.Tensor | None,       # edge_sign
     ]:
         (
             z_contextual,
@@ -752,7 +758,7 @@ class LibellaGNN(nn.Module):
             stats["sign_gt/tau_effective"] = (F.softplus(self.sign_tau) + 1e-3).item()
             stats["sign_gt/tau_raw"] = self.sign_tau.item()
         if hasattr(self, "ac_delta"):
-            stats["acmp/delta_effective"] = (torch.sigmoid(self.ac_delta) * 0.45).item()
+            stats["acmp/delta_effective"] = (torch.sigmoid(self.ac_delta) * 0.8).item()
             stats["acmp/delta_raw"] = self.ac_delta.item()
         if hasattr(self, "listen_gate"):
             gate_w_listen = self.listen_gate.weight.detach()
