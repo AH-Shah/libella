@@ -142,7 +142,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor,              # dst
         torch.Tensor | None,       # A_ij
         torch.Tensor,              # k_i_float
-        torch.Tensor | None,       # diff_sim
+        torch.Tensor | None,       # edge_sign
     ]:
         if len(src) > 0:
             src = src.contiguous()
@@ -213,8 +213,7 @@ class LibellaGNN(nn.Module):
 
             tau = F.softplus(self.sign_tau) + 1e-3
             edge_sign = torch.tanh(diff_sim / tau)
-            mag_temp = getattr(cfg, "spatial_mag_temp", 1.0)
-            edge_mag = torch.exp(torch.clamp(torch.abs(diff_sim) / mag_temp, max=20.0))
+            edge_mag = torch.exp(torch.clamp(torch.abs(diff_sim / tau), max=20.0))
 
             mag_sum = torch.zeros((N, 1), device=x_dense.device)
             mag_sum.index_add_(0, dst, edge_mag)
@@ -256,7 +255,7 @@ class LibellaGNN(nn.Module):
             self.last_broadcast_prob = None
             delta_h = torch.zeros_like(H_0_spatial)
             A_ij = None
-            diff_sim = None
+            edge_sign = None
 
         # Track GNN activity telemetry
         if self.training:
@@ -283,7 +282,7 @@ class LibellaGNN(nn.Module):
         # z_contextual now has the dynamic range to deeply suppress or heavily boost
         z_contextual = z_canonical * (1.0 + alpha * spatial_context)
 
-        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float, diff_sim
+        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float, edge_sign
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -371,7 +370,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor,              # delta_h
         torch.Tensor,              # z_canonical
         torch.Tensor,              # bio_scores
-        torch.Tensor | None,       # diff_sim
+        torch.Tensor | None,       # edge_sign
     ]:
         (
             z_contextual,
@@ -384,7 +383,7 @@ class LibellaGNN(nn.Module):
             dst,
             A_ij,
             k_i_float,
-            diff_sim,
+            edge_sign,
         ) = self.encode(x_dense, src, dst, edge_weights)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=-1)
 
@@ -448,7 +447,7 @@ class LibellaGNN(nn.Module):
             delta_h,
             z_canonical,
             bio_scores,
-            diff_sim,
+            edge_sign,
         )
 
     def calc_loss(
