@@ -43,7 +43,6 @@ class LibellaGNN(nn.Module):
         self.b_enc = nn.Parameter(torch.zeros(n_metaprograms))
         self.pade_gate = SafePadeActivation(p_deg=3, q_deg=2)
 
-        # --- NATIVE ARCHITECTURE (Unified on n_latents) ---
         # 1. Microsoft Differential Transformer: 2x Head Dimension
         self.head_dim = max(16, self.hidden_dim // 2)
         self.q_proj = nn.Linear(self.n_latents, 2 * self.head_dim, bias=False)
