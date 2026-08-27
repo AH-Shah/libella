@@ -461,6 +461,7 @@ class LibellaGNN(nn.Module):
         k_i_float: torch.Tensor | None = None,
         aux_recon: torch.Tensor | None = None,
         r_norm: torch.Tensor | None = None,
+        train_mask: torch.Tensor | None = None,
         ghost_logits: torch.Tensor | None = None,
         ghost_weights: torch.Tensor | None = None,
         progress: float = 1.0,
@@ -473,8 +474,10 @@ class LibellaGNN(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = (x_true > 0).detach()
-        num_pos = torch.clamp(is_non_zero.float().sum(), min=1.0)
-        num_zeros = (x_true == 0).float().sum()
+        mask = train_mask if train_mask is not None else torch.ones((x_true.size(0), 1), device=x_true.device)
+        valid_nodes = torch.clamp(mask.sum(), min=1.0)
+        num_pos = torch.clamp((is_non_zero.float() * mask).sum(), min=1.0)
+        num_zeros = ((x_true == 0).float() * mask).sum().detach()
         current_dynamic_w = (num_zeros / num_pos).detach()
 
         if self.training:
