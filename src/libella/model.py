@@ -355,21 +355,21 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
     ) -> tuple[
-        torch.Tensor,              # x_recon
-        torch.Tensor,              # z_contextual
-        torch.Tensor,              # w_dec_norm
-        torch.Tensor | None,       # aux_recon
-        torch.Tensor | None,       # r_norm
-        torch.Tensor,              # cell_mass
-        torch.Tensor | None,       # r_pos_ret
-        torch.Tensor,              # dead_mask_ret
-        torch.Tensor,              # spatial_context
-        torch.Tensor | None,       # A_ij
-        torch.Tensor,              # k_i_float
-        torch.Tensor,              # delta_h
-        torch.Tensor,              # z_canonical
-        torch.Tensor,              # bio_scores
-        torch.Tensor | None,       # edge_sign
+        torch.Tensor,       
+        torch.Tensor,       
+        torch.Tensor,       
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor,       
+        torch.Tensor | None,
+        torch.Tensor,       
+        torch.Tensor,       
+        torch.Tensor | None,
+        torch.Tensor,       
+        torch.Tensor,       
+        torch.Tensor,       
+        torch.Tensor,       
+        torch.Tensor | None,
     ]:
         (
             z_contextual,
@@ -516,9 +516,7 @@ class LibellaGNN(nn.Module):
         else:
             l_gate_sparse = torch.tensor(0.0, device=x_true.device)
 
-        # ---------------------------------------------------------
         # JACCARD-SCALED REDUNDANCY PENALTY
-        # ---------------------------------------------------------
         with torch.no_grad():
             # 1. Compute Exact Hard Support (Ignore soft-routed noise)
             if routed_scores is not None and k_i_float is not None:
@@ -547,7 +545,6 @@ class LibellaGNN(nn.Module):
             # 4. Compute Jaccard Overlap: P(A & B) / (P(A) + P(B) - P(A & B))
             m_i = self.marginal_ema.unsqueeze(1)  # (N, 1)
             m_j = self.marginal_ema.unsqueeze(0)  # (1, N)
-            # Add eps to prevent division by zero
             union_prob = torch.clamp(m_i + m_j - self.coact_ema, min=1e-5)
             jaccard_ema = self.coact_ema / union_prob
 
