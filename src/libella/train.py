@@ -674,15 +674,11 @@ def _train_loop(
         epoch_telemetry.update(deep_stats)
 
         # --- Multimodal Robust Pareto Composite Score ---
-        # 1. Base Generalization Anchor (Validation Loss)
-        val_recon = history["val_loss"][-1]
+        current_recon = epoch_telemetry.get("l_rec", float("inf"))
 
-        # 2. Strict Target Sparsity Compliance (Linear Penalty)
-        # Replaces the weak squared penalty. A strong linear penalty prevents the network 
-        # from "buying" a lower val_loss by inflating L0 early in Phase 2.
         target_k = float(getattr(model, "target_k", 38.0))
         k_error_ratio = abs(current_l0 - target_k) / max(1.0, target_k)
-        phi_budget = 1.0 + 5.0 * k_error_ratio
+        phi_budget = 1.0 + 1.5 * k_error_ratio
 
         # 3. Schedule Completion Gate (Governor Alignment)
         # Heavily penalizes checkpoints taken before max squeeze and spatial warmups are finished.
@@ -695,8 +691,7 @@ def _train_loop(
         dead_ratio = float(current_dead) / float(model.n_latents)
         phi_dict = 1.0 + 2.0 * dead_ratio
 
-        # Unified Multiplicative Pareto Composite Score
-        composite_score = val_recon * phi_budget * phi_schedule * phi_dict
+        composite_score = current_recon * phi_budget * phi_schedule * phi_dict
 
         epoch_metrics = {
             "epoch": epoch,
