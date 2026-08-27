@@ -762,41 +762,43 @@ def _train_loop(
         if hasattr(logger, "flush"):
             logger.flush()
 
-        epoch_log = {
-            "epoch/train_loss": history["train_loss"][-1],
-            "epoch/val_loss": history["val_loss"][-1],
-            "epoch/composite_score": composite_score,
-            "composite/phi_budget": phi_budget,
-            "composite/phi_dict": phi_dict,
-            "composite/phi_schedule": phi_schedule,
-            "loss/recon": epoch_telemetry.get("l_rec", 0.0),
-            "loss/ort": epoch_telemetry.get("l_ort", 0.0),
-            "loss/budget": epoch_telemetry.get("l_budget", 0.0),
-            "loss/aux": epoch_telemetry.get("l_aux", 0.0),
-            "loss/spatial": epoch_telemetry.get("l_spatial", 0.0),
-            "loss/align": epoch_telemetry.get("l_align", 0.0),
-            "loss/gate_sparse": epoch_telemetry.get("l_gate_sparse", 0.0),
-            "loss/dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
-            "sae/k_pred_mean": epoch_telemetry.get("k_pred_mean", 0.0),
-            "sae/sparsity_pct": epoch_telemetry.get("p_w", 0.0),
-            "sae/entropy": epoch_telemetry.get("ent", 0.0),
-            "graph/a_ij_mean": epoch_telemetry.get("a_ij_mean", 0.0),
-            "graph/active_edge_pct": epoch_telemetry.get("a_ij_density", 0.0) * 100.0,
-            "spatial/shift_mag": epoch_telemetry.get("shift_mag", 0.0),
-            "csnn/listen_prob_mean": epoch_telemetry.get("csnn_listen", 0.0),
-            "csnn/broadcast_prob_mean": epoch_telemetry.get("csnn_broadcast", 0.0),
-            "sae/l0_total": current_l0,
-            "sae/dead_latents": current_dead,
-            "sae/z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),
-            "sae/cell_mass_mean": epoch_telemetry.get("cell_mass_mean", 0.0),
-            "tracker/global_progress": epoch_schedules["global_progress"],
-            "tracker/spatial_progress": epoch_schedules["spatial_progress"],
-            "tracker/squeeze_progress": epoch_schedules["squeeze_progress"],
-            "tracker/pressure": getattr(tracker, "pressure", 0.0),
+        # Single Flat Metric Map for Every Epoch
+        unified_epoch_log = {
+            "ep_train_loss": history["train_loss"][-1],
+            "ep_val_loss": history["val_loss"][-1],
+            "ep_composite_score": composite_score,
+            "composite_phi_budget": phi_budget,
+            "composite_phi_dict": phi_dict,
+            "composite_phi_schedule": phi_schedule,
+            "l_recon": epoch_telemetry.get("l_rec", 0.0),
+            "l_ort": epoch_telemetry.get("l_ort", 0.0),
+            "l_budget": epoch_telemetry.get("l_budget", 0.0),
+            "l_aux": epoch_telemetry.get("l_aux", 0.0),
+            "l_spatial": epoch_telemetry.get("l_spatial", 0.0),
+            "l_align": epoch_telemetry.get("l_align", 0.0),
+            "l_gate_sparse": epoch_telemetry.get("l_gate_sparse", 0.0),
+            "l_dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
+            "sae_k_pred_mean": epoch_telemetry.get("k_pred_mean", 0.0),
+            "sae_sparsity_pct": epoch_telemetry.get("p_w", 0.0),
+            "sae_entropy": epoch_telemetry.get("ent", 0.0),
+            "graph_a_ij_mean": epoch_telemetry.get("a_ij_mean", 0.0),
+            "graph_active_edge_pct": epoch_telemetry.get("a_ij_density", 0.0) * 100.0,
+            "spatial_shift_mag": epoch_telemetry.get("shift_mag", 0.0),
+            "csnn_listen_prob_mean": epoch_telemetry.get("csnn_listen", 0.0),
+            "csnn_broadcast_prob_mean": epoch_telemetry.get("csnn_broadcast", 0.0),
+            "sae_l0_total": current_l0,
+            "sae_dead_latents": current_dead,
+            "sae_z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),
+            "sae_cell_mass_mean": epoch_telemetry.get("cell_mass_mean", 0.0),
+            "tr_global_progress": epoch_schedules["global_progress"],
+            "tr_spatial_progress": epoch_schedules["spatial_progress"],
+            "tr_squeeze_progress": epoch_schedules["squeeze_progress"],
+            "tr_pressure": getattr(tracker, "pressure", 0.0),
             **deep_stats,
         }
-        logger.log_metrics(epoch, epoch_log)
-        logger.log_model_telemetry(epoch, model, log_histograms=False)
+
+        # Log flat metrics once per epoch
+        logger.log_metrics(epoch, unified_epoch_log)
 
         # Only capture Pareto best checkpoints during the Soak Phase (Max Squeeze) or final epoch
         if (epoch_schedules["squeeze_progress"] >= 1.0 or epoch == total_epochs - 1) and composite_score < best_composite_score and not nan_detected:
