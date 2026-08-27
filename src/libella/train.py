@@ -522,10 +522,10 @@ def _train_loop(
 
                 train_chunk_count += 1
                 if len(src) > 0:
-                    del core_mask, edge_mask_float
+                    del core_mask
                 if len(src) > 0 and delta_h is not None and spatial_progress > 0.0:
                     del x_norm
-                del train_idx, train_mask, base_sae_loss, base_align_val, true_batch_loss, l_spatial_rel, spatial_loss_val
+                del train_idx, train_mask, edge_mask_float, base_sae_loss, base_align_val, true_batch_loss, l_spatial_rel, spatial_loss_val
 
                 # Release live autograd graph pointers held on model instance
                 model.last_listen_prob = None

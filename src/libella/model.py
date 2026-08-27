@@ -670,7 +670,8 @@ class LibellaGNN(nn.Module):
         loss_pde = F.huber_loss(spatial_sim, y_target, delta=0.5, reduction="none")
 
         total_raw_loss = loss_edges + loss_pde
-        return (total_raw_loss * variance_mask.float()).sum() / torch.clamp(variance_mask.float().sum(), min=1.0)
+        mask = variance_mask.float() if edge_mask_float is None else variance_mask.float() * edge_mask_float
+        return (total_raw_loss * mask).sum() / torch.clamp(mask.sum(), min=1.0)
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
