@@ -657,14 +657,20 @@ class LibellaGNN(nn.Module):
             local_std = torch.clamp(torch.sqrt(node_var_sum / degree_clamped)[dst], min=0.05)
 
             z_score = (bio_sim - local_mean) / local_std
+            y_target = torch.tanh(z_score)
 
             variance_mask = (node_var_sum / degree_clamped)[dst] > 1e-4
 
-        # Pre-Activation Huber Loss matching raw attention logits to local Z-scores
-        loss_edges = F.huber_loss(diff_sim, z_score, delta=1.0, reduction="none")
-        mask = variance_mask.float() if edge_mask_float is None else variance_mask.float() * edge_mask_float
-        valid_edges = torch.clamp(mask.sum(), min=1.0)
-        return (loss_edges * mask).sum() / valid_edges
+        # 1. Edge Anchor (Directly trains Q/K attention matrices)
+        loss_edges = F.mse_loss(edge_sign, y_target, reduction="none")
+
+        # 2. PDE Smoothing Supervision
+        d_norm = F.normalize(delta_h, p=2, dim=-1, eps=1e-6)
+        spatial_sim = (d_norm[src] * d_norm[dst]).sum(dim=-1, keepdim=True)
+        loss_pde = F.huber_loss(spatial_sim, y_target, delta=0.5, reduction="none")
+
+        total_raw_loss = loss_edges + loss_pde
+        return (total_raw_loss * variance_mask.float()).sum() / torch.clamp(variance_mask.float().sum(), min=1.0)
 
     @torch.no_grad()
     def get_deep_telemetry(self) -> dict[str, float]:
