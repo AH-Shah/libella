@@ -460,7 +460,9 @@ class SpatialBatcher:
         return {
             'x': self.X[subgraph_nodes],
             'adj': self.adj[subgraph_nodes, :][:, subgraph_nodes],
-            'coords': self.coords[subgraph_nodes], 
+            'coords': self.coords[subgraph_nodes],
+            'pos': self.coords[subgraph_nodes],
+            'spatial': self.coords[subgraph_nodes],
             'local_core_idx': local_core_idx,
             'orig_core_idx': core_idx, 
             'train_mask': self.train_mask[subgraph_nodes],
@@ -488,7 +490,12 @@ def _load_h5ad(
         
     
     upper_var_names = np.array([str(g).upper() for g in adata_mem.var_names])
-    valid_genes_mask = np.array([g in clean_whitelist for g in upper_var_names])
+
+    if len(clean_whitelist) > 0:
+        valid_genes_mask = np.array([g in clean_whitelist for g in upper_var_names])
+    else:
+        valid_genes_mask = np.ones(len(upper_var_names), dtype=bool)
+
     valid_genes = upper_var_names[valid_genes_mask]
     
     X_csc = adata_mem.X.tocsc()
@@ -543,7 +550,8 @@ def _calc_moran_dict(
     tree = cKDTree(coords)
     _, knn_idx = tree.query(coords, k=cfg.moran_k)
     
-    src = np.repeat(np.arange(coords.shape[0]), 6)
+    k_neighbors_effective = knn_idx.shape[1] - 1
+    src = np.repeat(np.arange(coords.shape[0]), k_neighbors_effective)
     dst = knn_idx[:, 1:].flatten()
     edges = np.unique(np.sort(np.vstack([src, dst]).T, axis=1), axis=0)
     
@@ -745,9 +753,10 @@ def pad_mps_shapes(
     src: torch.Tensor, 
     dst: torch.Tensor, 
     weights: torch.Tensor, 
+    spatial: torch.Tensor | None = None,
     node_bucket: int | None = None, 
     edge_bucket: int | None = None
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Calculate optimal buckets and pad graph shapes for PyTorch MPS."""
     if node_bucket is None or edge_bucket is None:
         if cfg.k_hops <= 1:
@@ -777,6 +786,9 @@ def pad_mps_shapes(
     if N_pad > N:
         x_dummy = torch.zeros(N_pad - N, x.size(1), dtype=x.dtype, device=x.device)
         x = torch.cat([x, x_dummy], dim=0)
+        if spatial is not None:
+            spatial_dummy = torch.zeros(N_pad - N, spatial.size(1), dtype=spatial.dtype, device=spatial.device)
+            spatial = torch.cat([spatial, spatial_dummy], dim=0)
 
     # 2. Pad Edges (Dummy edges pointing from Dummy Node -> Dummy Node with weight 0)
     if E_pad > E:
@@ -788,7 +800,7 @@ def pad_mps_shapes(
         dst = torch.cat([dst, dummy_idx], dim=0)
         weights = torch.cat([weights, dummy_w], dim=0)
 
-    return x, src, dst, weights
+    return x, src, dst, weights, spatial
 
 def build_graph_safe(f: Path, c_genes: list[str]) -> Path | None:
     """Wrap graph builder with safety checks to avoid identical retrains."""

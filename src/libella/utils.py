@@ -79,6 +79,10 @@ def scatter_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> t
     sum_val = torch.zeros(num_nodes, dtype=src.dtype, device=src.device).scatter_add(0, index, exp_val)
     return exp_val / (sum_val[index] + 1e-9)
 
+def inverse_softplus(y: float) -> float:
+    """Inverses the softplus function to initialize unconstrained parameters to exact target values."""
+    y = max(y, 1e-5)
+    return math.log(math.exp(y) - 1.0) if y < 20.0 else y
 
 
 class PhaseTracker:
@@ -104,10 +108,10 @@ class PhaseTracker:
         self.divergence_threshold: float = divergence_threshold
         self.ramp_divergence_slack: float = ramp_divergence_slack
 
-        # --- Phase 1 Horizons ---
-        self.min_p1_epochs: int = max(2, int(self.total_epochs * 0.05))
-        self.max_p1_epochs: int = max(self.min_p1_epochs + 1, int(self.total_epochs * 0.08))
-        self.p1_plateau_patience: int = 2
+        # --- Phase 1 Horizons (Epochs 0 to 10 for 40 epochs) ---
+        self.min_p1_epochs: int = max(5, int(self.total_epochs * 0.25))
+        self.max_p1_epochs: int = max(self.min_p1_epochs + 1, int(self.total_epochs * 0.25))
+        self.p1_plateau_patience: int = 4
         self.p1_plateau_count: int = 0
 
         # --- Dynamic Window Sizing & Max-Squeeze Horizons ---
@@ -160,33 +164,49 @@ class PhaseTracker:
     def get_global_progress(self, epoch: int, step_fraction: float = 0.0) -> float:
         return min(1.0, max(0.0, (epoch + step_fraction) / float(self.total_epochs)))
 
-    def get_squeeze_progress(self) -> float:
+    def get_squeeze_progress(self, epoch: int = 0, step_fraction: float = 0.0) -> float:
         if self.phase == 1:
-            return 0.0
-        return float(min(1.0, max(0.0, self.pressure)))
+            global_prog = self.get_global_progress(epoch, step_fraction)
+            p1_ratio = min(1.0, global_prog / max(1e-5, (self.min_p1_epochs / float(self.total_epochs))))
+            return float(0.30 * 0.5 * (1.0 - math.cos(math.pi * p1_ratio)))
+        raw_p = min(1.0, max(0.0, self.pressure))
+        smooth_p = 0.5 * (1.0 - math.cos(math.pi * raw_p))
+        return float(0.30 + 0.70 * smooth_p)
 
     def get_schedules(self, epoch: int, step_fraction: float = 0.0) -> dict[str, float]:
         global_prog = self.get_global_progress(epoch, step_fraction)
-        squeeze_prog = self.get_squeeze_progress()
+        squeeze_prog = self.get_squeeze_progress(epoch, step_fraction)
 
-        # Spatial Warm-up: 0.0 for first 10% of run, then linear ramp to 1.0 from [0.10 -> 0.50]
-        if global_prog < 0.10:
+        # Spatial Warm-up: 0.0 for Phase 1 (0 -> 25% of run), smooth cosine ramp to 1.0 across Phase 2 [25% -> 62.5% of run]
+        p1_bound = self.min_p1_epochs / float(self.total_epochs)
+        p2_bound = min(1.0, p1_bound + (15.0 / float(self.total_epochs)))
+        if global_prog < p1_bound:
             spatial_prog = 0.0
+        elif global_prog >= p2_bound:
+            spatial_prog = 1.0
         else:
-            spatial_prog = min(1.0, (global_prog - 0.10) / 0.40)
+            t_spatial = (global_prog - p1_bound) / max(1e-5, (p2_bound - p1_bound))
+            spatial_prog = 0.5 * (1.0 - math.cos(math.pi * t_spatial))
 
-        if self.phase == 1:
-            gamma_prog = 0.56
+        # Cosine-smoothed hardness ramp mapped to continuous squeeze progression
+        smooth_squeeze = 0.5 * (1.0 - math.cos(math.pi * squeeze_prog))
+        gamma_prog = 0.56 + 0.44 * smooth_squeeze
+
+        # Gate Sparsity Curriculum: 0.0 before Phase 2, smooth cosine ramp across Phase 2 [Epochs 10 -> 25]
+        if epoch < self.min_p1_epochs:
+            gate_prog = 0.0
+        elif epoch >= (self.min_p1_epochs + 15):
+            gate_prog = 1.0
         else:
-            # Cosine-smoothed hardness ramp to prevent sudden cliff at gamma=0.99
-            smooth_squeeze = 0.5 * (1.0 - math.cos(math.pi * squeeze_prog))
-            gamma_prog = 0.56 + 0.44 * smooth_squeeze
+            t_gate = (epoch + step_fraction - float(self.min_p1_epochs)) / 15.0
+            gate_prog = 0.5 * (1.0 - math.cos(math.pi * t_gate))
 
         return {
             "global_progress": global_prog,
             "squeeze_progress": squeeze_prog,
             "spatial_progress": spatial_prog,
             "gamma_progress": gamma_prog,
+            "gate_progress": gate_prog,
         }
 
     def _update_schedules(self, epoch: int) -> None:
@@ -250,9 +270,9 @@ class PhaseTracker:
             return False
 
         # =============================================================
-        # PHASE 2: Fast-Track to Max Pressure (1.0)
+        # PHASE 2: Controlled 15-Epoch Squeeze Ramp (Epochs 10 -> 25)
         # =============================================================
-        target_ramp_epochs = max(1, int((self.total_epochs - self.p2_start_epoch) * 0.50))
+        target_ramp_epochs = max(1, int(getattr(cfg, "p2_ramp_epochs", 15)))
         base_step = 1.0 / target_ramp_epochs
 
         # Surge brake: only pause ramp if reconstruction loss jumps >25%
@@ -520,19 +540,20 @@ def export_latents_from_graphs(
                 src = torch.from_numpy(adj_coo.row).to(torch.int32)
                 dst = torch.from_numpy(adj_coo.col).to(torch.int32)
                 weights = torch.from_numpy(adj_coo.data).to(torch.float32)
+                chunk_spatial = torch.from_numpy(chunk["coords"]).to(torch.float32).to(device)
 
                 chunk_x = chunk_x.to(device)
                 src = src.to(device)
                 dst = dst.to(device)
                 weights = weights.to(device)
 
-                chunk_x, src, dst, weights = pad_mps_shapes(chunk_x, src, dst, weights)
+                chunk_x, src, dst, weights, chunk_spatial = pad_mps_shapes(chunk_x, src, dst, weights, spatial=chunk_spatial)
                 if device.type != "mps":
                     src = src.to(torch.int64)
                     dst = dst.to(torch.int64)
 
                 # Direct encoder inference (bypasses decoder reconstruction FLOPs)
-                z_contextual, *_ = model.encode(chunk_x, src, dst, weights)
+                z_contextual, *_ = model.encode(chunk_x, src, dst, weights, spatial=chunk_spatial)
 
                 # Slice ONLY core nodes (drops halo receptive field)
                 local_core = chunk["local_core_idx"]
@@ -615,8 +636,6 @@ class SafePadeActivation(nn.Module):
         self.c_in = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Softly bind inputs into [-1, 1] to prevent x^3 from exploding/inverting
-        # This forces Padé to behave purely as a smooth shape inside its stable domain
         x_safe = torch.tanh(x / F.softplus(self.c_in))
         
         p_val = self.p_coeffs[0]
@@ -626,7 +645,9 @@ class SafePadeActivation(nn.Module):
         q_val = 1.0
         abs_x = torch.abs(x_safe)
         for i in range(len(self.q_coeffs)):
-            q_val = q_val + torch.abs(self.q_coeffs[i]) * (abs_x ** (i + 1))
+            # FIX: Force strict positivity. The coefficient physically cannot drop below 0.1
+            q_c = F.softplus(self.q_coeffs[i]) + 0.1 
+            q_val = q_val + q_c * (abs_x ** (i + 1))
             
         return p_val / q_val
 
@@ -732,3 +753,155 @@ class ExactLaPruneFunction(torch.autograd.Function):
         if ctx.needs_input_grad[2]:
             return grad_scores, grad_k, grad_gamma, None, None
         return grad_scores, grad_k, None, None, None
+
+
+@torch.no_grad()
+def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
+    """Harvests clean, unified model diagnostics and parameter statistics."""
+    stats: dict[str, float] = {}
+
+    for name, param in model.named_parameters():
+        p_clean = name.replace(".", "_")
+        stats[f"p_{p_clean}"] = float(param.detach().norm(2).item())
+        if param.grad is not None:
+            stats[f"g_{p_clean}"] = float(param.grad.detach().norm(2).item())
+            stats[f"z_{p_clean}_pct"] = float((param.grad == 0).float().mean().item() * 100.0)
+
+    # 1. Dictionary Health & SVD Telemetry (CPU fallback for MPS stability)
+    if hasattr(model, "encoder_weight"):
+        w_enc = F.normalize(model.encoder_weight, p=2, dim=-1)
+        stats["d_encoder_norm"] = float(model.encoder_weight.detach().norm(2).item())
+        s_enc = torch.linalg.svdvals(w_enc.detach().cpu())
+        stats["d_encoder_effective_rank"] = float(((s_enc.sum() ** 2) / torch.clamp((s_enc**2).sum(), min=1e-9)).item())
+
+    if hasattr(model, "steps_since_active") and hasattr(model, "dead_step_threshold"):
+        stats["d_dead_latents_pct"] = float((model.steps_since_active >= model.dead_step_threshold).float().mean().item() * 100.0)
+
+    if hasattr(model, "encoder_bias"):
+        stats["d_encoder_bias_max"] = float(model.encoder_bias.detach().abs().max().item())
+        stats["d_encoder_bias_mean"] = float(model.encoder_bias.detach().mean().item())
+        
+    if hasattr(model, "decoder_bias"):
+        stats["d_decoder_bias_max"] = float(model.decoder_bias.detach().abs().max().item())
+        stats["d_decoder_bias_mean"] = float(model.decoder_bias.detach().mean().item())
+
+    if hasattr(model, "decoder_weight"):
+        w_dec = F.normalize(model.decoder_weight, p=2, dim=-1)
+        stats["d_decoder_norm"] = float(model.decoder_weight.detach().norm(2).item())
+
+        sim = torch.mm(w_dec, w_dec.t())
+        off_diag_mask = ~torch.eye(w_dec.size(0), dtype=torch.bool, device=w_dec.device)
+        off_diag_vals = sim.masked_select(off_diag_mask)
+        if off_diag_vals.numel() > 0:
+            stats["d_max_cross_corr"] = float(off_diag_vals.max().item())
+            stats["d_mean_cross_corr"] = float(off_diag_vals.abs().mean().item())
+
+        s_dec = torch.linalg.svdvals(w_dec.detach().cpu())
+        stats["d_effective_rank"] = float(((s_dec.sum() ** 2) / torch.clamp((s_dec**2).sum(), min=1e-9)).item())
+        stats["d_svd_sigma_1"] = float(s_dec[0].item())
+        stats["d_svd_sigma_2"] = float(s_dec[1].item() if s_dec.numel() > 1 else 0.0)
+        stats["d_svd_sigma_3"] = float(s_dec[2].item() if s_dec.numel() > 2 else 0.0)
+
+    # 2. Co-activation & Jaccard Overlap
+    if hasattr(model, "coact_ema") and hasattr(model, "marginal_ema") and hasattr(model, "ortho_mask"):
+        off_diag_coact = model.coact_ema * model.ortho_mask
+        stats["d_coact_ema_mean"] = float(off_diag_coact.mean().item())
+        stats["d_coact_ema_max"] = float(off_diag_coact.max().item())
+
+        m_i = model.marginal_ema.unsqueeze(1)
+        m_j = model.marginal_ema.unsqueeze(0)
+        union_p = torch.clamp(m_i + m_j - model.coact_ema, min=1e-5)
+        jaccard_mat = (model.coact_ema / union_p) * model.ortho_mask
+        stats["d_jaccard_ema_mean"] = float(jaccard_mat.mean().item())
+        stats["d_jaccard_ema_max"] = float(jaccard_mat.max().item())
+
+    # 3. Encoder-Decoder Alignment
+    if hasattr(model, "encoder_weight") and hasattr(model, "decoder_weight"):
+        w_enc = F.normalize(model.encoder_weight, p=2, dim=-1)
+        w_dec = F.normalize(model.decoder_weight, p=2, dim=-1)
+        align_cos = (w_enc * w_dec).sum(dim=-1)
+        stats["d_alignment_mean"] = float(align_cos.mean().item())
+        stats["d_alignment_min"] = float(align_cos.min().item())
+        quantiles = torch.quantile(align_cos, torch.tensor([0.10, 0.90], device=align_cos.device))
+        stats["d_alignment_p10"] = float(quantiles[0].item())
+        stats["d_alignment_p90"] = float(quantiles[1].item())
+
+    # 4. Spatial Topology & Geometric RBF
+    if hasattr(model, "last_spatial_delta_ratio"):
+        val = float(model.last_spatial_delta_ratio.item())
+        stats["spatial/delta_ratio"] = val
+        stats["spatial_delta_ratio"] = val
+
+    if hasattr(model, "tau_1_param") and hasattr(model, "tau_2_param"):
+        stats["diff_rbf_tau_1_effective"] = float((F.softplus(model.tau_1_param) + 1e-3).item())
+        stats["diff_rbf_tau_2_effective"] = float((F.softplus(model.tau_2_param) + 1e-3).item())
+
+    if hasattr(model, "lambda_node_proj"):
+        stats["diff_lambda_node_proj_norm"] = float(model.lambda_node_proj.weight.detach().norm(2).item())
+        if hasattr(model, "last_lambda_ij_mean"):
+            stats["diff_attn/lambda_effective"] = float(model.last_lambda_ij_mean.item())
+            stats["diff_attn_lambda_effective"] = float(model.last_lambda_ij_mean.item())
+            stats["diff_lambda_ij_std"] = float(model.last_lambda_ij_std.item())
+            stats["diff_lambda_ij_min"] = float(model.last_lambda_ij_min.item())
+            stats["diff_lambda_ij_max"] = float(model.last_lambda_ij_max.item())
+        else:
+            lambda_base = 0.20 + 0.65 * torch.sigmoid(model.lambda_node_proj.bias.detach()).mean().item()
+            stats["diff_attn/lambda_effective"] = float(lambda_base)
+            stats["diff_attn_lambda_effective"] = float(lambda_base)
+
+    if hasattr(model, "sign_tau"):
+        stats["sign_gt_tau_effective"] = float((F.softplus(model.sign_tau) + 1e-3).item())
+        stats["sign_gt_tau_raw"] = float(model.sign_tau.item())
+
+    if hasattr(model, "ac_delta"):
+        stats["acmp_delta_effective"] = float((torch.sigmoid(model.ac_delta) * 0.8).item())
+        stats["acmp_delta_raw"] = float(model.ac_delta.item())
+
+    if hasattr(model, "last_edge_mag_max"):
+        stats["diff_edge_mag_max"] = float(model.last_edge_mag_max.item())
+    if hasattr(model, "last_a_ij_density"):
+        stats["diff_a_ij_density"] = float(model.last_a_ij_density.item())
+    if hasattr(model, "last_a_ij_mean"):
+        stats["diff_a_ij_mean"] = float(model.last_a_ij_mean.item())
+
+    # 5. SoftSAE Dynamic Routing & Rational Activation
+    if hasattr(model, "last_k_float_mean"):
+        stats["routing_k_budget_mean"] = float(model.last_k_float_mean.item())
+    if hasattr(model, "last_k_float_std"):
+        stats["routing_k_budget_std"] = float(model.last_k_float_std.item())
+    if hasattr(model, "last_bio_scores_max"):
+        stats["routing_bio_scores_max"] = float(model.last_bio_scores_max.item())
+    if hasattr(model, "last_pade_out_max"):
+        stats["routing_pade_out_max"] = float(model.last_pade_out_max.item())
+    if hasattr(model, "b_scale"):
+        stats["softsae_b_scale_mean"] = float(model.b_scale.mean().item())
+        stats["softsae_b_enc_mean"] = float(model.b_enc.mean().item())
+        stats["routing_b_scale_max"] = float(model.b_scale.detach().max().item())
+
+    if hasattr(model, "pade_gate"):
+        stats["rsae_pade_p_norm"] = float(model.pade_gate.p_coeffs.norm(2).item())
+        stats["rsae_pade_q_norm"] = float(model.pade_gate.q_coeffs.norm(2).item())
+        stats["rsae_pade_p0"] = float(model.pade_gate.p_coeffs[0].item())
+        stats["rsae_pade_q0"] = float(model.pade_gate.q_coeffs[0].item())
+
+    # 6. Spatial GNN & CSNN Gates
+    stats["gnn_listen_prob_mean"] = float(model.last_listen_prob.mean().item()) if getattr(model, "last_listen_prob", None) is not None else 0.0
+    stats["gnn_broadcast_prob_mean"] = float(model.last_broadcast_prob.mean().item()) if getattr(model, "last_broadcast_prob", None) is not None else 0.0
+
+    if hasattr(model, "last_delta_h_max"):
+        stats["gnn_delta_h_max"] = float(model.last_delta_h_max.item())
+    if hasattr(model, "last_qwen_gate_mean"):
+        stats["gnn_qwen_gate_mean"] = float(model.last_qwen_gate_mean.item())
+    if hasattr(model, "last_spatial_context_max"):
+        stats["gnn_spatial_context_max"] = float(model.last_spatial_context_max.item())
+
+    # 7. Loss Dynamics & Residual Energy
+    if hasattr(model, "dynamic_w_ema"):
+        stats["loss_dynamic_w_ema"] = float(model.dynamic_w_ema.item())
+    if hasattr(model, "last_r_pos_energy"):
+        stats["loss_r_pos_energy_mean"] = float(model.last_r_pos_energy.item())
+    if hasattr(model, "last_aux_recon_energy"):
+        stats["loss_aux_recon_energy_mean"] = float(model.last_aux_recon_energy.item())
+
+    return stats
+

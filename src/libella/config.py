@@ -41,9 +41,10 @@ class RunConfig:
     n_dict_components: int = 100
     n_latents: int | None = 256
     extra_topics: int = 0
+    target_k: int = 19.0
 
     # Training & Batches
-    epochs: int = 300
+    epochs: int = 40
     batch_size: int = 5000
     meta_batch_size: int = 5
     phase2_force_window: int = 20
@@ -73,17 +74,17 @@ class RunConfig:
     laprune_gamma: float = 0.90
 
     # Top-K Sparsity & Latent Dynamics
-    topk_k: int = 38
+    topk_k: int = 19
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
 
     # AuxK Dormancy & Residual Resampling
-    aux_weight: float = 0.50
+    aux_weight: float = 1.0
     aux_k: int = 4
     aux_min_k: int = 2
     aux_min_residual_energy: float = 0.05
-    dead_step_threshold: int = 10
+    dead_step_threshold: int = 200
 
     # Ambient Baseline Decoupling
     ambient_scale_init: float = 0.50
@@ -103,6 +104,7 @@ class RunConfig:
     lr_base: float = 1e-3
     wd_base: float = 1e-4
     lr_decoder: float = 3e-3
+    lr_decoder_bias: float = 1e-4
     lr_temperature: float = 1e-3
     lr_min: float = 1e-6
     grad_clip_recon: float = 1000.0

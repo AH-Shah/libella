@@ -34,6 +34,7 @@ class LibellaGNN(nn.Module):
         # SoftSAE Dynamic Sparsity & Cosine Scoring Parameterization
         self.k_predictor = nn.Sequential(
             nn.Linear(in_channels, self.hidden_dim // 2),
+            nn.RMSNorm(self.hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(self.hidden_dim // 2, 1),
             nn.Sigmoid(),
@@ -48,18 +49,19 @@ class LibellaGNN(nn.Module):
         self.q_proj = nn.Linear(self.n_latents, 2 * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.n_latents, 2 * self.head_dim, bias=False)
 
-        # Differential Lambda Reparameterization (Learnable Vectors)
-        self.lambda_q1 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
-        self.lambda_k1 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
-        self.lambda_q2 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
-        self.lambda_k2 = nn.Parameter(torch.randn(self.head_dim) * 0.02)
-        self.lambda_init = 0.8  # Microsoft's recommended constant
+        # Node-projected 1D lambda logit for edge-adaptive noise subtraction
+        self.lambda_node_proj = nn.Linear(self.n_latents, 1)
+        with torch.no_grad():
+            nn.init.normal_(self.lambda_node_proj.weight, std=0.1)
+            nn.init.constant_(self.lambda_node_proj.bias, 0.5)
+
+        # Geometric RBF Physical Distance Scales (initialized dynamically from empirical edge distribution)
+        self.tau_1_param = nn.Parameter(torch.tensor(1.0))
+        self.tau_2_param = nn.Parameter(torch.tensor(0.1))
 
         # 2. Alibaba Qwen: Element-wise, Query-Dependent Gate
+        self.qwen_norm = nn.RMSNorm(self.n_latents)
         self.qwen_gate = nn.Linear(self.n_latents, self.n_latents)
-
-        # 3. Microsoft: Headwise Normalization
-        self.diff_norm = nn.RMSNorm(self.n_latents)
 
         self.sign_tau = nn.Parameter(torch.tensor(-2.0))
         self.ac_delta = nn.Parameter(torch.tensor(0.0))
@@ -68,25 +70,36 @@ class LibellaGNN(nn.Module):
         self.broadcast_gate = nn.Linear(self.n_latents, 1)
         
         with torch.no_grad():
-            # Start at 50/50 probability (0.0 raw) to maximize initial gradient flow
-            nn.init.constant_(self.listen_gate.bias, 0.0)
-            nn.init.constant_(self.broadcast_gate.bias, 0.0)
+            # Start at ~82% probability (+1.5 raw) to prevent early spatial freezing
+            nn.init.constant_(self.listen_gate.bias, 1.5)
+            nn.init.constant_(self.broadcast_gate.bias, 1.5)
 
         self.last_listen_prob = None
         self.last_broadcast_prob = None
 
-        # Spatial Gate Head operates on latent delta residual
+        # Spatial Gate Head operates on latent delta residual for per-channel vector modulation
         self.spatial_gate_head = nn.Linear(self.n_latents, self.n_latents)
         with torch.no_grad():
             nn.init.normal_(self.spatial_gate_head.weight, std=0.02)
             nn.init.zeros_(self.spatial_gate_head.bias)
 
-        # Learnable spatial gain knob (sigmoid(0.0) * 0.10 = 0.05 baseline modulation)
-        self.spatial_gain = nn.Parameter(torch.tensor(0.0))
-
         self.register_buffer("last_a_ij_density", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_a_ij_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_lambda_ij_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_lambda_ij_std", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_lambda_ij_min", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_lambda_ij_max", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_spatial_delta_ratio", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_k_float_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_k_float_std", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_bio_scores_max", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_pade_out_max", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_edge_mag_max", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_delta_h_max", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_qwen_gate_mean", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_spatial_context_max", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_r_pos_energy", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_aux_recon_energy", torch.tensor(0.0), persistent=False)
 
         # 4. Untied Encoder & Decoder Dictionaries
         if init_components is not None:
@@ -100,6 +113,9 @@ class LibellaGNN(nn.Module):
 
         self.decoder_weight = nn.Parameter(dec_init.clone())
         self.encoder_weight = nn.Parameter(dec_init.clone())
+        # Bias for the [0, 1] normalized space
+        self.encoder_bias = nn.Parameter(torch.zeros(in_channels))
+        # Bias for the [0, 5000] raw counts space
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
 
         # Buffers & Aux State Tracking
@@ -113,7 +129,7 @@ class LibellaGNN(nn.Module):
         self.coact_ema_initialized = False
         self.ema_momentum = 0.95 
 
-        self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 20)
+        self.dead_step_threshold = getattr(cfg, "dead_step_threshold", 200)
 
         self.aux_k = getattr(cfg, "aux_k", 4)
         self.ortho_sample_size = getattr(cfg, "ortho_sample_size", min(256, self.n_latents))
@@ -130,6 +146,7 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor,
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
+        spatial: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,              
         torch.Tensor,              
@@ -152,7 +169,7 @@ class LibellaGNN(nn.Module):
         # 1. BIOLOGY & RAW LOGIT SCORING (Scale σ ≈ sqrt(in_channels))
         cell_mass = torch.clamp(x_dense.norm(p=2, dim=-1, keepdim=True), min=1e-5)
         x_norm = x_dense / cell_mass
-        x_centered = x_norm - self.decoder_bias
+        x_centered = x_norm - self.encoder_bias
 
         w_enc_dir = F.normalize(self.encoder_weight, p=2, dim=1)
         cosine_sim = torch.mm(x_centered, w_enc_dir.t())
@@ -167,71 +184,103 @@ class LibellaGNN(nn.Module):
         bio_std = bio_scores.std(dim=-1, keepdim=True).clamp(min=1e-4)
         laprune_inputs = (bio_scores - bio_mean) / bio_std
 
+        k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
+        rank = torch.argsort(torch.argsort(bio_scores, dim=-1, descending=True), dim=-1)
+        hard_mask = (rank < k_discrete).float()
+
         if self.training:
             gamma_scale = getattr(self, "current_gamma_progress", 1.0)
             gamma_effective = max(0.05, self.laprune_gamma * gamma_scale)
             soft_mask = ExactLaPruneFunction.apply(laprune_inputs, k_i_float, gamma_effective)
-            # Safe-Padé rational pre-conditioner with ReLU positivity guard
-            z_canonical = F.relu(self.pade_gate(bio_scores)) * soft_mask
+            # STE: forward uses hard_mask, backward uses soft_mask
+            z_canonical = F.relu(self.pade_gate(bio_scores)) * (hard_mask.detach() - soft_mask.detach() + soft_mask)
         else:
-            k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
-            # Double-argsort guarantees EXACTLY K non-zeros by breaking ties deterministically
-            rank = torch.argsort(torch.argsort(bio_scores, dim=-1, descending=True), dim=-1)
-            hard_mask = (rank < k_discrete).float()
             z_canonical = F.relu(self.pade_gate(bio_scores)) * hard_mask
+
+        if self.training:
+            with torch.no_grad():
+                self.last_k_float_mean.copy_(k_i_float.mean())
+                self.last_k_float_std.copy_(k_i_float.std())
+                self.last_bio_scores_max.copy_(bio_scores.max())
+                self.last_pade_out_max.copy_(z_canonical.max())
 
         # 4. TOPOLOGY & ACMP WITH REINFORCED 5% GRADIENT FIREWALL
         H_0 = torch.tanh(bio_scores)
         
         # Spatial Gradient Firewall: Passes forward activations, throttles backward gradients into SAE to 5%
-        rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.05)
-        H_0_spatial = H_0.detach() + rho_spatial * (H_0 - H_0.detach())
+        rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.5)
+        H_0_spatial = H_0
 
         if len(src) > 0:
             W_bil = edge_weights.unsqueeze(1)
 
-            # Microsoft DiffAttn: Split Projections
+            # Microsoft DiffAttn: Split Projections & Scale
             Q = F.normalize(self.q_proj(H_0_spatial), p=2, dim=-1)
             K = F.normalize(self.k_proj(H_0_spatial), p=2, dim=-1)
             Q1, Q2 = Q.chunk(2, dim=-1)
             K1, K2 = K.chunk(2, dim=-1)
 
-            # Compute Signal 1 (Correlation) and Signal 2 (Common-Mode Noise)
-            sim_1 = (Q1[dst] * K1[src]).sum(dim=-1, keepdim=True)
-            sim_2 = (Q2[dst] * K2[src]).sum(dim=-1, keepdim=True)
+            scale = 1.0 / math.sqrt(self.head_dim)
+            tau_1 = F.softplus(self.tau_1_param) + 1e-3
+            tau_2 = F.softplus(self.tau_2_param) + 1e-3
 
-            # Synchronized Lambda Reparameterization
-            lambda_val = (
-                torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
-                - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
-                + self.lambda_init
-            )
+            if spatial is not None:
+                dist_sq = (spatial[src] - spatial[dst]).pow(2).sum(dim=-1, keepdim=True)
+                rbf_1 = torch.exp(torch.clamp(-dist_sq / tau_1, min=-30.0))
+                rbf_2 = torch.exp(torch.clamp(-dist_sq / tau_2, min=-30.0))
+            else:
+                rbf_1 = 5.0
+                rbf_2 = 30.0
 
-            # Differential Subtraction
-            diff_sim = sim_1 - lambda_val * sim_2
+            # 1. Geometric RBF-Scaled Dual Stream Similarities
+            sim_1 = (Q1[dst] * K1[src]).sum(dim=-1, keepdim=True) * scale * rbf_1
+            sim_2 = (Q2[dst] * K2[src]).sum(dim=-1, keepdim=True) * scale * rbf_2
 
+            # 2. Node-Factorized Edge-Adaptive Lambda (N, 1) -> (E, 1)
+            lambda_node_raw = self.lambda_node_proj(H_0_spatial)
+            lambda_edge_raw = (lambda_node_raw[src] + lambda_node_raw[dst]) / 2.0
+            lambda_ij = 0.20 + 0.65 * torch.sigmoid(lambda_edge_raw)
+
+            if self.training:
+                with torch.no_grad():
+                    self.last_lambda_ij_mean.copy_(lambda_ij.mean())
+                    self.last_lambda_ij_std.copy_(lambda_ij.std())
+                    self.last_lambda_ij_min.copy_(lambda_ij.min())
+                    self.last_lambda_ij_max.copy_(lambda_ij.max())
+
+            # 3. Differential Similarity & Phase Shift
+            diff_sim = sim_1 - lambda_ij * sim_2
             tau = F.softplus(self.sign_tau) + 1e-3
             edge_sign = torch.tanh(diff_sim / tau)
-            edge_mag = torch.exp(torch.clamp(torch.abs(diff_sim / tau), max=20.0))
 
-            mag_sum = torch.zeros((N, 1), device=x_dense.device)
-            mag_sum.index_add_(0, dst, edge_mag)
-            normalized_mag = edge_mag / torch.clamp(mag_sum[dst], min=1e-5)
-            A_ij = edge_sign * normalized_mag * W_bil
+            # 4. Magnitude Clamping (Max ~54.6)
+            edge_mag = torch.exp(torch.clamp(torch.abs(diff_sim / tau), max=4.0))
+
+            # 5. Signed Un-normalized Adjacency & Degree Normalization Across Neighbors
+            A_unnorm = edge_sign * edge_mag
+            deg_abs = torch.zeros((N, 1), device=x_dense.device)
+            deg_abs.index_add_(0, dst, torch.abs(A_unnorm))
+            A_diff = A_unnorm / torch.clamp(deg_abs[dst], min=1e-5)
+            A_ij = A_diff * W_bil
+
+            if getattr(self, "current_epoch", 0) < 10:
+                A_ij = torch.clamp(A_ij, min=-10.0, max=10.0)
 
             if self.training:
                 with torch.no_grad():
                     self.last_a_ij_density.copy_((torch.abs(A_ij) > 0.01).float().mean())
                     self.last_a_ij_mean.copy_(A_ij.mean())
+                    self.last_edge_mag_max.copy_(edge_mag.max())
 
             H_k = H_0_spatial
             delta = torch.sigmoid(self.ac_delta) * 0.8
             eta = 0.5  # Explicit Euler step size to prevent overshooting
 
             for _ in range(self.k_hops):
-                # Strict hard cap at 0.40 to prevent semantic oversmoothing and dictionary collapse
-                g_listen = 0.40 * torch.sigmoid(self.listen_gate(H_k))
-                g_broadcast = 0.40 * torch.sigmoid(self.broadcast_gate(H_k))
+                raw_listen = torch.sigmoid(self.listen_gate(H_k))
+                raw_broadcast = torch.sigmoid(self.broadcast_gate(H_k))
+                g_listen = raw_listen * 0.95 + 0.05
+                g_broadcast = raw_broadcast * 0.95 + 0.05
                 W_edge = A_ij * g_broadcast[src] * g_listen[dst]
 
                 msg = W_edge * (H_k[src] - H_k[dst])
@@ -262,26 +311,27 @@ class LibellaGNN(nn.Module):
                 d_ratio = delta_h.norm(p=2, dim=-1).mean() / (H_0_spatial.norm(p=2, dim=-1).mean() + 1e-5)
                 self.last_spatial_delta_ratio.copy_(d_ratio)
 
-        # 5. ZERO-CENTERED CONTEXTUAL MODULATION (DeepSeek Soft Severance + Qwen Gating + RMSNorm)
-        rho_recon_to_gnn = getattr(cfg, "recon_to_gnn_scale", 0.10)
-        delta_h_for_sae = delta_h.detach() + rho_recon_to_gnn * (delta_h - delta_h.detach())
-        g_qwen = torch.sigmoid(self.qwen_gate(H_0_spatial))
+        # 5. VECTORIZED CONTEXTUAL MODULATION (DeepSeek Soft Severance + Qwen Gating + Vector Alpha)
+        rho_recon_to_gnn = getattr(cfg, "recon_to_gnn_scale", 0.50)
+        delta_h_for_sae = delta_h
+        g_qwen = torch.sigmoid(self.qwen_gate(self.qwen_norm(H_0_spatial)))
         delta_h_gated = delta_h_for_sae * g_qwen
 
-        raw_context = self.spatial_gate_head(delta_h_gated)
-        norm_context = (1.0 - self.lambda_init) * self.diff_norm(raw_context)
-        centered_context = norm_context - norm_context.mean(dim=-1, keepdim=True)
-        spatial_context = torch.tanh(centered_context)
-
+        # Amplify residual input into spatial head and allow full dynamic range
+        raw_context = self.spatial_gate_head(delta_h_gated * 2.0)
         spatial_prog = getattr(self, "current_spatial_progress", 1.0) if self.training else 1.0
-        # Let the GNN swing the volume by up to +/- 40% (or cfg-defined ceiling)
-        alpha_max = getattr(cfg, "spatial_alpha_max", 0.40)
-        alpha = torch.sigmoid(self.spatial_gain) * alpha_max * spatial_prog
 
-        # z_contextual now has the dynamic range to deeply suppress or heavily boost
-        z_contextual = z_canonical * (1.0 + alpha * spatial_context)
+        # Dynamic per-channel vector modulation [-1.0, +1.0] gated by spatial curriculum
+        alpha_vec = spatial_prog * torch.tanh(raw_context)
+        z_contextual = z_canonical * (1.0 + alpha_vec)
 
-        return z_contextual, z_canonical, bio_scores, cell_mass, spatial_context, delta_h, src, dst, A_ij, k_i_float, edge_sign
+        if self.training:
+            with torch.no_grad():
+                self.last_delta_h_max.copy_(delta_h.abs().max())
+                self.last_qwen_gate_mean.copy_(g_qwen.mean())
+                self.last_spatial_context_max.copy_(alpha_vec.abs().max())
+
+        return z_contextual, z_canonical, bio_scores, cell_mass, alpha_vec, delta_h, src, dst, A_ij, k_i_float, edge_sign, hard_mask
 
     @torch.no_grad()
     def resample_dead_latents(
@@ -354,6 +404,7 @@ class LibellaGNN(nn.Module):
         src: torch.Tensor,
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
+        spatial: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,       
         torch.Tensor,       
@@ -383,12 +434,12 @@ class LibellaGNN(nn.Module):
             A_ij,
             k_i_float,
             edge_sign,
-        ) = self.encode(x_dense, src, dst, edge_weights)
+            hard_mask,
+        ) = self.encode(x_dense, src, dst, edge_weights, spatial=spatial)
         w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=-1)
 
-        # Direct Magnitude-Bypass Decoder Reconstruction
-        x_recon_centered = torch.mm(z_contextual, w_dec_norm)
-        x_recon = (x_recon_centered + self.decoder_bias) * cell_mass
+        # Direct Magnitude-Bypass Decoder Reconstruction with Depth Re-injection
+        x_recon = torch.mm(z_contextual, w_dec_norm) * cell_mass + self.decoder_bias
 
         aux_recon = None
         r_norm = None
@@ -397,11 +448,8 @@ class LibellaGNN(nn.Module):
 
         if self.training:
             with torch.no_grad():
-                # Use top-K indices from raw scores to determine genuine usage
-                k_track = k_i_float.detach().round().clamp(1, self.n_latents).long()
-                sorted_scores, _ = torch.sort(bio_scores.detach(), dim=-1, descending=True)
-                hard_thresh = torch.gather(sorted_scores, dim=1, index=k_track - 1)
-                active_in_batch = (bio_scores.detach() >= hard_thresh).any(dim=0)
+                # Re-use precomputed hard support directly to avoid redundant argsort passes
+                active_in_batch = (hard_mask > 0).any(dim=0)
 
                 self.steps_since_active.add_(1)
                 self.steps_since_active.masked_fill_(active_in_batch, 0)
@@ -413,6 +461,8 @@ class LibellaGNN(nn.Module):
                 r_pos_ret = r_pos
                 r_norm = F.normalize(r_pos + 1e-6, p=2, dim=-1)
                 residual_energy = r_pos.norm(p=2, dim=-1).mean()
+                self.last_r_pos_energy.copy_(residual_energy)
+                self.last_aux_recon_energy.zero_()
 
             if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
                 with torch.no_grad():
@@ -428,6 +478,7 @@ class LibellaGNN(nn.Module):
                     z_aux_weights = F.relu(topk_res.values)
                     z_aux = torch.zeros_like(aux_scores).scatter_(-1, topk_res.indices, z_aux_weights)
                     aux_recon = torch.mm(z_aux, w_dead)
+                    self.last_aux_recon_energy.copy_(aux_recon.norm(p=2, dim=-1).mean())
 
                     del dead_indices, w_dead, aux_sim, aux_scores, topk_res, z_aux_weights, z_aux
 
@@ -521,9 +572,8 @@ class LibellaGNN(nn.Module):
             # 1. Compute Exact Hard Support (Ignore soft-routed noise)
             if routed_scores is not None and k_i_float is not None:
                 k_discrete = torch.clamp(k_i_float.round().long(), min=1, max=self.n_latents)
-                sorted_scores, _ = torch.sort(routed_scores, dim=-1, descending=True)
-                hard_thresh = torch.gather(sorted_scores, dim=1, index=k_discrete - 1)
-                hard_mask = (routed_scores >= hard_thresh).float()
+                rank = torch.argsort(torch.argsort(routed_scores, dim=-1, descending=True), dim=-1)
+                hard_mask = (rank < k_discrete).float()
             else:
                 hard_mask = (z > 1e-4).float()
 
@@ -602,7 +652,8 @@ class LibellaGNN(nn.Module):
         aux_weight = getattr(cfg, "aux_weight", 0.50)
         budget_weight = getattr(cfg, "softsae_budget_weight", 1.0)
         align_weight = getattr(cfg, "enc_dec_align_weight", 15.0)
-        gate_weight = getattr(cfg, "gate_sparsity_weight", 0.05)
+        gate_prog = getattr(self, "current_gate_progress", 1.0) if self.training else 1.0
+        gate_weight = getattr(cfg, "gate_sparsity_weight", 0.05) * gate_prog
 
         total_loss = (
             l_recon
@@ -669,96 +720,4 @@ class LibellaGNN(nn.Module):
         mask = variance_mask.float() if edge_mask_float is None else variance_mask.float() * edge_mask_float
         return (total_raw_loss * mask).sum() / torch.clamp(mask.sum(), min=1.0)
 
-    @torch.no_grad()
-    def get_deep_telemetry(self) -> dict[str, float]:
-        """Harvests clean, unified model diagnostics and parameter statistics."""
-        stats: dict[str, float] = {}
-
-        for name, param in self.named_parameters():
-            p_clean = name.replace(".", "_")
-            stats[f"p_{p_clean}"] = float(param.detach().norm(2).item())
-            if param.grad is not None:
-                stats[f"g_{p_clean}"] = float(param.grad.detach().norm(2).item())
-                stats[f"z_{p_clean}_pct"] = float((param.grad == 0).float().mean().item() * 100.0)
-
-        # Dictionary telemetry
-        if hasattr(self, "encoder_weight"):
-            w_enc = F.normalize(self.encoder_weight, p=2, dim=-1)
-            stats["d_encoder_norm"] = float(self.encoder_weight.detach().norm(2).item())
-            s_enc = torch.linalg.svdvals(w_enc.detach().cpu())
-            stats["d_encoder_effective_rank"] = float(((s_enc.sum() ** 2) / torch.clamp((s_enc**2).sum(), min=1e-9)).item())
-
-        if hasattr(self, "decoder_weight"):
-            w_dec = F.normalize(self.decoder_weight, p=2, dim=-1)
-            stats["d_decoder_norm"] = float(self.decoder_weight.detach().norm(2).item())
-
-            sim = torch.mm(w_dec, w_dec.t())
-            off_diag_mask = ~torch.eye(w_dec.size(0), dtype=torch.bool, device=w_dec.device)
-            off_diag_vals = sim.masked_select(off_diag_mask)
-            if off_diag_vals.numel() > 0:
-                stats["d_max_cross_corr"] = float(off_diag_vals.max().item())
-                stats["d_mean_cross_corr"] = float(off_diag_vals.abs().mean().item())
-
-            s_dec = torch.linalg.svdvals(w_dec.detach().cpu())
-            stats["d_effective_rank"] = float(((s_dec.sum() ** 2) / torch.clamp((s_dec**2).sum(), min=1e-9)).item())
-            stats["d_svd_sigma_1"] = float(s_dec[0].item())
-            stats["d_svd_sigma_2"] = float(s_dec[1].item() if s_dec.numel() > 1 else 0.0)
-            stats["d_svd_sigma_3"] = float(s_dec[2].item() if s_dec.numel() > 2 else 0.0)
-
-        # Co-activation and Jaccard metrics
-        if hasattr(self, "coact_ema") and hasattr(self, "marginal_ema"):
-            off_diag_coact = self.coact_ema * self.ortho_mask
-            stats["d_coact_ema_mean"] = float(off_diag_coact.mean().item())
-            stats["d_coact_ema_max"] = float(off_diag_coact.max().item())
-
-            m_i = self.marginal_ema.unsqueeze(1)
-            m_j = self.marginal_ema.unsqueeze(0)
-            union_p = torch.clamp(m_i + m_j - self.coact_ema, min=1e-5)
-            jaccard_mat = (self.coact_ema / union_p) * self.ortho_mask
-            stats["d_jaccard_ema_mean"] = float(jaccard_mat.mean().item())
-            stats["d_jaccard_ema_max"] = float(jaccard_mat.max().item())
-
-        # Encoder-Decoder Alignment
-        if hasattr(self, "encoder_weight") and hasattr(self, "decoder_weight"):
-            w_enc = F.normalize(self.encoder_weight, p=2, dim=-1)
-            w_dec = F.normalize(self.decoder_weight, p=2, dim=-1)
-            align_cos = (w_enc * w_dec).sum(dim=-1)
-            stats["d_alignment_mean"] = float(align_cos.mean().item())
-            stats["d_alignment_min"] = float(align_cos.min().item())
-            quantiles = torch.quantile(align_cos, torch.tensor([0.10, 0.90], device=align_cos.device))
-            stats["d_alignment_p10"] = float(quantiles[0].item())
-            stats["d_alignment_p90"] = float(quantiles[1].item())
-
-        # Topology and Differential Attention
-        if hasattr(self, "last_spatial_delta_ratio"):
-            stats["spatial_delta_ratio"] = float(self.last_spatial_delta_ratio.item())
-        if hasattr(self, "spatial_gain"):
-            alpha_max = float(getattr(cfg, "spatial_alpha_max", 0.40))
-            stats["spatial_alpha_max"] = alpha_max
-            stats["spatial_gain_raw"] = float(self.spatial_gain.item())
-            stats["spatial_effective_gain"] = float((torch.sigmoid(self.spatial_gain) * alpha_max).item())
-        if hasattr(self, "sign_tau"):
-            stats["sign_gt_tau_effective"] = float((F.softplus(self.sign_tau) + 1e-3).item())
-            stats["sign_gt_tau_raw"] = float(self.sign_tau.item())
-        if hasattr(self, "ac_delta"):
-            stats["acmp_delta_effective"] = float((torch.sigmoid(self.ac_delta) * 0.8).item())
-            stats["acmp_delta_raw"] = float(self.ac_delta.item())
-        if hasattr(self, "lambda_q1") and hasattr(self, "lambda_k1"):
-            lambda_val = (
-                torch.exp(torch.dot(self.lambda_q1, self.lambda_k1))
-                - torch.exp(torch.dot(self.lambda_q2, self.lambda_k2))
-                + self.lambda_init
-            ).item()
-            stats["diff_attn_lambda_effective"] = float(lambda_val)
-
-        # Padé and Latent Routing
-        if hasattr(self, "b_scale"):
-            stats["softsae_b_scale_mean"] = float(self.b_scale.mean().item())
-            stats["softsae_b_enc_mean"] = float(self.b_enc.mean().item())
-        if hasattr(self, "pade_gate"):
-            stats["rsae_pade_p_norm"] = float(self.pade_gate.p_coeffs.norm(2).item())
-            stats["rsae_pade_q_norm"] = float(self.pade_gate.q_coeffs.norm(2).item())
-            stats["rsae_pade_p0"] = float(self.pade_gate.p_coeffs[0].item())
-            stats["rsae_pade_q0"] = float(self.pade_gate.q_coeffs[0].item())
-
-        return stats
+    
