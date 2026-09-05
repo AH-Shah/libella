@@ -55,9 +55,12 @@ class LibellaGNN(nn.Module):
             nn.init.normal_(self.lambda_node_proj.weight, std=0.1)
             nn.init.constant_(self.lambda_node_proj.bias, 0.5)
 
-        # Geometric RBF Physical Distance Scales (initialized dynamically from empirical edge distribution)
-        self.tau_1_param = nn.Parameter(torch.tensor(1.0))
-        self.tau_2_param = nn.Parameter(torch.tensor(0.1))
+        # --- REVISED: Geometric RBF Physical Distance Scales ---
+        # Use relative log-offsets centered at 0.0 to prevent 1/tau^2 gradient vanishing
+        self.register_buffer("tau_1_base", torch.tensor(1.0))
+        self.register_buffer("tau_2_base", torch.tensor(0.1))
+        self.delta_tau_1 = nn.Parameter(torch.tensor(0.0))
+        self.delta_tau_2 = nn.Parameter(torch.tensor(0.0))
 
         # 2. Alibaba Qwen: Element-wise, Query-Dependent Gate
         self.qwen_norm = nn.RMSNorm(self.n_latents)
@@ -77,10 +80,10 @@ class LibellaGNN(nn.Module):
         self.last_listen_prob = None
         self.last_broadcast_prob = None
 
-        # Spatial Gate Head operates on latent delta residual for per-channel vector modulation
+        # Initialize spatial gate head cleanly
         self.spatial_gate_head = nn.Linear(self.n_latents, self.n_latents)
         with torch.no_grad():
-            nn.init.normal_(self.spatial_gate_head.weight, std=0.02)
+            nn.init.normal_(self.spatial_gate_head.weight, std=0.01)
             nn.init.zeros_(self.spatial_gate_head.bias)
 
         self.register_buffer("last_a_ij_density", torch.tensor(0.0), persistent=False)
@@ -133,6 +136,14 @@ class LibellaGNN(nn.Module):
 
         self.aux_k = getattr(cfg, "aux_k", 4)
         self.ortho_sample_size = getattr(cfg, "ortho_sample_size", min(256, self.n_latents))
+
+    @torch.no_grad()
+    def set_empirical_rbf_scales(self, tau_1: float, tau_2: float) -> None:
+        """Sets empirical physical distance bases; learnable deltas remain centered at 0.0."""
+        self.tau_1_base.copy_(torch.tensor(float(tau_1)))
+        self.tau_2_base.copy_(torch.tensor(float(tau_2)))
+        self.delta_tau_1.zero_()
+        self.delta_tau_2.zero_()
 
     @torch.no_grad()
     def normalize_decoder(self) -> None:
@@ -221,8 +232,9 @@ class LibellaGNN(nn.Module):
             K1, K2 = K.chunk(2, dim=-1)
 
             scale = 1.0 / math.sqrt(self.head_dim)
-            tau_1 = F.softplus(self.tau_1_param) + 1e-3
-            tau_2 = F.softplus(self.tau_2_param) + 1e-3
+            # --- REVISED: Adaptive RBF scales with log-offset parameterization ---
+            tau_1 = self.tau_1_base * torch.exp(torch.clamp(self.delta_tau_1, min=-4.0, max=4.0))
+            tau_2 = self.tau_2_base * torch.exp(torch.clamp(self.delta_tau_2, min=-4.0, max=4.0))
 
             if spatial is not None:
                 dist_sq = (spatial[src] - spatial[dst]).pow(2).sum(dim=-1, keepdim=True)
@@ -317,11 +329,11 @@ class LibellaGNN(nn.Module):
         g_qwen = torch.sigmoid(self.qwen_gate(self.qwen_norm(H_0_spatial)))
         delta_h_gated = delta_h_for_sae * g_qwen
 
-        # Amplify residual input into spatial head and allow full dynamic range
-        raw_context = self.spatial_gate_head(delta_h_gated * 2.0)
+        # Raw context from un-normalized residual
+        raw_context = self.spatial_gate_head(delta_h_gated)
         spatial_prog = getattr(self, "current_spatial_progress", 1.0) if self.training else 1.0
 
-        # Dynamic per-channel vector modulation [-1.0, +1.0] gated by spatial curriculum
+        # Full unconstrained dynamic range: GNN can fully purge (-1.0) or reinforce (+1.0)
         alpha_vec = spatial_prog * torch.tanh(raw_context)
         z_contextual = z_canonical * (1.0 + alpha_vec)
 
@@ -514,7 +526,6 @@ class LibellaGNN(nn.Module):
         ghost_logits: torch.Tensor | None = None,
         ghost_weights: torch.Tensor | None = None,
         progress: float = 1.0,
-        spatial_shift: torch.Tensor | None = None,
         src: torch.Tensor | None = None,
         dst: torch.Tensor | None = None,
         z_full: torch.Tensor | None = None,

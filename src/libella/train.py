@@ -196,7 +196,7 @@ def init_decoder_bias_from_data(
         model.decoder_bias.data.copy_(ambient_floor)
         print(f"  ↳ Initialized decoder_bias to raw count mean (L2 norm: {model.decoder_bias.norm(2).item():.4f}, across {total_samples} core cells)")
 
-    if collected_edge_dists_sq and hasattr(model, "tau_1_param") and hasattr(model, "tau_2_param"):
+    if collected_edge_dists_sq and hasattr(model, "set_empirical_rbf_scales"):
         all_d_sq = torch.cat(collected_edge_dists_sq, dim=0)
         # Filter out self-loops (d = 0) so quantiles reflect genuine inter-cell physical spacing
         valid_edge_mask = all_d_sq > 1e-4
@@ -210,8 +210,7 @@ def init_decoder_bias_from_data(
         tau_2_emp = float(q_d_sq[0].item())  # 10th percentile of distinct neighbors (Physical contact)
         tau_1_emp = float(q_d_sq[4].item())  # 90th percentile of distinct neighbors (Paracrine diffusion boundary)
 
-        model.tau_2_param.data.copy_(torch.tensor(inverse_softplus(tau_2_emp), device=device))
-        model.tau_1_param.data.copy_(torch.tensor(inverse_softplus(tau_1_emp), device=device))
+        model.set_empirical_rbf_scales(tau_1_emp, tau_2_emp)
 
         print(
             f"  ↳ Empirical Distance Distribution (across {all_d_sq.numel()} edges):\n"
@@ -263,7 +262,7 @@ def _init_model(
     ]
     diff_attn_params = [
         p for n, p in model.named_parameters()
-        if any(k in n for k in ["q_proj", "k_proj", "tau_1_param", "tau_2_param", "lambda_node_proj"])
+        if any(k in n for k in ["q_proj", "k_proj", "delta_tau", "lambda_node_proj"])
         and id(p) not in {id(w) for w in strict_wd_gate_params}
     ]
     temp_routing_params = [
@@ -502,7 +501,6 @@ def _train_loop(
                     r_norm=r_norm,
                     train_mask=train_mask,
                     progress=schedules["global_progress"],
-                    spatial_shift=spatial_context,
                     src=src,
                     dst=dst,
                     z_full=z,

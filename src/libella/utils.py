@@ -832,9 +832,11 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
         stats["spatial/delta_ratio"] = val
         stats["spatial_delta_ratio"] = val
 
-    if hasattr(model, "tau_1_param") and hasattr(model, "tau_2_param"):
-        stats["diff_rbf_tau_1_effective"] = float((F.softplus(model.tau_1_param) + 1e-3).item())
-        stats["diff_rbf_tau_2_effective"] = float((F.softplus(model.tau_2_param) + 1e-3).item())
+    if hasattr(model, "tau_1_base") and hasattr(model, "delta_tau_1"):
+        tau_1_eff = model.tau_1_base * torch.exp(torch.clamp(model.delta_tau_1, min=-4.0, max=4.0))
+        tau_2_eff = model.tau_2_base * torch.exp(torch.clamp(model.delta_tau_2, min=-4.0, max=4.0))
+        stats["diff_rbf_tau_1_effective"] = float(tau_1_eff.item())
+        stats["diff_rbf_tau_2_effective"] = float(tau_2_eff.item())
 
     if hasattr(model, "lambda_node_proj"):
         stats["diff_lambda_node_proj_norm"] = float(model.lambda_node_proj.weight.detach().norm(2).item())
