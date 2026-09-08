@@ -25,7 +25,7 @@ class LibellaGNN(nn.Module):
         self.k_hops = getattr(cfg, "k_hops", 2)
         self.n_latents = n_metaprograms
         self.in_channels = in_channels
-        self.target_k = float(getattr(cfg, "target_k", 38.0))
+        self.target_k = float(getattr(cfg, "target_k", 19.0))
         # Limit dynamic budget bounds to [0.5x, 1.5x] of K goal
         self.min_k = 0.5 * self.target_k
         self.max_k = 1.5 * self.target_k
@@ -108,12 +108,17 @@ class LibellaGNN(nn.Module):
         if init_components is not None:
             dec_init = torch.tensor(init_components, dtype=torch.float32)
             if dec_init.shape != (self.n_latents, in_channels):
-                dec_init = torch.randn(self.n_latents, in_channels)
+                dec_init = torch.abs(torch.randn(self.n_latents, in_channels))
+            else:
+                dec_init = torch.abs(dec_init)
         else:
-            dec_init = torch.randn(self.n_latents, in_channels)
+            dec_init = torch.abs(torch.randn(self.n_latents, in_channels))
 
         dec_init = F.normalize(dec_init, p=2, dim=-1)
 
+        self.register_buffer("tau_0", torch.tensor(0.025))
+        self.register_buffer("budget_lambda", torch.tensor(1.0))
+        self.delta_tau_gene = nn.Parameter(torch.zeros(self.n_latents, 1))
         self.decoder_weight = nn.Parameter(dec_init.clone())
         self.encoder_weight = nn.Parameter(dec_init.clone())
         # Bias for the [0, 1] normalized space
@@ -170,6 +175,7 @@ class LibellaGNN(nn.Module):
         torch.Tensor | None,    
         torch.Tensor,         
         torch.Tensor | None,    
+        torch.Tensor,
     ]:
         if len(src) > 0:
             src = src.contiguous()
@@ -182,9 +188,17 @@ class LibellaGNN(nn.Module):
         x_norm = x_dense / cell_mass
         x_centered = x_norm - self.encoder_bias
 
-        w_enc_dir = F.normalize(self.encoder_weight, p=2, dim=1)
-        cosine_sim = torch.mm(x_centered, w_enc_dir.t())
-        bio_scores = torch.exp(self.b_scale) * cosine_sim + self.b_enc
+        tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
+        w_enc_pos = F.relu(self.encoder_weight)
+
+        w_gnn_norm = F.normalize(w_enc_pos + 1e-8, p=2, dim=-1)
+        w_sae_sparse = F.relu(w_enc_pos - tau)
+        w_sae_norm = F.normalize(w_sae_sparse + 1e-8, p=2, dim=-1)
+
+        sae_sim = torch.mm(x_centered, w_sae_norm.t())
+        bio_scores = torch.exp(self.b_scale) * sae_sim + self.b_enc
+
+        gnn_sim = torch.mm(x_centered, w_gnn_norm.t())
 
         # 2. DYNAMIC K-BUDGET ESTIMATION [0.5x -> 1.5x of target_k]
         k_ratio = self.k_predictor(x_centered)
@@ -216,7 +230,7 @@ class LibellaGNN(nn.Module):
                 self.last_pade_out_max.copy_(z_canonical.max())
 
         # 4. TOPOLOGY & ACMP WITH REINFORCED 5% GRADIENT FIREWALL
-        H_0 = torch.tanh(bio_scores)
+        H_0 = torch.tanh(gnn_sim)
         
         # Spatial Gradient Firewall: Passes forward activations, throttles backward gradients into SAE to 5%
         rho_spatial = getattr(cfg, "spatial_gradient_scale", 0.5)
@@ -390,6 +404,7 @@ class LibellaGNN(nn.Module):
         # 1. Update BOTH dictionaries simultaneously
         self.decoder_weight.data[target_dead_ids] = new_atoms
         self.encoder_weight.data[target_dead_ids] = new_atoms.clone()
+        self.delta_tau_gene.data[target_dead_ids] = 0.0
 
         # 2. Reset score scale and bias for revived latents (Scale = 0.0 -> e^0 = 1.0)
         self.b_scale.data[target_dead_ids] = 0.0
@@ -399,7 +414,7 @@ class LibellaGNN(nn.Module):
 
         # 3. Reset optimizer moments
         if optimizer is not None:
-            params_to_reset = [self.decoder_weight, self.encoder_weight, self.b_scale, self.b_enc]
+            params_to_reset = [self.decoder_weight, self.encoder_weight, self.b_scale, self.b_enc, self.delta_tau_gene]
             for param in params_to_reset:
                 state = optimizer.state.get(param, None)
                 if state is not None:
@@ -433,6 +448,8 @@ class LibellaGNN(nn.Module):
         torch.Tensor,       
         torch.Tensor,       
         torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         (
             z_contextual,
@@ -448,10 +465,13 @@ class LibellaGNN(nn.Module):
             edge_sign,
             hard_mask,
         ) = self.encode(x_dense, src, dst, edge_weights, spatial=spatial)
-        w_dec_norm = F.normalize(self.decoder_weight, p=2, dim=-1)
+        tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
+        w_dec_pos = F.relu(self.decoder_weight)
+        w_dec_sparse = F.relu(w_dec_pos - tau)
+        w_dec_norm = F.normalize(w_dec_sparse + 1e-8, p=2, dim=-1)
 
-        # Direct Magnitude-Bypass Decoder Reconstruction with Depth Re-injection
-        x_recon = torch.mm(z_contextual, w_dec_norm) * cell_mass + self.decoder_bias
+        x_raw = torch.mm(z_contextual, w_dec_norm) * cell_mass
+        x_recon = F.relu(x_raw - self.decoder_bias)
 
         aux_recon = None
         r_norm = None
@@ -510,6 +530,8 @@ class LibellaGNN(nn.Module):
             z_canonical,
             bio_scores,
             edge_sign,
+            w_dec_sparse,
+            tau,
         )
 
     def calc_loss(
@@ -518,6 +540,8 @@ class LibellaGNN(nn.Module):
         x_true: torch.Tensor,
         z: torch.Tensor,
         w_dec_norm: torch.Tensor,
+        w_dec_sparse: torch.Tensor | None = None,
+        tau: torch.Tensor | None = None,
         routed_scores: torch.Tensor | None = None,
         k_i_float: torch.Tensor | None = None,
         aux_recon: torch.Tensor | None = None,
@@ -531,7 +555,7 @@ class LibellaGNN(nn.Module):
         z_full: torch.Tensor | None = None,
         A_ij: torch.Tensor | None = None,
         x_full: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = (x_true > 0).detach()
         mask = train_mask if train_mask is not None else torch.ones((x_true.size(0), 1), device=x_true.device)
@@ -564,13 +588,13 @@ class LibellaGNN(nn.Module):
         per_cell_loss = torch.sum(variance_weight * (stable_log_cosh + peak_penalty), dim=-1, keepdim=True)
         l_recon = torch.sum(per_cell_loss * mask) / (valid_nodes * math.sqrt(x_true.shape[-1]))
 
-        # 2. DUAL-HINGE ALIGNMENT LOSS (500x hard boundary wall)
-        w_enc_norm = F.normalize(self.encoder_weight, p=2, dim=-1)
+        if tau is None:
+            tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
+        w_enc_pos = F.relu(self.encoder_weight)
+        w_enc_sparse = F.relu(w_enc_pos - tau)
+        w_enc_norm = F.normalize(w_enc_sparse + 1e-8, p=2, dim=-1)
         align_cos = (w_enc_norm * w_dec_norm).sum(dim=-1)
-        # Linear hinge below 0.85 (gentle tether) + Impenetrable cliff below 0.75
-        l_align_linear = F.relu(0.85 - align_cos)
-        l_align_hard = F.relu(0.75 - align_cos).pow(2) * 500.0
-        l_align = torch.mean(l_align_linear + l_align_hard)
+        l_align = torch.mean(F.relu(0.85 - align_cos).pow(2)) * 10.0
 
         # 3. L1 GATE SPARSITY PENALTY (Forces selective neighborhood listening)
         if self.last_listen_prob is not None and self.last_broadcast_prob is not None:
@@ -630,9 +654,12 @@ class LibellaGNN(nn.Module):
         if k_i_float is not None:
             mean_k = (k_i_float * mask).sum() / valid_nodes
             k_err = mean_k - self.target_k
+            if self.training:
+                with torch.no_grad():
+                    self.budget_lambda.add_(0.02 * k_err.detach()).clamp_(min=0.5, max=10.0)
             
             # 1. Asymmetric Multiplier
-            asym_factor = torch.where(k_err > 0, 2.0, 1.0)
+            asym_factor = torch.where(k_err > 0, 2.0, 1.5)
             
             # 2. Charbonnier / Smoothed L1 Penalty
             eps = 0.1
@@ -662,17 +689,40 @@ class LibellaGNN(nn.Module):
 
         aux_weight = getattr(cfg, "aux_weight", 0.50)
         budget_weight = getattr(cfg, "softsae_budget_weight", 1.0)
-        align_weight = getattr(cfg, "enc_dec_align_weight", 15.0)
         gate_prog = getattr(self, "current_gate_progress", 1.0) if self.training else 1.0
         gate_weight = getattr(cfg, "gate_sparsity_weight", 0.05) * gate_prog
+
+        w_dec_pos = F.relu(self.decoder_weight)
+        if w_dec_sparse is None:
+            w_dec_sparse = F.relu(w_dec_pos - tau)
+
+        target_genes = getattr(cfg, "target_genes_per_latent", 350.0)
+        smooth_active_genes = torch.sigmoid((w_dec_pos - tau) / 0.01).sum(dim=-1)
+        active_latents_mask = (z > 1e-4).any(dim=0).float()
+        n_active = active_latents_mask.sum().clamp(min=1.0)
+        excess_genes = F.relu(smooth_active_genes - target_genes)
+        l_domain_sparse = (excess_genes * active_latents_mask).sum() / (n_active * target_genes)
+        lambda_domain = getattr(cfg, "domain_sparsity_weight", 0.05)
+
+        l_arip = torch.tensor(0.0, device=x_true.device)
+        arip_weight = getattr(cfg, "arip_weight", 0.0)
+        if self.training and n_active > 1 and arip_weight > 0.0:
+            active_indices = torch.nonzero(active_latents_mask).squeeze(-1)
+            w_sub = w_dec_norm[active_indices]
+            gram_sub = torch.mm(w_sub, w_sub.t())
+            active_count_f = n_active
+            arip_penalty = F.relu(gram_sub.pow(2).sum() - active_count_f) / active_count_f
+            l_arip = arip_penalty * arip_weight
 
         total_loss = (
             l_recon
             + (current_ortho * l_ortho)
-            + (budget_weight * l_budget)
+            + (self.budget_lambda * budget_weight * l_budget)
             + (aux_weight * l_aux)
-            + (align_weight * l_align)
+            + l_align
             + (gate_weight * l_gate_sparse)
+            + (lambda_domain * l_domain_sparse)
+            + l_arip
         )
 
         return (
@@ -683,6 +733,8 @@ class LibellaGNN(nn.Module):
             l_aux.detach(),
             l_align.detach(),
             l_gate_sparse.detach(),
+            l_domain_sparse.detach(),
+            l_arip.detach(),
         )
 
     def calc_spatial_loss(

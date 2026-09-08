@@ -412,6 +412,15 @@ class UnifiedLogger:
             amb_pct = (1.0 / (1.0 + 2.718281828459045 ** (-amb_val * 5.0))) * 0.40 * 100.0
             metrics["autopsy/ambient_absorption_pct"] = amb_pct
 
+        if "delta_tau_gene" in state:
+            tau_0 = state.get("tau_0", torch.tensor(0.025)).float()
+            tau = tau_0 * torch.exp(torch.clamp(state["delta_tau_gene"].float(), min=-2.0, max=2.5))
+            metrics["autopsy/tau_mean"] = float(tau.mean().item())
+            if "decoder_weight" in state:
+                w_dec = F.relu(state["decoder_weight"].float())
+                w_sparse = F.relu(w_dec - tau)
+                metrics["autopsy/gene_density_pct"] = float((w_sparse > 0).float().mean().item() * 100.0)
+
         if self.writer:
             self.log_metrics(step, metrics)
 
@@ -785,6 +794,20 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
         stats["d_decoder_bias_max"] = float(model.decoder_bias.detach().abs().max().item())
         stats["d_decoder_bias_mean"] = float(model.decoder_bias.detach().mean().item())
 
+    if hasattr(model, "delta_tau_gene") and hasattr(model, "tau_0"):
+        tau = model.tau_0 * torch.exp(torch.clamp(model.delta_tau_gene.detach(), min=-2.0, max=2.5))
+        stats["tau_mean"] = float(tau.mean().item())
+        stats["tau_min"] = float(tau.min().item())
+        stats["tau_max"] = float(tau.max().item())
+        if hasattr(model, "decoder_weight"):
+            w_dec = F.relu(model.decoder_weight.detach())
+            w_sparse = F.relu(w_dec - tau)
+            density = (w_sparse > 0).float()
+            stats["gene_density_pct"] = float(density.mean().item() * 100.0)
+            per_latent = density.sum(dim=-1)
+            stats["genes_per_latent_min"] = float(per_latent.min().item())
+            stats["genes_per_latent_max"] = float(per_latent.max().item())
+
     if hasattr(model, "decoder_weight"):
         w_dec = F.normalize(model.decoder_weight, p=2, dim=-1)
         stats["d_decoder_norm"] = float(model.decoder_weight.detach().norm(2).item())
@@ -832,11 +855,9 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
         stats["spatial/delta_ratio"] = val
         stats["spatial_delta_ratio"] = val
 
-    if hasattr(model, "tau_1_base") and hasattr(model, "delta_tau_1"):
-        tau_1_eff = model.tau_1_base * torch.exp(torch.clamp(model.delta_tau_1, min=-4.0, max=4.0))
-        tau_2_eff = model.tau_2_base * torch.exp(torch.clamp(model.delta_tau_2, min=-4.0, max=4.0))
-        stats["diff_rbf_tau_1_effective"] = float(tau_1_eff.item())
-        stats["diff_rbf_tau_2_effective"] = float(tau_2_eff.item())
+    if hasattr(model, "tau_1_param") and hasattr(model, "tau_2_param"):
+        stats["diff_rbf_tau_1_effective"] = float((F.softplus(model.tau_1_param) + 1e-3).item())
+        stats["diff_rbf_tau_2_effective"] = float((F.softplus(model.tau_2_param) + 1e-3).item())
 
     if hasattr(model, "lambda_node_proj"):
         stats["diff_lambda_node_proj_norm"] = float(model.lambda_node_proj.weight.detach().norm(2).item())
@@ -867,6 +888,8 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
         stats["diff_a_ij_mean"] = float(model.last_a_ij_mean.item())
 
     # 5. SoftSAE Dynamic Routing & Rational Activation
+    if hasattr(model, "budget_lambda"):
+        stats["routing_budget_lambda"] = float(model.budget_lambda.item())
     if hasattr(model, "last_k_float_mean"):
         stats["routing_k_budget_mean"] = float(model.last_k_float_mean.item())
     if hasattr(model, "last_k_float_std"):

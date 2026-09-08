@@ -1,0 +1,40 @@
+======================================================================================================
+                  TRI-MODEL BENCHMARK SCORECARD: GROUND TRUTH vs. LIBELLA vs. BANKSY                  
+======================================================================================================
+  - Target Barcode Subset : Strictly 1:1 Matched Across All Models
+  - Identical Cells       : 114,623
+  - Discovery Model       : Libella_Discovery
+  - Total Benchmark Time  : 13.51s
+
+| Metric / Benchmark Domain                    |      Oracle (GT) | Libella_Discov.. |           BANKSY |
+|:------------------------------------------- |---------------: |---------------: |---------------:|
+| **Domain 1: Cell Type Discriminability**     |                  |                  |                  |
+|   Probe Macro-AUROC                          |           1.0000 |           0.8955 |           0.9430 |
+|   Probe Balanced Accuracy                    |           1.0000 |           0.2066 |           0.2654 |
+|   Probe Macro-F1                             |           1.0000 |           0.2013 |           0.2573 |
+| **Domain 2: Anti-Oversmoothing & Dispersion** |                  |                  |                  |
+|   Dirichlet Energy Ratio                     |           1.2572 |           1.4818 |           1.5648 |
+|   Latent Mean Moran's I                      |           0.1299 |           0.0934 |           0.0465 |
+| **Domain 3: Boundary Sharpness**             |                  |                  |                  |
+|   Boundary Contrast Ratio (BCR)              |           2.0000 |           1.5383 |           1.0584 |
+|   Boundary Separation (Cohen's d)            |          10.0000 |           1.3545 |           0.5241 |
+| **Domain 4: Infiltration Architecture**      |                  |                  |                  |
+|   Infiltration Mixing Entropy Corr           |           0.9998 |           0.6608 |           0.3251 |
+|   Mean Cluster Clark-Evans R                 |           0.5726 |           0.5896 |           0.3928 |
+| **Domain 5: Latent Capacity & Sparsity**     |                  |                  |                  |
+|   Effective Rank (eRank)                     |          12.6700 |         204.4000 |         242.8100 |
+|   Activation Gini Sparsity                   |           0.9500 |           0.9304 |           0.4429 |
+| **Domain 6: Lineage Clustering & Purity**    |                  |                  |                  |
+|   Clustering NMI                             |           0.9954 |           0.3178 |           0.3276 |
+|   Clustering ARI                             |           0.9998 |           0.3409 |           0.1359 |
+|   Centroid-Approximated ASW                  |           1.0000 |           0.0825 |           0.0505 |
+| **Domain 7: Spatial Microenvironment**       |                  |                  |                  |
+|   Spatial Cluster kNN Purity                 |           0.5285 |           0.3092 |           0.3370 |
+| **Domain 8: Manifold Preservation**          |                  |                  |                  |
+|   Edge Manifold Correlation                  |           0.4165 |           0.5071 |           0.4278 |
+| **Domain 9: Transcriptome Reconstruction**   |                  |                  |                  |
+|   HVG Imputation AUPRC                       |           0.2653 |           0.4120 |           0.6133 |
+|   Non-Zero Spearman rho                      |           0.2117 |           0.2853 |           0.4180 |
+| **Metadata**                                 |                  |                  |                  |
+|   Latent Dimensions (D)                      |               20 |              256 |              256 |
+|   Identical Cells Evaluated                  |          114,623 |          114,623 |          114,623 |

@@ -250,6 +250,15 @@ def _init_model(
         p for n, p in model.named_parameters()
         if "decoder_weight" in n or "encoder_weight" in n
     ]
+    tau_params = [
+        p for n, p in model.named_parameters()
+        if "delta_tau_gene" in n
+    ]
+    no_decay_params = [
+        p for n, p in model.named_parameters()
+        if any(nd in n for nd in ["b_scale", "b_enc", "k_predictor"])
+    ]
+    no_decay_ids = {id(p) for p in no_decay_params + tau_params}
     strict_wd_gate_params = [
         p for n, p in model.named_parameters()
         if n in (
@@ -258,29 +267,40 @@ def _init_model(
             "listen_gate.weight",
             "broadcast_gate.weight",
         )
-        or "k_predictor" in n
+        and id(p) not in no_decay_ids
     ]
     diff_attn_params = [
         p for n, p in model.named_parameters()
         if any(k in n for k in ["q_proj", "k_proj", "delta_tau", "lambda_node_proj"])
         and id(p) not in {id(w) for w in strict_wd_gate_params}
+        and id(p) not in no_decay_ids
     ]
     temp_routing_params = [
         p for n, p in model.named_parameters()
         if any(k in n for k in [
             "sign_tau", "ac_delta", "listen_gate", "broadcast_gate",
-            "spatial_gate_head", "b_scale", "b_enc",
-            "pade_gate", "k_predictor", "qwen_gate", "qwen_norm"
+            "spatial_gate_head", "pade_gate", "qwen_gate", "qwen_norm"
         ])
         and id(p) not in {id(w) for w in strict_wd_gate_params}
+        and id(p) not in no_decay_ids
     ]
-    special_ids = {id(p) for p in bias_params + decoder_weight_params + strict_wd_gate_params + diff_attn_params + temp_routing_params}
+    special_ids = {
+        id(p)
+        for p in bias_params
+        + decoder_weight_params
+        + no_decay_params
+        + tau_params
+        + strict_wd_gate_params
+        + diff_attn_params
+        + temp_routing_params
+    }
     base_params = [
         p for p in model.parameters()
         if id(p) not in special_ids
     ]
 
     lr_base = getattr(cfg, "lr_base", 1e-3)
+    lr_tau = getattr(cfg, "lr_tau", lr_base * 20.0)
     optimizer = torch.optim.Adam([
         {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},
         {"params": strict_wd_gate_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_gates", 1e-3)},
@@ -288,6 +308,8 @@ def _init_model(
         {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0},
         {"params": bias_params, "lr": getattr(cfg, "lr_decoder_bias", 1e-4), "weight_decay": 0.0},
         {"params": temp_routing_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
+        {"params": no_decay_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
+        {"params": tau_params, "lr": lr_tau, "weight_decay": 0.0},
     ], betas=(0.0, 0.999), eps=1e-8)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -387,7 +409,11 @@ def _train_loop(
             "l_aux": torch.zeros((), device=device),
             "l_align": torch.zeros((), device=device),
             "l_gate_sparse": torch.zeros((), device=device),
+            "l_domain_sparse": torch.zeros((), device=device),
+            "l_arip": torch.zeros((), device=device),
             "l_spatial": torch.zeros((), device=device),
+            "tau_mean": torch.zeros((), device=device),
+            "gene_density": torch.zeros((), device=device),
             "k_pred_mean": torch.zeros((), device=device),
             "a_ij_mean": torch.zeros((), device=device),
             "a_ij_density": torch.zeros((), device=device),
@@ -474,6 +500,8 @@ def _train_loop(
                     z_canonical,
                     routed_scores,
                     edge_sign,
+                    w_dec_sparse,
+                    tau,
                 ) = model(x, src, dst, weights, spatial=spatial)
 
                 last_r_pos = r_pos
@@ -495,6 +523,8 @@ def _train_loop(
                     x,
                     z,
                     w_dec_norm,
+                    w_dec_sparse=w_dec_sparse,
+                    tau=tau,
                     routed_scores=routed_scores,
                     k_i_float=k_i_float,
                     aux_recon=aux_recon,
@@ -514,6 +544,8 @@ def _train_loop(
                 base_aux_val = loss_res[4]
                 base_align_val = loss_res[5]
                 base_gate_sparse_val = loss_res[6]
+                base_domain_sparse_val = loss_res[7]
+                base_arip_val = loss_res[8]
 
                 # 3. Dedicated Contrastive Spatial Relation Loss with Warm-up Gate
                 spatial_progress = schedules.get("spatial_progress", 0.0)
@@ -576,7 +608,11 @@ def _train_loop(
                     epoch_telemetry_acc["l_aux"] += base_aux_val
                     epoch_telemetry_acc["l_align"] += base_align_val
                     epoch_telemetry_acc["l_gate_sparse"] += base_gate_sparse_val
+                    epoch_telemetry_acc["l_domain_sparse"] += base_domain_sparse_val
+                    epoch_telemetry_acc["l_arip"] += base_arip_val
                     epoch_telemetry_acc["l_spatial"] += l_spatial_rel
+                    epoch_telemetry_acc["tau_mean"] += tau.detach().mean()
+                    epoch_telemetry_acc["gene_density"] += (w_dec_sparse.detach() > 0).float().mean() * 100.0
                     if k_i_float is not None:
                         epoch_telemetry_acc["k_pred_mean"] += k_i_float[train_idx].detach().mean()
                     epoch_telemetry_acc["l0_avg"] += batch_active.sum(dim=-1).mean()
@@ -636,7 +672,7 @@ def _train_loop(
 
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
 
-                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores, edge_sign
+                del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores, edge_sign, w_dec_sparse, tau
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
@@ -759,6 +795,8 @@ def _train_loop(
                 "spatial": round(epoch_telemetry.get("l_spatial", 0.0), 4),
                 "align": round(epoch_telemetry.get("l_align", 0.0), 4),
                 "gate_sparse": round(epoch_telemetry.get("l_gate_sparse", 0.0), 4),
+                "domain_sparse": round(epoch_telemetry.get("l_domain_sparse", 0.0), 4),
+                "arip": round(epoch_telemetry.get("l_arip", 0.0), 4),
                 "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
             },
             "k_pred_mean": round(epoch_telemetry.get("k_pred_mean", target_k), 2),
@@ -848,7 +886,12 @@ def _train_loop(
             "l_spatial": epoch_telemetry.get("l_spatial", 0.0),
             "l_align": epoch_telemetry.get("l_align", 0.0),
             "l_gate_sparse": epoch_telemetry.get("l_gate_sparse", 0.0),
+            "l_domain_sparse": epoch_telemetry.get("l_domain_sparse", 0.0),
+            "l_arip": epoch_telemetry.get("l_arip", 0.0),
             "l_dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
+            "tau_mean": epoch_telemetry.get("tau_mean", 0.0),
+            "gene_density_pct": epoch_telemetry.get("gene_density", 0.0),
+            "budget_lambda": float(model.budget_lambda.item()) if hasattr(model, "budget_lambda") else 1.0,
             "sae_k_pred_mean": epoch_telemetry.get("k_pred_mean", 0.0),
             "sae_sparsity_pct": epoch_telemetry.get("p_w", 0.0),
             "sae_entropy": epoch_telemetry.get("ent", 0.0),
