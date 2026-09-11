@@ -118,6 +118,8 @@ class LibellaGNN(nn.Module):
 
         self.register_buffer("tau_0", torch.tensor(0.025))
         self.register_buffer("budget_lambda", torch.tensor(1.0))
+        self.register_buffer("gene_lambda", torch.tensor(1.0))
+        self.target_genes = float(getattr(cfg, "target_genes_per_latent", 350.0))
         self.delta_tau_gene = nn.Parameter(torch.zeros(self.n_latents, 1))
         self.decoder_weight = nn.Parameter(dec_init.clone())
         self.encoder_weight = nn.Parameter(dec_init.clone())
@@ -156,6 +158,18 @@ class LibellaGNN(nn.Module):
         self.decoder_weight.data = F.normalize(self.decoder_weight.data, p=2, dim=-1)
         self.encoder_weight.data = F.normalize(self.encoder_weight.data, p=2, dim=-1)
 
+    @staticmethod
+    def _apply_ste_gate(
+        w_pos: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Soft-to-Hard STE preserving full magnitude in forward with soft gradients in backward."""
+        w_soft = F.relu(w_pos - tau)
+        w_hard = w_pos * (w_pos > tau).float()
+        w_sparse = w_hard.detach() - w_soft.detach() + w_soft
+        w_norm = F.normalize(w_sparse + 1e-8, p=2, dim=-1)
+        return w_sparse, w_norm
+
     def encode(
         self,
         x_dense: torch.Tensor,
@@ -192,8 +206,7 @@ class LibellaGNN(nn.Module):
         w_enc_pos = F.relu(self.encoder_weight)
 
         w_gnn_norm = F.normalize(w_enc_pos + 1e-8, p=2, dim=-1)
-        w_sae_sparse = F.relu(w_enc_pos - tau)
-        w_sae_norm = F.normalize(w_sae_sparse + 1e-8, p=2, dim=-1)
+        w_sae_sparse, w_sae_norm = self._apply_ste_gate(w_enc_pos, tau)
 
         sae_sim = torch.mm(x_centered, w_sae_norm.t())
         bio_scores = torch.exp(self.b_scale) * sae_sim + self.b_enc
@@ -467,8 +480,7 @@ class LibellaGNN(nn.Module):
         ) = self.encode(x_dense, src, dst, edge_weights, spatial=spatial)
         tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
         w_dec_pos = F.relu(self.decoder_weight)
-        w_dec_sparse = F.relu(w_dec_pos - tau)
-        w_dec_norm = F.normalize(w_dec_sparse + 1e-8, p=2, dim=-1)
+        w_dec_sparse, w_dec_norm = self._apply_ste_gate(w_dec_pos, tau)
 
         x_raw = torch.mm(z_contextual, w_dec_norm) * cell_mass
         x_recon = F.relu(x_raw - self.decoder_bias)
@@ -591,8 +603,7 @@ class LibellaGNN(nn.Module):
         if tau is None:
             tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
         w_enc_pos = F.relu(self.encoder_weight)
-        w_enc_sparse = F.relu(w_enc_pos - tau)
-        w_enc_norm = F.normalize(w_enc_sparse + 1e-8, p=2, dim=-1)
+        _, w_enc_norm = self._apply_ste_gate(w_enc_pos, tau)
         align_cos = (w_enc_norm * w_dec_norm).sum(dim=-1)
         l_align = torch.mean(F.relu(0.85 - align_cos).pow(2)) * 10.0
 
@@ -694,15 +705,36 @@ class LibellaGNN(nn.Module):
 
         w_dec_pos = F.relu(self.decoder_weight)
         if w_dec_sparse is None:
-            w_dec_sparse = F.relu(w_dec_pos - tau)
+            w_dec_sparse, _ = self._apply_ste_gate(w_dec_pos, tau)
 
-        target_genes = getattr(cfg, "target_genes_per_latent", 350.0)
-        smooth_active_genes = torch.sigmoid((w_dec_pos - tau) / 0.01).sum(dim=-1)
+        target_genes = float(getattr(cfg, "target_genes_per_latent", 350.0))
+        temp = 0.01
+
+        sig_w = torch.sigmoid((w_dec_pos - tau) / temp)
+        sig_0 = torch.sigmoid(-tau / temp)
+        smooth_active_genes = (F.relu(sig_w - sig_0) / (1.0 - sig_0 + 1e-6)).sum(dim=-1)
+
+        per_latent_err = smooth_active_genes - target_genes
+        mean_genes = smooth_active_genes.mean()
+        gene_err = mean_genes - target_genes
+
+        if self.training:
+            with torch.no_grad():
+                norm_err = gene_err / target_genes
+                self.gene_lambda.add_(0.02 * norm_err.detach()).clamp_(min=0.2, max=15.0)
+
+        eps = 1.0
+        smooth_gene_l1 = torch.sqrt(per_latent_err.pow(2) + eps**2) - eps
+        asym_gene = torch.where(per_latent_err > 0, 2.0, 1.5)
+
+        squeeze = getattr(self, "current_progress", progress)
+        pressure = 1.0 + 9.0 * squeeze
+
+        l_domain_sparse = (asym_gene * smooth_gene_l1 * pressure).mean() / target_genes
+        domain_weight = getattr(cfg, "domain_sparsity_weight", 1.0)
+
         active_latents_mask = (z > 1e-4).any(dim=0).float()
         n_active = active_latents_mask.sum().clamp(min=1.0)
-        excess_genes = F.relu(smooth_active_genes - target_genes)
-        l_domain_sparse = (excess_genes * active_latents_mask).sum() / (n_active * target_genes)
-        lambda_domain = getattr(cfg, "domain_sparsity_weight", 0.05)
 
         l_arip = torch.tensor(0.0, device=x_true.device)
         arip_weight = getattr(cfg, "arip_weight", 0.0)
@@ -718,10 +750,10 @@ class LibellaGNN(nn.Module):
             l_recon
             + (current_ortho * l_ortho)
             + (self.budget_lambda * budget_weight * l_budget)
+            + (self.gene_lambda * domain_weight * l_domain_sparse)
             + (aux_weight * l_aux)
             + l_align
             + (gate_weight * l_gate_sparse)
-            + (lambda_domain * l_domain_sparse)
             + l_arip
         )
 

@@ -413,12 +413,12 @@ class UnifiedLogger:
             metrics["autopsy/ambient_absorption_pct"] = amb_pct
 
         if "delta_tau_gene" in state:
-            tau_0 = state.get("tau_0", torch.tensor(0.025)).float()
+            tau_0 = state.get("tau_0", torch.tensor(0.05)).float()
             tau = tau_0 * torch.exp(torch.clamp(state["delta_tau_gene"].float(), min=-2.0, max=2.5))
             metrics["autopsy/tau_mean"] = float(tau.mean().item())
             if "decoder_weight" in state:
                 w_dec = F.relu(state["decoder_weight"].float())
-                w_sparse = F.relu(w_dec - tau)
+                w_sparse = w_dec * (w_dec > tau).float()
                 metrics["autopsy/gene_density_pct"] = float((w_sparse > 0).float().mean().item() * 100.0)
 
         if self.writer:
@@ -801,7 +801,10 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
         stats["tau_max"] = float(tau.max().item())
         if hasattr(model, "decoder_weight"):
             w_dec = F.relu(model.decoder_weight.detach())
-            w_sparse = F.relu(w_dec - tau)
+            if hasattr(model, "_apply_ste_gate"):
+                w_sparse, _ = model._apply_ste_gate(w_dec, tau)
+            else:
+                w_sparse = w_dec * (w_dec > tau).float()
             density = (w_sparse > 0).float()
             stats["gene_density_pct"] = float(density.mean().item() * 100.0)
             per_latent = density.sum(dim=-1)
@@ -890,6 +893,8 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
     # 5. SoftSAE Dynamic Routing & Rational Activation
     if hasattr(model, "budget_lambda"):
         stats["routing_budget_lambda"] = float(model.budget_lambda.item())
+    if hasattr(model, "gene_lambda"):
+        stats["routing_gene_lambda"] = float(model.gene_lambda.item())
     if hasattr(model, "last_k_float_mean"):
         stats["routing_k_budget_mean"] = float(model.last_k_float_mean.item())
     if hasattr(model, "last_k_float_std"):

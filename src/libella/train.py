@@ -555,7 +555,7 @@ def _train_loop(
                     l_spatial_rel = model.calc_spatial_loss(
                         delta_h, edge_sign, src, dst, x_norm, edge_mask_float=edge_mask_float
                     )
-                    spatial_loss_weight = getattr(cfg, "spatial_loss_weight", 15.0) * spatial_progress
+                    spatial_loss_weight = getattr(cfg, "spatial_loss_weight", 30.0) * spatial_progress
                     spatial_loss_val = spatial_loss_weight * l_spatial_rel
                 else:
                     l_spatial_rel = torch.tensor(0.0, device=device)
@@ -892,6 +892,7 @@ def _train_loop(
             "tau_mean": epoch_telemetry.get("tau_mean", 0.0),
             "gene_density_pct": epoch_telemetry.get("gene_density", 0.0),
             "budget_lambda": float(model.budget_lambda.item()) if hasattr(model, "budget_lambda") else 1.0,
+            "gene_lambda": float(model.gene_lambda.item()) if hasattr(model, "gene_lambda") else 1.0,
             "sae_k_pred_mean": epoch_telemetry.get("k_pred_mean", 0.0),
             "sae_sparsity_pct": epoch_telemetry.get("p_w", 0.0),
             "sae_entropy": epoch_telemetry.get("ent", 0.0),
