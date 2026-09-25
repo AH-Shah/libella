@@ -263,7 +263,6 @@ def _init_model(
         p for n, p in model.named_parameters()
         if n in (
             "qwen_gate.weight",
-            "spatial_gate_head.weight",
             "listen_gate.weight",
             "broadcast_gate.weight",
         )
@@ -279,10 +278,18 @@ def _init_model(
         p for n, p in model.named_parameters()
         if any(k in n for k in [
             "sign_tau", "ac_delta", "listen_gate", "broadcast_gate",
-            "spatial_gate_head", "pade_gate", "qwen_gate", "qwen_norm"
+            "pade_gate", "qwen_gate", "qwen_norm"
         ])
         and id(p) not in {id(w) for w in strict_wd_gate_params}
         and id(p) not in no_decay_ids
+    ]
+    orthogonal_params = [
+        p for n, p in model.named_parameters()
+        if "cross_weight" in n or "cross_talk" in n
+    ]
+    direct_gate_params = [
+        p for n, p in model.named_parameters()
+        if "spatial_gate_head" in n and "cross_weight" not in n and "cross_talk" not in n
     ]
     special_ids = {
         id(p)
@@ -293,6 +300,8 @@ def _init_model(
         + strict_wd_gate_params
         + diff_attn_params
         + temp_routing_params
+        + direct_gate_params
+        + orthogonal_params
     }
     base_params = [
         p for p in model.parameters()
@@ -304,6 +313,8 @@ def _init_model(
     optimizer = torch.optim.Adam([
         {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},
         {"params": strict_wd_gate_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_gates", 1e-3)},
+        {"params": direct_gate_params, "lr": lr_base * 2.0, "weight_decay": 1e-4},
+        {"params": orthogonal_params, "lr": lr_base * 1.0, "weight_decay": 0.0},
         {"params": diff_attn_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_diff_attn", 1e-4)},
         {"params": decoder_weight_params, "lr": getattr(cfg, "lr_decoder", lr_base * 0.5), "weight_decay": 0.0},
         {"params": bias_params, "lr": getattr(cfg, "lr_decoder_bias", 1e-4), "weight_decay": 0.0},
@@ -840,6 +851,9 @@ def _train_loop(
                 "delta_h_max": round(deep_stats.get("gnn_delta_h_max", 0.0), 4),
                 "qwen_gate_mean": round(deep_stats.get("gnn_qwen_gate_mean", 0.0), 4),
                 "spatial_context_max": round(deep_stats.get("gnn_spatial_context_max", 0.0), 4),
+                "cross_scale": round(deep_stats.get("spatial_gate_cross_scale", 0.0), 4),
+                "w_direct_mean": round(deep_stats.get("spatial_gate_w_direct_mean", 0.0), 4),
+                "cross_eff_rank": round(deep_stats.get("spatial_gate_cross_eff_rank", float(model.n_latents)), 2),
             },
             "loss_and_reg": {
                 "dynamic_w_ema": round(deep_stats.get("loss_dynamic_w_ema", 1.0), 4),
@@ -901,6 +915,9 @@ def _train_loop(
             "spatial_shift_mag": epoch_telemetry.get("shift_mag", 0.0),
             "csnn_listen_prob_mean": epoch_telemetry.get("csnn_listen", 0.0),
             "csnn_broadcast_prob_mean": epoch_telemetry.get("csnn_broadcast", 0.0),
+            "spatial_gate_cross_scale": deep_stats.get("spatial_gate_cross_scale", 0.0),
+            "spatial_gate_w_direct_mean": deep_stats.get("spatial_gate_w_direct_mean", 0.0),
+            "spatial_gate_cross_eff_rank": deep_stats.get("spatial_gate_cross_eff_rank", float(model.n_latents)),
             "sae_l0_total": current_l0,
             "sae_dead_latents": current_dead,
             "sae_z_mag_mean": epoch_telemetry.get("z_mag_mean", 0.0),

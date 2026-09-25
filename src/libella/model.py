@@ -11,6 +11,45 @@ import torch.nn.functional as F
 from .config import cfg
 from .utils import ExactLaPruneFunction, SafePadeActivation
 
+
+class SemanticOrthogonalGateHead(nn.Module):
+    """Dual-path semantic and orthogonal manifold spatial modulation head."""
+
+    def __init__(self, n_latents: int) -> None:
+        super().__init__()
+        self.n_latents = n_latents
+        self.in_norm = nn.RMSNorm(n_latents)
+        self.w_direct = nn.Parameter(torch.full((n_latents,), 0.5))
+        self.b_direct = nn.Parameter(torch.zeros(n_latents))
+        w_init = torch.empty(n_latents, n_latents)
+        nn.init.orthogonal_(w_init)
+        self.cross_weight = nn.Parameter(w_init)
+        self.cross_scale = nn.Parameter(torch.zeros(1))
+
+    def _orthogonalize(self, steps: int = 5) -> torch.Tensor:
+        with torch.no_grad():
+            v = torch.ones((self.n_latents, 1), device=self.cross_weight.device, dtype=self.cross_weight.dtype)
+            for _ in range(2):
+                v = torch.mm(self.cross_weight, v)
+                v = v / (v.norm() + 1e-7)
+                v = torch.mm(self.cross_weight.t(), v)
+                v = v / (v.norm() + 1e-7)
+            s_max = torch.norm(torch.mm(self.cross_weight, v))
+        scale = torch.clamp(s_max, min=1e-6) * 1.05
+        x_mat = self.cross_weight / scale
+        for _ in range(steps):
+            a_mat = torch.mm(x_mat.t(), x_mat)
+            x_mat = 1.5 * x_mat - 0.5 * torch.mm(x_mat, a_mat)
+        return x_mat
+
+    def forward(self, delta_h_gated: torch.Tensor) -> torch.Tensor:
+        h_norm = self.in_norm(delta_h_gated)
+        direct_context = h_norm * self.w_direct + self.b_direct
+        w_ortho = self._orthogonalize(steps=5)
+        cross_context = F.linear(h_norm, w_ortho) * self.cross_scale
+        return direct_context + cross_context
+
+
 class LibellaGNN(nn.Module):
     """Core Libella Spatial GNN architecture with Top-K Hard Sparsity and Residual AuxK Revival."""
 
@@ -80,11 +119,7 @@ class LibellaGNN(nn.Module):
         self.last_listen_prob = None
         self.last_broadcast_prob = None
 
-        # Initialize spatial gate head cleanly
-        self.spatial_gate_head = nn.Linear(self.n_latents, self.n_latents)
-        with torch.no_grad():
-            nn.init.normal_(self.spatial_gate_head.weight, std=0.01)
-            nn.init.zeros_(self.spatial_gate_head.bias)
+        self.spatial_gate_head = SemanticOrthogonalGateHead(self.n_latents)
 
         self.register_buffer("last_a_ij_density", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_a_ij_mean", torch.tensor(0.0), persistent=False)
@@ -422,12 +457,26 @@ class LibellaGNN(nn.Module):
         # 2. Reset score scale and bias for revived latents (Scale = 0.0 -> e^0 = 1.0)
         self.b_scale.data[target_dead_ids] = 0.0
         self.b_enc.data[target_dead_ids] = 0.0
+        if hasattr(self.spatial_gate_head, "w_direct"):
+            self.spatial_gate_head.w_direct.data[target_dead_ids] = 0.5
+            self.spatial_gate_head.b_direct.data[target_dead_ids] = 0.0
 
         self.steps_since_active[target_dead_ids] = 0
 
         # 3. Reset optimizer moments
         if optimizer is not None:
-            params_to_reset = [self.decoder_weight, self.encoder_weight, self.b_scale, self.b_enc, self.delta_tau_gene]
+            params_to_reset = [
+                self.decoder_weight,
+                self.encoder_weight,
+                self.b_scale,
+                self.b_enc,
+                self.delta_tau_gene,
+            ]
+            if hasattr(self.spatial_gate_head, "w_direct"):
+                params_to_reset.extend([
+                    self.spatial_gate_head.w_direct,
+                    self.spatial_gate_head.b_direct,
+                ])
             for param in params_to_reset:
                 state = optimizer.state.get(param, None)
                 if state is not None:

@@ -925,6 +925,27 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
     if hasattr(model, "last_spatial_context_max"):
         stats["gnn_spatial_context_max"] = float(model.last_spatial_context_max.item())
 
+    if hasattr(model, "spatial_gate_head"):
+        sgh = model.spatial_gate_head
+        if hasattr(sgh, "cross_scale"):
+            stats["spatial_gate_cross_scale"] = float(sgh.cross_scale.detach().item())
+        if hasattr(sgh, "w_direct"):
+            stats["spatial_gate_w_direct_mean"] = float(sgh.w_direct.detach().mean().item())
+            stats["spatial_gate_w_direct_std"] = float(sgh.w_direct.detach().std().item())
+        if hasattr(sgh, "b_direct"):
+            stats["spatial_gate_b_direct_mean"] = float(sgh.b_direct.detach().mean().item())
+        if hasattr(sgh, "_orthogonalize"):
+            w_cross = sgh._orthogonalize().detach().cpu()
+            s_cross = torch.linalg.svdvals(w_cross)
+            stats["spatial_gate_cross_eff_rank"] = float(((s_cross.sum() ** 2) / torch.clamp((s_cross ** 2).sum(), min=1e-9)).item())
+            stats["spatial_gate_cross_s_min"] = float(s_cross[-1].item())
+            stats["spatial_gate_cross_s_max"] = float(s_cross[0].item())
+        elif hasattr(sgh, "cross_talk") and hasattr(sgh.cross_talk, "weight"):
+            w_cross = sgh.cross_talk.weight.detach().cpu()
+            s_cross = torch.linalg.svdvals(w_cross)
+            stats["spatial_gate_cross_eff_rank"] = float(((s_cross.sum() ** 2) / torch.clamp((s_cross ** 2).sum(), min=1e-9)).item())
+            stats["spatial_gate_cross_s_min"] = float(s_cross[-1].item())
+
     # 7. Loss Dynamics & Residual Energy
     if hasattr(model, "dynamic_w_ema"):
         stats["loss_dynamic_w_ema"] = float(model.dynamic_w_ema.item())
