@@ -780,7 +780,7 @@ class LibellaGNN(nn.Module):
         pressure = 1.0 + 9.0 * squeeze
 
         l_domain_sparse = (asym_gene * smooth_gene_l1 * pressure).mean() / target_genes
-        domain_weight = getattr(cfg, "domain_sparsity_weight", 1.0)
+        domain_weight = getattr(cfg, "domain_sparsity_weight", 2.5)
 
         active_latents_mask = (z > 1e-4).any(dim=0).float()
         n_active = active_latents_mask.sum().clamp(min=1.0)
