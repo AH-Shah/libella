@@ -558,22 +558,19 @@ class LibellaGNN(nn.Module):
                 self.last_aux_recon_energy.zero_()
 
             if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
-                with torch.no_grad():
-                    dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
-                    num_dead = dead_indices.numel()
-                    k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
+                dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
+                num_dead = dead_indices.numel()
+                k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
 
-                    w_dead = w_dec_norm[dead_indices].detach()
-                    aux_sim = torch.mm(r_norm, w_dead.t())
-                    aux_scores = torch.exp(self.b_scale[dead_indices]) * aux_sim + self.b_enc[dead_indices]
-                    topk_res = torch.topk(aux_scores, k=k_aux, dim=-1)
+                w_dead = w_dec_norm[dead_indices]
+                aux_sim = torch.mm(r_norm.detach(), w_dead.t())
+                aux_scores = torch.exp(self.b_scale[dead_indices]) * aux_sim + self.b_enc[dead_indices]
+                topk_res = torch.topk(aux_scores, k=k_aux, dim=-1)
 
-                    z_aux_weights = F.relu(topk_res.values)
-                    z_aux = torch.zeros_like(aux_scores).scatter_(-1, topk_res.indices, z_aux_weights)
-                    aux_recon = torch.mm(z_aux, w_dead)
-                    self.last_aux_recon_energy.copy_(aux_recon.norm(p=2, dim=-1).mean())
-
-                    del dead_indices, w_dead, aux_sim, aux_scores, topk_res, z_aux_weights, z_aux
+                z_aux_weights = F.relu(topk_res.values)
+                z_aux = torch.zeros_like(aux_scores).scatter(-1, topk_res.indices, z_aux_weights)
+                aux_recon = torch.mm(z_aux, w_dead)
+                self.last_aux_recon_energy.copy_(aux_recon.detach().norm(p=2, dim=-1).mean())
 
         return (
             x_recon,
@@ -736,8 +733,7 @@ class LibellaGNN(nn.Module):
         # 5. Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
-            aux_error = (aux_recon - r_norm).pow(2).sum(dim=-1).mean()
-            l_aux = aux_error / res_energy
+            l_aux = (aux_recon - r_norm.detach()).pow(2).sum(dim=-1).mean() / res_energy
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 

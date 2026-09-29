@@ -718,7 +718,7 @@ def _train_loop(
                 elif hasattr(model, "decoder_weight"):
                     model.decoder_weight.data = F.normalize(model.decoder_weight.data, p=2, dim=-1)
 
-                if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
+                if getattr(cfg, "enable_hard_resample", False) and last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
                     model.resample_dead_latents(last_r_pos, last_dead_mask, optimizer=optimizer)
 
             global_step += 1

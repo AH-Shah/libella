@@ -84,7 +84,7 @@ class RunConfig:
     aux_k: int = 4
     aux_min_k: int = 2
     aux_min_residual_energy: float = 0.05
-    dead_step_threshold: int = 200
+    dead_step_threshold: int = 100
 
     # Ambient Baseline Decoupling
     ambient_scale_init: float = 0.50
