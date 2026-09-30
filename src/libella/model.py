@@ -651,7 +651,9 @@ class LibellaGNN(nn.Module):
         w_enc_pos = F.relu(self.encoder_weight)
         _, w_enc_norm = self._apply_ste_gate(w_enc_pos, tau)
         align_cos = (w_enc_norm * w_dec_norm).sum(dim=-1)
-        l_align = torch.mean(F.relu(0.85 - align_cos).pow(2)) * 10.0
+        l_align_mean = torch.mean(F.relu(0.85 - align_cos).pow(2)) * 10.0
+        l_align_floor = torch.mean(F.relu(0.40 - align_cos).pow(2)) * 30.0
+        l_align = l_align_mean + l_align_floor
 
         # 3. L1 GATE SPARSITY PENALTY (Forces selective neighborhood listening)
         if self.last_listen_prob is not None and self.last_broadcast_prob is not None:
@@ -698,8 +700,8 @@ class LibellaGNN(nn.Module):
         excess_sim = F.relu(positive_sim - ortho_thresh)
         
         # 6. Apply Jaccard Scaling
-        redundancy_matrix = jaccard_ema * excess_sim.pow(2)
-        l_ortho_mean = redundancy_matrix.sum() / max(1.0, self.ortho_mask.sum())
+        redundancy_matrix = (1 + jaccard_ema) * excess_sim.pow(2)
+        l_ortho_mean = redundancy_matrix.sum() / self.n_latents
         
         # 7. Clone Guard (Emergency brake for literal twins)
         max_corr = positive_sim.max()
