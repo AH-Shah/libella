@@ -45,6 +45,7 @@ class RunConfig:
 
     # Training & Batches
     epochs: int = 40
+    target_optim_steps: int = 260
     batch_size: int = 5000
     meta_batch_size: int = 5
     phase2_force_window: int = 20
@@ -78,13 +79,19 @@ class RunConfig:
     active_latent_threshold: float = 1e-4
     alpha_ema_max: float = 0.005
     alpha_ema_step_multiplier: float = 2.0
+    target_genes_per_latent: float = 350.0
+    init_balance_lambda: float = 50.0
+    target_balance: float = 1.04
+    lr_balance_lambda: float = 0.5
+    min_balance_lambda: float = 5.0
+    max_balance_lambda: float = 150.0
 
     # AuxK Dormancy & Residual Resampling
     aux_weight: float = 1.0
     aux_k: int = 4
     aux_min_k: int = 2
     aux_min_residual_energy: float = 0.05
-    dead_step_threshold: int = 100
+    dead_step_threshold: int = 200
 
     # Ambient Baseline Decoupling
     ambient_scale_init: float = 0.50

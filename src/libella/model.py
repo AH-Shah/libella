@@ -138,6 +138,7 @@ class LibellaGNN(nn.Module):
         self.register_buffer("last_spatial_context_max", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_r_pos_energy", torch.tensor(0.0), persistent=False)
         self.register_buffer("last_aux_recon_energy", torch.tensor(0.0), persistent=False)
+        self.register_buffer("last_balance_loss", torch.tensor(0.0), persistent=False)
 
         # 4. Untied Encoder & Decoder Dictionaries
         if init_components is not None:
@@ -154,7 +155,12 @@ class LibellaGNN(nn.Module):
         self.register_buffer("tau_0", torch.tensor(0.025))
         self.register_buffer("budget_lambda", torch.tensor(1.0))
         self.register_buffer("gene_lambda", torch.tensor(1.0))
+        self.register_buffer(
+            "balance_lambda",
+            torch.tensor(float(getattr(cfg, "init_balance_lambda", 50.0)), dtype=torch.float32),
+        )
         self.target_genes = float(getattr(cfg, "target_genes_per_latent", 350.0))
+        self.target_balance = float(getattr(cfg, "target_balance", 1.04))
         self.delta_tau_gene = nn.Parameter(torch.zeros(self.n_latents, 1))
         self.decoder_weight = nn.Parameter(dec_init.clone())
         self.encoder_weight = nn.Parameter(dec_init.clone())
@@ -337,7 +343,7 @@ class LibellaGNN(nn.Module):
             A_diff = A_unnorm / torch.clamp(deg_abs[dst], min=1e-5)
             A_ij = A_diff * W_bil
 
-            if getattr(self, "current_epoch", 0) < 10:
+            if getattr(self, "current_global_progress", 0.0) < 0.25:
                 A_ij = torch.clamp(A_ij, min=-10.0, max=10.0)
 
             if self.training:
@@ -558,19 +564,22 @@ class LibellaGNN(nn.Module):
                 self.last_aux_recon_energy.zero_()
 
             if dead_mask_ret.any() and residual_energy > getattr(cfg, "aux_min_residual_energy", 0.05):
-                dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
-                num_dead = dead_indices.numel()
-                k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
+                with torch.no_grad():
+                    dead_indices = torch.nonzero(dead_mask_ret).squeeze(-1)
+                    num_dead = dead_indices.numel()
+                    k_aux = min(max(getattr(cfg, "aux_min_k", 2), self.aux_k), num_dead)
 
-                w_dead = w_dec_norm[dead_indices]
-                aux_sim = torch.mm(r_norm.detach(), w_dead.t())
-                aux_scores = torch.exp(self.b_scale[dead_indices]) * aux_sim + self.b_enc[dead_indices]
-                topk_res = torch.topk(aux_scores, k=k_aux, dim=-1)
+                    w_dead = w_dec_norm[dead_indices].detach()
+                    aux_sim = torch.mm(r_norm, w_dead.t())
+                    aux_scores = torch.exp(self.b_scale[dead_indices]) * aux_sim + self.b_enc[dead_indices]
+                    topk_res = torch.topk(aux_scores, k=k_aux, dim=-1)
 
-                z_aux_weights = F.relu(topk_res.values)
-                z_aux = torch.zeros_like(aux_scores).scatter(-1, topk_res.indices, z_aux_weights)
-                aux_recon = torch.mm(z_aux, w_dead)
-                self.last_aux_recon_energy.copy_(aux_recon.detach().norm(p=2, dim=-1).mean())
+                    z_aux_weights = F.relu(topk_res.values)
+                    z_aux = torch.zeros_like(aux_scores).scatter_(-1, topk_res.indices, z_aux_weights)
+                    aux_recon = torch.mm(z_aux, w_dead)
+                    self.last_aux_recon_energy.copy_(aux_recon.norm(p=2, dim=-1).mean())
+
+                    del dead_indices, w_dead, aux_sim, aux_scores, topk_res, z_aux_weights, z_aux
 
         return (
             x_recon,
@@ -613,7 +622,18 @@ class LibellaGNN(nn.Module):
         z_full: torch.Tensor | None = None,
         A_ij: torch.Tensor | None = None,
         x_full: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         # 1. Variance-Weighted Cell-Averaged Asymmetric Log-Cosh Loss
         is_non_zero = (x_true > 0).detach()
         mask = train_mask if train_mask is not None else torch.ones((x_true.size(0), 1), device=x_true.device)
@@ -735,7 +755,8 @@ class LibellaGNN(nn.Module):
         # 5. Residual Alignment
         if aux_recon is not None and r_norm is not None:
             res_energy = torch.clamp(r_norm.pow(2).sum(dim=-1).mean(), min=1e-4)
-            l_aux = (aux_recon - r_norm.detach()).pow(2).sum(dim=-1).mean() / res_energy
+            aux_error = (aux_recon - r_norm).pow(2).sum(dim=-1).mean()
+            l_aux = aux_error / res_energy
         else:
             l_aux = torch.tensor(0.0, device=x_true.device)
 
@@ -793,6 +814,24 @@ class LibellaGNN(nn.Module):
             arip_penalty = F.relu(gram_sub.pow(2).sum() - active_count_f) / active_count_f
             l_arip = arip_penalty * arip_weight
 
+        if routed_scores is not None:
+            f_hard = ((z > 1e-4).float() * mask).sum(dim=0).detach() / valid_nodes
+            f_norm = f_hard / torch.clamp(f_hard.sum(), min=1e-5)
+            p_soft = (F.softmax(routed_scores, dim=-1) * mask).sum(dim=0) / valid_nodes
+            l_balance = float(self.n_latents) * torch.sum(f_norm * p_soft)
+            if self.training:
+                with torch.no_grad():
+                    bal_err = l_balance.detach() - self.target_balance
+                    lr_lambda = getattr(cfg, "lr_balance_lambda", 0.5)
+                    min_lambda = getattr(cfg, "min_balance_lambda", 5.0)
+                    max_lambda = getattr(cfg, "max_balance_lambda", 150.0)
+                    self.balance_lambda.add_(lr_lambda * bal_err).clamp_(
+                        min=min_lambda, max=max_lambda
+                    )
+                    self.last_balance_loss.copy_(l_balance.detach())
+        else:
+            l_balance = torch.tensor(0.0, device=x_true.device)
+
         total_loss = (
             l_recon
             + (current_ortho * l_ortho)
@@ -802,6 +841,7 @@ class LibellaGNN(nn.Module):
             + l_align
             + (gate_weight * l_gate_sparse)
             + l_arip
+            + (self.balance_lambda * l_balance)
         )
 
         return (
@@ -814,6 +854,7 @@ class LibellaGNN(nn.Module):
             l_gate_sparse.detach(),
             l_domain_sparse.detach(),
             l_arip.detach(),
+            l_balance.detach(),
         )
 
     def calc_spatial_loss(

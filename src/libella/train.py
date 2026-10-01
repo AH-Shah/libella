@@ -383,17 +383,22 @@ def _train_loop(
         log_dir=str(out_dir),
     )
     global_step = 0
-    accumulation_steps = getattr(cfg, "meta_batch_size", 4)
-    total_epochs = getattr(cfg, "epochs", 100)
+    accumulation_steps = getattr(cfg, "meta_batch_size", 5)
+    total_epochs = getattr(cfg, "epochs", 40)
+    steps_per_epoch = max(1, math.ceil(len(training_cache) / accumulation_steps))
+    total_steps = total_epochs * steps_per_epoch
 
     tracker = PhaseTracker(
         total_epochs=total_epochs,
+        total_steps=total_steps,
         surge_tolerance=getattr(cfg, "surge_tolerance", 0.50),
         divergence_threshold=getattr(cfg, "divergence_threshold", 0.25),
         ramp_divergence_slack=getattr(cfg, "ramp_divergence_slack", 1.00),
     )
     if tracker_state is not None:
         tracker.__dict__.update(tracker_state)
+        tracker.total_epochs = total_epochs
+        tracker.total_steps = total_steps
         print(
             f"  ↳ Restored PhaseTracker state (Phase {tracker.phase}, "
             f"Pressure: {tracker.pressure:.2f}, Squeeze Progress: {tracker.get_squeeze_progress():.2f})"
@@ -422,6 +427,7 @@ def _train_loop(
             "l_gate_sparse": torch.zeros((), device=device),
             "l_domain_sparse": torch.zeros((), device=device),
             "l_arip": torch.zeros((), device=device),
+            "l_balance": torch.zeros((), device=device),
             "l_spatial": torch.zeros((), device=device),
             "tau_mean": torch.zeros((), device=device),
             "gene_density": torch.zeros((), device=device),
@@ -557,6 +563,7 @@ def _train_loop(
                 base_gate_sparse_val = loss_res[6]
                 base_domain_sparse_val = loss_res[7]
                 base_arip_val = loss_res[8]
+                base_balance_val = loss_res[9]
 
                 # 3. Dedicated Contrastive Spatial Relation Loss with Warm-up Gate
                 spatial_progress = schedules.get("spatial_progress", 0.0)
@@ -621,6 +628,7 @@ def _train_loop(
                     epoch_telemetry_acc["l_gate_sparse"] += base_gate_sparse_val
                     epoch_telemetry_acc["l_domain_sparse"] += base_domain_sparse_val
                     epoch_telemetry_acc["l_arip"] += base_arip_val
+                    epoch_telemetry_acc["l_balance"] += base_balance_val
                     epoch_telemetry_acc["l_spatial"] += l_spatial_rel
                     epoch_telemetry_acc["tau_mean"] += tau.detach().mean()
                     epoch_telemetry_acc["gene_density"] += (w_dec_sparse.detach() > 0).float().mean() * 100.0
@@ -718,7 +726,7 @@ def _train_loop(
                 elif hasattr(model, "decoder_weight"):
                     model.decoder_weight.data = F.normalize(model.decoder_weight.data, p=2, dim=-1)
 
-                if getattr(cfg, "enable_hard_resample", False) and last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
+                if last_dead_mask is not None and last_dead_mask.any() and last_r_pos is not None:
                     model.resample_dead_latents(last_r_pos, last_dead_mask, optimizer=optimizer)
 
             global_step += 1
@@ -808,6 +816,7 @@ def _train_loop(
                 "gate_sparse": round(epoch_telemetry.get("l_gate_sparse", 0.0), 4),
                 "domain_sparse": round(epoch_telemetry.get("l_domain_sparse", 0.0), 4),
                 "arip": round(epoch_telemetry.get("l_arip", 0.0), 4),
+                "balance": round(epoch_telemetry.get("l_balance", 0.0), 4),
                 "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
             },
             "k_pred_mean": round(epoch_telemetry.get("k_pred_mean", target_k), 2),
@@ -902,11 +911,13 @@ def _train_loop(
             "l_gate_sparse": epoch_telemetry.get("l_gate_sparse", 0.0),
             "l_domain_sparse": epoch_telemetry.get("l_domain_sparse", 0.0),
             "l_arip": epoch_telemetry.get("l_arip", 0.0),
+            "l_balance": epoch_telemetry.get("l_balance", 0.0),
             "l_dynamic_w_ema": epoch_telemetry.get("dyn_w", 1.0),
             "tau_mean": epoch_telemetry.get("tau_mean", 0.0),
             "gene_density_pct": epoch_telemetry.get("gene_density", 0.0),
             "budget_lambda": float(model.budget_lambda.item()) if hasattr(model, "budget_lambda") else 1.0,
             "gene_lambda": float(model.gene_lambda.item()) if hasattr(model, "gene_lambda") else 1.0,
+            "balance_lambda": float(model.balance_lambda.item()) if hasattr(model, "balance_lambda") else 50.0,
             "sae_k_pred_mean": epoch_telemetry.get("k_pred_mean", 0.0),
             "sae_sparsity_pct": epoch_telemetry.get("p_w", 0.0),
             "sae_entropy": epoch_telemetry.get("ent", 0.0),
@@ -989,7 +1000,8 @@ def _train_loop(
                 )
 
         epochs_remaining = total_epochs - epoch - 1
-        force_window = getattr(cfg, "phase2_force_window", 10)
+        max_p1_window = max(2, int(round(total_epochs * 0.50)))
+        force_window = min(getattr(cfg, "phase2_force_window", 20), max_p1_window)
         if tracker.phase == 1 and epochs_remaining <= force_window:
             tqdm.write(f"\n[!] Approaching max epochs ({total_epochs}). Forcing Phase 2.")
             tracker.force_phase2(epoch, epoch_telemetry.get("l_rec", 0.0))
@@ -1037,16 +1049,27 @@ def train_gnn(
     n_latents = getattr(cfg, "n_latents", getattr(cfg, "n_metaprograms", 512))
     print(f"[*] Initializing Native Top-K SAE Latent Space (M = {n_latents}, Top-K = {getattr(cfg, 'topk_k', 3)})...")
 
+    training_cache = _prep_ssd_chunks(graph_paths)
+    gc.collect()
+
+    if cfg.mode != "DEV":
+        accum_steps = getattr(cfg, "meta_batch_size", 5)
+        steps_per_epoch = max(1, math.ceil(len(training_cache) / accum_steps))
+        target_steps = getattr(cfg, "target_optim_steps", 260)
+        raw_epochs = target_steps / steps_per_epoch
+        if raw_epochs >= 20:
+            cfg.epochs = max(10, int(round(raw_epochs / 10.0)) * 10)
+        else:
+            cfg.epochs = max(5, int(round(raw_epochs / 5.0)) * 5)
+        print(f"  ↳ Dataset scale: {len(training_cache)} chunks ({steps_per_epoch} steps/epoch). Auto-scheduled {cfg.epochs} epochs (~{cfg.epochs * steps_per_epoch} steps).")
+
     model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
         common_genes, n_latents, checkpoint_path
     )
     gc.collect()
 
-    training_cache = _prep_ssd_chunks(graph_paths)
-    gc.collect()
-
-    if start_epoch >= getattr(cfg, "epochs", 100):
-        print(f"-> Training already reached target epoch ({start_epoch}/{getattr(cfg, 'epochs', 100)}). Skipping loop.")
+    if start_epoch >= getattr(cfg, "epochs", 40):
+        print(f"-> Training already reached target epoch ({start_epoch}/{getattr(cfg, 'epochs', 40)}). Skipping loop.")
         master_latent_path = out_dir / "libella_latent.npz"
         if not master_latent_path.exists():
             export_latents_from_graphs(model, graph_paths, out_dirs["out"], device)

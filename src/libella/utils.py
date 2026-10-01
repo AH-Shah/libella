@@ -97,29 +97,30 @@ class PhaseTracker:
 
     def __init__(
         self,
-        total_epochs: int = 50,
-        surge_tolerance: float = 0.50,        # Allow up to 50% loss fluctuation during pressure changes
-        divergence_threshold: float = 0.25,   # Soak early stop: val loss degrades >25% above hard baseline
-        ramp_divergence_slack: float = 1.00,  # Ramp early stop: allow up to 100% surge during compression
+        total_epochs: int = 40,
+        total_steps: int | None = None,
+        surge_tolerance: float = 0.50,
+        divergence_threshold: float = 0.25,
+        ramp_divergence_slack: float = 1.00,
     ) -> None:
         self.phase: int = 1
         self.total_epochs: int = max(1, total_epochs)
+        self.total_steps: int = total_steps if total_steps is not None else max(1, self.total_epochs * 6)
         self.surge_tolerance: float = surge_tolerance
         self.divergence_threshold: float = divergence_threshold
         self.ramp_divergence_slack: float = ramp_divergence_slack
 
-        # --- Phase 1 Horizons (Epochs 0 to 10 for 40 epochs) ---
-        self.min_p1_epochs: int = max(5, int(self.total_epochs * 0.25))
-        self.max_p1_epochs: int = max(self.min_p1_epochs + 1, int(self.total_epochs * 0.25))
+        # Phase 1: 25% of optimization budget
+        self.min_p1_epochs: int = max(2, int(round(self.total_epochs * 0.25)))
+        self.max_p1_epochs: int = max(self.min_p1_epochs + 1, int(round(self.total_epochs * 0.25)))
         self.p1_plateau_patience: int = 4
         self.p1_plateau_count: int = 0
 
-        # --- Dynamic Window Sizing & Max-Squeeze Horizons ---
-        self.cycle_window: int = max(3, int(self.total_epochs * 0.06))
-        # Soak at 100% squeeze for at least 25% of training before convergence stopping unlocks
-        self.min_max_squeeze_epochs: int = max(8, int(self.total_epochs * 0.25))
+        # Dynamic window sizing and Phase 3 soak horizon (37.5% of budget)
+        self.cycle_window: int = max(2, int(round(self.total_epochs * 0.075)))
+        self.min_max_squeeze_epochs: int = max(2, int(round(self.total_epochs * 0.375)))
         self.max_squeeze_epochs_count: int = 0
-        self.patience_epochs: int = max(6, int(self.total_epochs * 0.15))
+        self.patience_epochs: int = max(3, int(round(self.total_epochs * 0.15)))
 
         # --- Metric Histories ---
         self.rec_history: list[float] = []
@@ -167,7 +168,7 @@ class PhaseTracker:
     def get_squeeze_progress(self, epoch: int = 0, step_fraction: float = 0.0) -> float:
         if self.phase == 1:
             global_prog = self.get_global_progress(epoch, step_fraction)
-            p1_ratio = min(1.0, global_prog / max(1e-5, (self.min_p1_epochs / float(self.total_epochs))))
+            p1_ratio = min(1.0, global_prog / 0.25)
             return float(0.30 * 0.5 * (1.0 - math.cos(math.pi * p1_ratio)))
         raw_p = min(1.0, max(0.0, self.pressure))
         smooth_p = 0.5 * (1.0 - math.cos(math.pi * raw_p))
@@ -177,29 +178,22 @@ class PhaseTracker:
         global_prog = self.get_global_progress(epoch, step_fraction)
         squeeze_prog = self.get_squeeze_progress(epoch, step_fraction)
 
-        # Spatial Warm-up: 0.0 for Phase 1 (0 -> 25% of run), smooth cosine ramp to 1.0 across Phase 2 [25% -> 62.5% of run]
-        p1_bound = self.min_p1_epochs / float(self.total_epochs)
-        p2_bound = min(1.0, p1_bound + (15.0 / float(self.total_epochs)))
-        if global_prog < p1_bound:
+        # Phase 2A & 2B: concurrent ramp across 37.5% of run (25% -> 62.5%)
+        if global_prog < 0.25:
             spatial_prog = 0.0
-        elif global_prog >= p2_bound:
+            gate_prog = 0.0
+        elif global_prog >= 0.625:
             spatial_prog = 1.0
+            gate_prog = 1.0
         else:
-            t_spatial = (global_prog - p1_bound) / max(1e-5, (p2_bound - p1_bound))
-            spatial_prog = 0.5 * (1.0 - math.cos(math.pi * t_spatial))
+            t_ramp = (global_prog - 0.25) / 0.375
+            ramp_val = float(0.5 * (1.0 - math.cos(math.pi * t_ramp)))
+            spatial_prog = ramp_val
+            gate_prog = ramp_val
 
         # Cosine-smoothed hardness ramp mapped to continuous squeeze progression
         smooth_squeeze = 0.5 * (1.0 - math.cos(math.pi * squeeze_prog))
         gamma_prog = 0.56 + 0.44 * smooth_squeeze
-
-        # Gate Sparsity Curriculum: 0.0 before Phase 2, smooth cosine ramp across Phase 2 [Epochs 10 -> 25]
-        if epoch < self.min_p1_epochs:
-            gate_prog = 0.0
-        elif epoch >= (self.min_p1_epochs + 15):
-            gate_prog = 1.0
-        else:
-            t_gate = (epoch + step_fraction - float(self.min_p1_epochs)) / 15.0
-            gate_prog = 0.5 * (1.0 - math.cos(math.pi * t_gate))
 
         return {
             "global_progress": global_prog,
@@ -270,9 +264,9 @@ class PhaseTracker:
             return False
 
         # =============================================================
-        # PHASE 2: Controlled 15-Epoch Squeeze Ramp (Epochs 10 -> 25)
+        # PHASE 2: Controlled Squeeze Ramp (37.5% of budget)
         # =============================================================
-        target_ramp_epochs = max(1, int(getattr(cfg, "p2_ramp_epochs", 15)))
+        target_ramp_epochs = max(1, int(round(self.total_epochs * 0.375)))
         base_step = 1.0 / target_ramp_epochs
 
         # Surge brake: only pause ramp if reconstruction loss jumps >25%
@@ -895,6 +889,10 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
         stats["routing_budget_lambda"] = float(model.budget_lambda.item())
     if hasattr(model, "gene_lambda"):
         stats["routing_gene_lambda"] = float(model.gene_lambda.item())
+    if hasattr(model, "balance_lambda"):
+        stats["routing_balance_lambda"] = float(model.balance_lambda.item())
+    if hasattr(model, "last_balance_loss"):
+        stats["routing_balance_loss"] = float(model.last_balance_loss.item())
     if hasattr(model, "last_k_float_mean"):
         stats["routing_k_budget_mean"] = float(model.last_k_float_mean.item())
     if hasattr(model, "last_k_float_std"):
@@ -953,6 +951,8 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
         stats["loss_r_pos_energy_mean"] = float(model.last_r_pos_energy.item())
     if hasattr(model, "last_aux_recon_energy"):
         stats["loss_aux_recon_energy_mean"] = float(model.last_aux_recon_energy.item())
+    if hasattr(model, "last_balance_loss"):
+        stats["loss_balance"] = float(model.last_balance_loss.item())
 
     return stats
 
