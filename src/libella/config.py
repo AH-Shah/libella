@@ -24,6 +24,14 @@ class RunConfig:
     force_retrain: bool = False
     phase: str = "ALL"
     unsupervised: bool = False
+    seed: int = 42
+    arm: str = "A0"
+    g_det: float = 0.0
+    det_loss_weight: float = 1.0
+    det_init_scale: float = 3.0
+    lr_det: float = 4e-3
+    wd_det: float = 0.0
+    grad_clip_det: float = 1000.0
 
     # Logging & Telemetry
     telemetry: str = "none"

@@ -212,7 +212,7 @@ def _get_raw_adjs(graph_paths: list[Path]) -> np.ndarray:
         n_cells = y_processed.shape[0]
 
         if n_cells > max_priors_cells:
-            idx = np.random.RandomState(42).choice(
+            idx = np.random.RandomState(getattr(cfg, "seed", 42)).choice(
                 n_cells, max_priors_cells, replace=False
             )
             y_processed = y_processed[idx]
@@ -250,7 +250,7 @@ def _get_raw_adjs(graph_paths: list[Path]) -> np.ndarray:
             else:
                 top_indices.update(cell_indices)
 
-        selected_cells = np.array(list(top_indices))
+        selected_cells = np.sort(np.array(list(top_indices)))
         union_matrix_scaled = union_matrix_scaled[selected_cells]
         del X_csc, selected_cells, top_indices
         gc.collect()
@@ -263,7 +263,7 @@ def _get_raw_adjs(graph_paths: list[Path]) -> np.ndarray:
     dict_learner = MiniBatchDictionaryLearning(
         n_components=n_dict_comp,
         alpha=2.0,
-        random_state=42,
+        random_state=getattr(cfg, "seed", 42),
         max_iter=150,
         batch_size=512,
     )

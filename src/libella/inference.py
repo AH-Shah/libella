@@ -91,8 +91,8 @@ def validate_panel(
     random_expectation_floor = M_panel / N_total
     p_sample = np.ones(N_total) / N_total
     n_perms = min(1000, cfg.n_perms_entropy)
-    
-    u_noise = np.random.rand(n_perms, N_total)
+    rng = np.random.default_rng(getattr(cfg, "seed", 42))
+    u_noise = rng.random((n_perms, N_total))
     gumbel_noise = -np.log(-np.log(u_noise + 1e-9))
     weighted_scores = np.log(p_sample + 1e-9) + gumbel_noise
     random_panels = np.argsort(weighted_scores, axis=1)[:, -M_panel:]
@@ -114,7 +114,7 @@ def _calc_I_perm(
     F_mat: np.ndarray, A_sp: sp.csr_matrix, N: int, starts: np.ndarray, ends: np.ndarray, s_idx: np.ndarray
 ) -> np.ndarray:
     """Fast localized topological permutations."""
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(getattr(cfg, "seed", 42))
     perm_idx = np.empty(N, dtype=np.int32)
     for st, ed in zip(starts, ends):
         if ed - st > 1:
@@ -150,7 +150,8 @@ def _load_inf_data(
             idx = geo_sketch(adata_tmp, cfg.max_cells_per_sample, common_genes)
             del adata_tmp
         else:
-            idx = np.sort(np.random.choice(n_cells, cfg.max_cells_per_sample, replace=False))
+            rng = np.random.default_rng(getattr(cfg, "seed", 42))
+            idx = np.sort(rng.choice(n_cells, cfg.max_cells_per_sample, replace=False))
             
         X_raw_sub = X_raw_sub[idx]
         coords = coords[idx]
@@ -611,8 +612,9 @@ def refine_outputs(
     
     null_entropies = []
     n_perms = cfg.n_perms_entropy
+    rng = np.random.default_rng(getattr(cfg, "seed", 42))
     for _ in range(n_perms):
-        shuffled = np.random.permutation(patient_mass.flatten()).reshape(patient_mass.shape)
+        shuffled = rng.permutation(patient_mass.flatten()).reshape(patient_mass.shape)
         sh_p = shuffled / (shuffled.sum(axis=1, keepdims=True) + 1e-9)
         null_entropies.append(-np.sum(sh_p * np.log(sh_p + 1e-9), axis=1))
     
@@ -753,10 +755,10 @@ def make_domains(
             
             sc.pp.neighbors(adata, n_neighbors=5, metric="correlation", use_rep="X")
             try:
-                sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=42, flavor="igraph", directed=False)
+                sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=getattr(cfg, "seed", 42), flavor="igraph", directed=False)
             except TypeError:
 
-                sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=42)
+                sc.tl.leiden(adata, resolution=cfg.leiden_res, random_state=getattr(cfg, "seed", 42))
                 
         leiden_mapping = adata.obs["leiden"].astype(int).values
         

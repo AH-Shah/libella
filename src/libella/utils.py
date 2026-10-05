@@ -55,9 +55,15 @@ def get_whitelist(csv_path: Path) -> set[str]:
     return clean_genes
 
 def set_seed(seed: int = 42) -> None:
-    """Set random seeds for reproducibility."""
+    """Set random seeds for reproducibility across Python, NumPy, and PyTorch backends."""
+    import os
+    import random
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed)
 
@@ -641,7 +647,7 @@ class SafePadeActivation(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_safe = torch.tanh(x / F.softplus(self.c_in))
         
-        p_val = self.p_coeffs[0]
+        p_val = 0.0
         for i in range(1, len(self.p_coeffs)):
             p_val = p_val + self.p_coeffs[i] * (x_safe ** i)
             
@@ -909,9 +915,8 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
     if hasattr(model, "pade_gate"):
         stats["rsae_pade_p_norm"] = float(model.pade_gate.p_coeffs.norm(2).item())
         stats["rsae_pade_q_norm"] = float(model.pade_gate.q_coeffs.norm(2).item())
-        stats["rsae_pade_p0"] = float(model.pade_gate.p_coeffs[0].item())
+        stats["rsae_pade_p0"] = 0.0
         stats["rsae_pade_q0"] = float(model.pade_gate.q_coeffs[0].item())
-
     # 6. Spatial GNN & CSNN Gates
     stats["gnn_listen_prob_mean"] = float(model.last_listen_prob.mean().item()) if getattr(model, "last_listen_prob", None) is not None else 0.0
     stats["gnn_broadcast_prob_mean"] = float(model.last_broadcast_prob.mean().item()) if getattr(model, "last_broadcast_prob", None) is not None else 0.0

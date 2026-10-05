@@ -48,6 +48,25 @@ class SemanticOrthogonalGateHead(nn.Module):
         w_ortho = self._orthogonalize(steps=5)
         cross_context = F.linear(h_norm, w_ortho) * self.cross_scale
         return direct_context + cross_context
+class CalibratedGradHook(torch.autograd.Function):
+    """
+    Calibrated Gradient Hook for Arm N1 Detection Head.
+    Subtracts the batch-mean gradient across cells to eliminate the uniform
+    negative drift caused by 96% zero-inflation, preventing lineage collapse
+    while preserving differential cell-type supervisory signal.
+    """
+    @staticmethod
+    def forward(ctx, z, g_det):
+        ctx.g_det = g_det
+        return z
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        g = ctx.g_det
+        if g <= 0.0:
+            return None, None
+        grad_centered = grad_output - grad_output.mean(dim=0, keepdim=True)
+        return g * grad_centered, None
 
 
 class LibellaGNN(nn.Module):
@@ -169,6 +188,19 @@ class LibellaGNN(nn.Module):
         # Bias for the [0, 5000] raw counts space
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
 
+        # Detection Head (Arm N1: p(x > 0 | z))
+        arm = getattr(cfg, "arm", "").upper()
+        use_det = "N1" in arm or getattr(cfg, "use_detection_head", False)
+        if use_det:
+            init_scale = float(getattr(cfg, "det_init_scale", 3.0))
+            w_det_init = dec_init.clone() * init_scale
+            self.det_weight = nn.Parameter(w_det_init)
+            self.det_bias = nn.Parameter(torch.zeros(in_channels))
+        else:
+            self.det_weight = None
+            self.det_bias = None
+        self.last_det_logits = None
+
         # Buffers & Aux State Tracking
         self.register_buffer("ortho_mask", 1.0 - torch.eye(self.n_latents, dtype=torch.float32))
         self.register_buffer("steps_since_active", torch.zeros(self.n_latents, dtype=torch.int64))
@@ -210,6 +242,17 @@ class LibellaGNN(nn.Module):
         w_sparse = w_hard.detach() - w_soft.detach() + w_soft
         w_norm = F.normalize(w_sparse + 1e-8, p=2, dim=-1)
         return w_sparse, w_norm
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        if prefix + "det_weight" in state_dict and self.det_weight is None:
+            w_shape = state_dict[prefix + "det_weight"].shape
+            self.det_weight = nn.Parameter(torch.empty(w_shape, dtype=torch.float32))
+            self.det_bias = nn.Parameter(torch.empty(w_shape[1], dtype=torch.float32))
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def encode(
         self,
@@ -267,14 +310,17 @@ class LibellaGNN(nn.Module):
         rank = torch.argsort(torch.argsort(bio_scores, dim=-1, descending=True), dim=-1)
         hard_mask = (rank < k_discrete).float()
 
+        pade_act = self.pade_gate(bio_scores)
+
         if self.training:
             gamma_scale = getattr(self, "current_gamma_progress", 1.0)
             gamma_effective = max(0.05, self.laprune_gamma * gamma_scale)
             soft_mask = ExactLaPruneFunction.apply(laprune_inputs, k_i_float, gamma_effective)
             # STE: forward uses hard_mask, backward uses soft_mask
-            z_canonical = F.relu(self.pade_gate(bio_scores)) * (hard_mask.detach() - soft_mask.detach() + soft_mask)
+            ste_mask = (hard_mask.detach() - soft_mask.detach() + soft_mask)
+            z_canonical = F.relu(pade_act) * ste_mask
         else:
-            z_canonical = F.relu(self.pade_gate(bio_scores)) * hard_mask
+            z_canonical = F.relu(pade_act) * hard_mask
 
         if self.training:
             with torch.no_grad():
@@ -467,6 +513,10 @@ class LibellaGNN(nn.Module):
             self.spatial_gate_head.w_direct.data[target_dead_ids] = 0.5
             self.spatial_gate_head.b_direct.data[target_dead_ids] = 0.0
 
+        if self.det_weight is not None:
+            init_scale = float(getattr(cfg, "det_init_scale", 3.0))
+            self.det_weight.data[target_dead_ids] = new_atoms.clone() * init_scale
+
         self.steps_since_active[target_dead_ids] = 0
 
         # 3. Reset optimizer moments
@@ -478,6 +528,8 @@ class LibellaGNN(nn.Module):
                 self.b_enc,
                 self.delta_tau_gene,
             ]
+            if self.det_weight is not None:
+                params_to_reset.append(self.det_weight)
             if hasattr(self.spatial_gate_head, "w_direct"):
                 params_to_reset.extend([
                     self.spatial_gate_head.w_direct,
@@ -500,25 +552,8 @@ class LibellaGNN(nn.Module):
         dst: torch.Tensor,
         edge_weights: torch.Tensor,
         spatial: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor,       
-        torch.Tensor,       
-        torch.Tensor,       
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor,       
-        torch.Tensor | None,
-        torch.Tensor,       
-        torch.Tensor,       
-        torch.Tensor | None,
-        torch.Tensor,       
-        torch.Tensor,       
-        torch.Tensor,       
-        torch.Tensor,       
-        torch.Tensor | None,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+        return_det: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         (
             z_contextual,
             z_canonical,
@@ -539,6 +574,18 @@ class LibellaGNN(nn.Module):
 
         x_raw = torch.mm(z_contextual, w_dec_norm) * cell_mass
         x_recon = F.relu(x_raw - self.decoder_bias)
+
+        # Detection Head Forward (Arm N1: p(x > 0 | z))
+        if self.det_weight is not None:
+            g = float(getattr(cfg, "g_det", 0.0))
+            if g > 0.0:
+                z_det = CalibratedGradHook.apply(z_contextual, g)
+            else:
+                z_det = z_contextual.detach()
+            det_logits = torch.mm(z_det, self.det_weight) + self.det_bias
+        else:
+            det_logits = None
+        self.last_det_logits = det_logits.detach() if det_logits is not None else None
 
         aux_recon = None
         r_norm = None
@@ -581,7 +628,7 @@ class LibellaGNN(nn.Module):
 
                     del dead_indices, w_dead, aux_sim, aux_scores, topk_res, z_aux_weights, z_aux
 
-        return (
+        base_outs = (
             x_recon,
             z_contextual,
             w_dec_norm,
@@ -600,6 +647,42 @@ class LibellaGNN(nn.Module):
             w_dec_sparse,
             tau,
         )
+        if return_det:
+            return (*base_outs, det_logits)
+        return base_outs
+
+    def decode(
+        self,
+        z: torch.Tensor,
+        cell_mass: torch.Tensor | None = None,
+        apply_det_gate: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Decodes latents to gene expression predictions.
+        If detection head is enabled and apply_det_gate is True, returns (pi * x_recon, pi).
+        Otherwise returns (x_recon, None).
+        """
+        tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
+        w_dec_pos = F.relu(self.decoder_weight)
+        _, w_dec_norm = self._apply_ste_gate(w_dec_pos, tau)
+
+        z = z.to(device=self.decoder_weight.device, dtype=self.decoder_weight.dtype)
+        if cell_mass is not None:
+            cell_mass = cell_mass.to(device=self.decoder_weight.device, dtype=self.decoder_weight.dtype)
+
+        if cell_mass is not None:
+            x_raw = torch.mm(z, w_dec_norm) * cell_mass
+        else:
+            x_raw = torch.mm(z, w_dec_norm)
+        x_recon = F.relu(x_raw - self.decoder_bias)
+
+        if self.det_weight is not None:
+            det_logits = torch.mm(z, self.det_weight) + self.det_bias
+            pi = torch.sigmoid(det_logits)
+            if apply_det_gate:
+                return pi * x_recon, pi
+            return x_recon, pi
+        return x_recon, None
 
     def calc_loss(
         self,

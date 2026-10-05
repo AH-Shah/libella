@@ -22,13 +22,14 @@ from .data import (
     pt_to_scipy_csr,
 )
 from .model import LibellaGNN
-from .utils import PhaseTracker, UnifiedLogger, export_latents_from_graphs, get_device, get_deep_telemetry,inverse_softplus
+from .utils import PhaseTracker, UnifiedLogger, export_latents_from_graphs, get_device, get_deep_telemetry, inverse_softplus, set_seed
 
 
 
 def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
     """Slice patient graphs into SSD chunks for OOM-safe training."""
     print("  ↳ Slicing patient graphs to SSD chunks...")
+    set_seed(getattr(cfg, "seed", 42))
     out_dir = paths.make_dirs(cfg.suffix)["out"]
 
     tmp_chunk_dir = out_dir / "temp_training_chunks"
@@ -40,10 +41,10 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
     tmp_chunk_dir.mkdir(parents=True, exist_ok=True)
     training_cache: list[dict[str, Any]] = []
 
-    for path in tqdm(graph_paths, desc="Slicing Sub-Graphs", leave=False):
+    for pt_idx, path in enumerate(tqdm(graph_paths, desc="Slicing Sub-Graphs", leave=False)):
         patient_name = path.stem.replace("_graph", "")
         
-        existing_chunks = list(tmp_chunk_dir.glob(f"{patient_name}_chunk_*.pt"))
+        existing_chunks = sorted(list(tmp_chunk_dir.glob(f"{patient_name}_chunk_*.pt")))
         if len(existing_chunks) > 0:
             for chunk_file in existing_chunks:
                 training_cache.append({
@@ -69,7 +70,8 @@ def _prep_ssd_chunks(graph_paths: list[Path]) -> list[dict[str, Any]]:
         batcher = SpatialBatcher(
             X=X_sp, adj=adj_sp, coords=data.pos.numpy(),
             train_mask=data.train_mask.numpy(), val_mask=data.val_mask.numpy(), 
-            batch_size=cfg.batch_size, k_hops=cfg.k_hops, shuffle=True
+            batch_size=cfg.batch_size, k_hops=cfg.k_hops, shuffle=True,
+            seed=getattr(cfg, "seed", 42) + pt_idx,
         )
         
         for chunk_idx, core_idx in enumerate(batcher.chunks):
@@ -143,9 +145,10 @@ def init_decoder_bias_from_data(
     model.eval()
     total_normed = torch.zeros(model.in_channels, dtype=torch.float32, device="cpu")
     total_raw = torch.zeros(model.in_channels, dtype=torch.float32, device="cpu")
+    total_detected = torch.zeros(model.in_channels, dtype=torch.float32, device="cpu")
     total_samples = 0
     collected_edge_dists_sq: list[torch.Tensor] = []
-    meta_batches = make_meta_batches(training_cache, meta_batch_size=batch_size)
+    meta_batches = make_meta_batches(training_cache, meta_batch_size=batch_size, seed=getattr(cfg, "seed", 42))
 
     for meta_meta in prefetch_batches(meta_batches):
         # Support both tuple/list yields and direct meta_meta generator
@@ -172,6 +175,7 @@ def init_decoder_bias_from_data(
                 cell_mass = torch.clamp(x_core.norm(p=2, dim=-1, keepdim=True), min=1e-5)
                 total_normed += (x_core / cell_mass).sum(dim=0)
                 total_raw += x_core.sum(dim=0)
+                total_detected += (x_core > 0).float().sum(dim=0)
                 total_samples += x_core.size(0)
 
             src = batch.get("src")
@@ -195,6 +199,11 @@ def init_decoder_bias_from_data(
         ambient_floor = raw_mean * 0.01
         model.decoder_bias.data.copy_(ambient_floor)
         print(f"  ↳ Initialized decoder_bias to raw count mean (L2 norm: {model.decoder_bias.norm(2).item():.4f}, across {total_samples} core cells)")
+        if hasattr(model, "det_bias") and model.det_bias is not None:
+            det_rate = (total_detected / total_samples).clamp(min=1e-4, max=1.0 - 1e-4)
+            det_logit_init = torch.log(det_rate / (1.0 - det_rate)).to(device=device)
+            model.det_bias.data.copy_(det_logit_init)
+            print(f"  ↳ Initialized det_bias to empirical logits (mean rate: {det_rate.mean().item():.4f}, det_bias mean: {model.det_bias.mean().item():.4f})")
 
     if collected_edge_dists_sq and hasattr(model, "set_empirical_rbf_scales"):
         all_d_sq = torch.cat(collected_edge_dists_sq, dim=0)
@@ -291,6 +300,15 @@ def _init_model(
         p for n, p in model.named_parameters()
         if "spatial_gate_head" in n and "cross_weight" not in n and "cross_talk" not in n
     ]
+    det_weight_params = [
+        p for n, p in model.named_parameters()
+        if "det_weight" in n
+    ]
+    det_bias_params = [
+        p for n, p in model.named_parameters()
+        if "det_bias" in n
+    ]
+    det_params = det_weight_params + det_bias_params
     special_ids = {
         id(p)
         for p in bias_params
@@ -302,6 +320,7 @@ def _init_model(
         + temp_routing_params
         + direct_gate_params
         + orthogonal_params
+        + det_params
     }
     base_params = [
         p for p in model.parameters()
@@ -310,7 +329,8 @@ def _init_model(
 
     lr_base = getattr(cfg, "lr_base", 1e-3)
     lr_tau = getattr(cfg, "lr_tau", lr_base * 20.0)
-    optimizer = torch.optim.Adam([
+    lr_det = getattr(cfg, "lr_det", lr_base * 4.0)
+    opt_param_groups = [
         {"params": base_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_base", 1e-4)},
         {"params": strict_wd_gate_params, "lr": lr_base * 2.0, "weight_decay": getattr(cfg, "wd_gates", 1e-3)},
         {"params": direct_gate_params, "lr": lr_base * 2.0, "weight_decay": 1e-4},
@@ -321,7 +341,16 @@ def _init_model(
         {"params": temp_routing_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
         {"params": no_decay_params, "lr": lr_base * 2.0, "weight_decay": 0.0},
         {"params": tau_params, "lr": lr_tau, "weight_decay": 0.0},
-    ], betas=(0.0, 0.999), eps=1e-8)
+    ]
+    if det_weight_params:
+        opt_param_groups.append(
+            {"params": det_weight_params, "lr": lr_det, "weight_decay": getattr(cfg, "wd_det", 0.0)}
+        )
+    if det_bias_params:
+        opt_param_groups.append(
+            {"params": det_bias_params, "lr": lr_det, "weight_decay": 0.0}
+        )
+    optimizer = torch.optim.Adam(opt_param_groups, betas=(0.0, 0.999), eps=1e-8)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=getattr(cfg, "epochs", 40), eta_min=getattr(cfg, "lr_min", 1e-5)
@@ -443,9 +472,12 @@ def _train_loop(
             "dyn_w": torch.zeros((), device=device),
             "z_mag_mean": torch.zeros((), device=device),
             "cell_mass_mean": torch.zeros((), device=device),
+            "l_det": torch.zeros((), device=device),
+            "det_prob_mean": torch.zeros((), device=device),
+            "det_obs_rate": torch.zeros((), device=device),
         }
 
-        meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps)
+        meta_batches = make_meta_batches(training_cache, meta_batch_size=accumulation_steps, seed=getattr(cfg, "seed", 42) + epoch)
         total_steps_per_epoch = len(meta_batches)
         alpha_ema = min(
             getattr(cfg, "alpha_ema_max", 0.05),
@@ -501,6 +533,7 @@ def _train_loop(
                 model.target_k = float(getattr(cfg, "target_k", getattr(cfg, "topk_k", 38.0)))
 
                 # 1. Forward Pass
+                model_outs = model(x, src, dst, weights, spatial=spatial, return_det=True)
                 (
                     recon,
                     z,
@@ -519,7 +552,8 @@ def _train_loop(
                     edge_sign,
                     w_dec_sparse,
                     tau,
-                ) = model(x, src, dst, weights, spatial=spatial)
+                ) = model_outs[:17]
+                det_logits = model_outs[17] if len(model_outs) > 17 else None
 
                 last_r_pos = r_pos
                 last_dead_mask = dead_mask
@@ -579,7 +613,22 @@ def _train_loop(
                     l_spatial_rel = torch.tensor(0.0, device=device)
                     spatial_loss_val = torch.tensor(0.0, device=device)
 
-                true_batch_loss = base_sae_loss + spatial_loss_val
+                # 4. Detection Head Loss (Arm N1)
+                if det_logits is not None:
+                    n_train = max(1, train_idx.numel())
+                    bce = F.binary_cross_entropy_with_logits(
+                        det_logits[train_idx],
+                        (x[train_idx] > 0).float(),
+                        reduction="sum",
+                    )
+                    l_det = bce / (n_train * math.sqrt(x.size(-1)))
+                    det_loss_weight = float(getattr(cfg, "det_loss_weight", 1.0))
+                    det_loss_val = det_loss_weight * l_det
+                else:
+                    l_det = torch.tensor(0.0, device=device)
+                    det_loss_val = torch.tensor(0.0, device=device)
+
+                true_batch_loss = base_sae_loss + spatial_loss_val + det_loss_val
 
                 if torch.isnan(true_batch_loss) or torch.isinf(true_batch_loss):
                     nan_detected = True
@@ -642,6 +691,12 @@ def _train_loop(
                     if cell_mass is not None:
                         epoch_telemetry_acc["cell_mass_mean"] += cell_mass[train_idx].detach().mean()
 
+                    if det_logits is not None:
+                        epoch_telemetry_acc["l_det"] += l_det.detach()
+                        pi_batch = torch.sigmoid(det_logits[train_idx].detach())
+                        epoch_telemetry_acc["det_prob_mean"] += pi_batch.mean()
+                        epoch_telemetry_acc["det_obs_rate"] += (x[train_idx] > 0).float().mean()
+
                     del z_det, batch_active, current_freq
 
                 train_chunk_count += 1
@@ -649,7 +704,7 @@ def _train_loop(
                     del core_mask
                 if len(src) > 0 and delta_h is not None and spatial_progress > 0.0:
                     del x_norm
-                del train_idx, train_mask, edge_mask_float, base_sae_loss, base_align_val, true_batch_loss, l_spatial_rel, spatial_loss_val
+                del train_idx, train_mask, edge_mask_float, base_sae_loss, base_align_val, true_batch_loss, l_spatial_rel, spatial_loss_val, l_det, det_loss_val
 
                 # Detach gate telemetry to release autograd graph while preserving values for telemetry
                 if model.last_listen_prob is not None:
@@ -692,25 +747,37 @@ def _train_loop(
                     del val_idx, val_recon, x_val, w_mat, raw_delta_val, asym_val, scaled_delta_val, abs_delta_val, stable_log_cosh_val, peak_penalty_val, per_cell_loss_val, val_recon_loss
 
                 del batch, src, dst, weights, x, recon, z, w_dec_norm, aux_recon, r_norm, cell_mass, spatial_context, A_ij, k_i_float, delta_h, z_canonical, routed_scores, edge_sign, w_dec_sparse, tau
+                if det_logits is not None:
+                    del det_logits
 
             if nan_detected:
                 optimizer.zero_grad(set_to_none=True)
                 break
 
-            # 1. Dual-Group Gradient Clipping & Grad Telemetry Extraction
+            # 1. Multi-Group Gradient Clipping & Grad Telemetry Extraction
             recon_keys = ("decoder_bias", "encoder_bias", "decoder_weight", "encoder_weight")
+            det_keys = ("det_weight", "det_bias")
+            all_managed_keys = recon_keys + det_keys
             recon_params = [
                 p for n, p in model.named_parameters()
                 if any(k in n for k in recon_keys) and p.grad is not None
             ]
+            det_params = [
+                p for n, p in model.named_parameters()
+                if any(k in n for k in det_keys) and p.grad is not None
+            ]
             spatial_params = [
                 p for n, p in model.named_parameters()
-                if not any(k in n for k in recon_keys) and p.grad is not None
+                if not any(k in n for k in all_managed_keys) and p.grad is not None
             ]
 
             if recon_params:
                 torch.nn.utils.clip_grad_norm_(
                     recon_params, max_norm=getattr(cfg, "grad_clip_recon", 1000.0)
+                )
+            if det_params:
+                torch.nn.utils.clip_grad_norm_(
+                    det_params, max_norm=getattr(cfg, "grad_clip_det", 1000.0)
                 )
             if spatial_params:
                 torch.nn.utils.clip_grad_norm_(
@@ -808,6 +875,7 @@ def _train_loop(
             },
             "loss_components": {
                 "rec": round(current_rec, 4),
+                "det": round(epoch_telemetry.get("l_det", 0.0), 4),
                 "ort": round(epoch_telemetry.get("l_ort", 0.0), 4),
                 "budget": round(epoch_telemetry.get("l_budget", 0.0), 4),
                 "aux": round(epoch_telemetry.get("l_aux", 0.0), 4),
@@ -818,6 +886,11 @@ def _train_loop(
                 "arip": round(epoch_telemetry.get("l_arip", 0.0), 4),
                 "balance": round(epoch_telemetry.get("l_balance", 0.0), 4),
                 "dynamic_w_ema": round(epoch_telemetry.get("dyn_w", 1.0), 4),
+            },
+            "detection_head": {
+                "l_det": round(epoch_telemetry.get("l_det", 0.0), 5),
+                "det_prob_mean": round(epoch_telemetry.get("det_prob_mean", 0.0), 4),
+                "det_obs_rate": round(epoch_telemetry.get("det_obs_rate", 0.0), 4),
             },
             "k_pred_mean": round(epoch_telemetry.get("k_pred_mean", target_k), 2),
             "pade_diagnostics": {
@@ -903,6 +976,9 @@ def _train_loop(
             "composite_phi_dict": phi_dict,
             "composite_phi_schedule": phi_schedule,
             "l_recon": epoch_telemetry.get("l_rec", 0.0),
+            "l_det": epoch_telemetry.get("l_det", 0.0),
+            "det_prob_mean": epoch_telemetry.get("det_prob_mean", 0.0),
+            "det_obs_rate": epoch_telemetry.get("det_obs_rate", 0.0),
             "l_ort": epoch_telemetry.get("l_ort", 0.0),
             "l_budget": epoch_telemetry.get("l_budget", 0.0),
             "l_aux": epoch_telemetry.get("l_aux", 0.0),
@@ -985,10 +1061,17 @@ def _train_loop(
                 l0_pct = (l0_val / model.n_latents) * 100.0
                 pade_inv = deep_stats.get("pade/rank_inversion_pct", 0.0)
                 d_ratio = deep_stats.get("spatial/delta_ratio", 0.0)
+                det_str = (
+                    f"Det_L:{epoch_telemetry.get('l_det', 0.0):<5.3f} "
+                    f"Det_P:{epoch_telemetry.get('det_prob_mean', 0.0):<4.2f} "
+                    f"Det_Obs:{epoch_telemetry.get('det_obs_rate', 0.0):<4.2f} | "
+                    if model.det_weight is not None else ""
+                )
                 tqdm.write(
                     f" [Ep {(epoch+1):03d}] Score:{composite_score:<6.2f} "
                     f"Rec:{epoch_telemetry.get('l_rec', 0.0):<5.3f} "
                     f"V_Loss:{history['val_loss'][-1]:<5.3f} | "
+                    f"{det_str}"
                     f"L0:{l0_val:<4.1f}/{model.n_latents} ({l0_pct:<4.1f}%) "
                     f"K_Pred:{epoch_telemetry.get('k_pred_mean', 0.0):<4.1f} "
                     f"Dead:{int(epoch_telemetry.get('dead_cnt', 0)):<3d} | "
@@ -1041,6 +1124,7 @@ def train_gnn(
     common_genes: list[str],
 ) -> tuple[LibellaGNN, dict[str, list], int]:
     """Master orchestrator for GNN training phase."""
+    set_seed(getattr(cfg, "seed", 42))
     out_dirs = paths.make_dirs(getattr(cfg, "suffix", "default"))
     checkpoint_path = out_dirs["checkpoint"]
     out_dir = out_dirs["out"]

@@ -178,7 +178,8 @@ def geo_subsample(
     coords: np.ndarray, 
     target_cells: int, 
     global_bounds: tuple[float, float, float, float], 
-    global_n_bins: int
+    global_n_bins: int,
+    seed: int | None = None,
 ) -> np.ndarray:
     """Perform vectorized geometric subsampling on a universal grid."""
     if target_cells <= 0:
@@ -187,6 +188,8 @@ def geo_subsample(
     n_cells_total = coords.shape[0]
     if n_cells_total <= target_cells:
         return np.arange(n_cells_total)
+
+    rng = np.random.default_rng(seed if seed is not None else getattr(cfg, "seed", 42))
 
     xmin, xmax, ymin, ymax = global_bounds
         
@@ -199,7 +202,7 @@ def geo_subsample(
     grid_ids = x_idx * global_n_bins + y_idx 
 
     # Instant vectorized shuffling inside spatial blocks
-    noise = np.random.rand(n_cells_total)
+    noise = rng.random(n_cells_total)
     order = np.lexsort((noise, grid_ids))
     grid_ids_sorted = grid_ids[order]
     
@@ -223,10 +226,10 @@ def geo_subsample(
     deficit = target_cells - len(sampled_indices)
     if deficit > 0 and leftover_indices:
         leftovers = np.concatenate(leftover_indices)
-        recovery = np.random.choice(leftovers, size=min(deficit, len(leftovers)), replace=False)
+        recovery = rng.choice(leftovers, size=min(deficit, len(leftovers)), replace=False)
         sampled_indices = np.concatenate([sampled_indices, recovery])
         
-    return np.sort(np.random.choice(sampled_indices, target_cells, replace=False) if len(sampled_indices) > target_cells else sampled_indices)
+    return np.sort(rng.choice(sampled_indices, target_cells, replace=False) if len(sampled_indices) > target_cells else sampled_indices)
 
 
 def _get_sketch_clusters(
@@ -250,7 +253,7 @@ def _get_sketch_clusters(
     
     # 4. PCA and completely destroy the normalized matrix
     n_components = min(50, len(present_genes) - 1)
-    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    svd = TruncatedSVD(n_components=n_components, random_state=getattr(cfg, "seed", 42))
     X_pca = svd.fit_transform(X_expr_norm)
     del X_expr_norm 
 
@@ -258,7 +261,7 @@ def _get_sketch_clusters(
     kmeans = MiniBatchKMeans(
         n_clusters=n_clusters, 
         batch_size=cfg.batch_size, 
-        random_state=42, 
+        random_state=getattr(cfg, "seed", 42), 
         n_init=3
     )
     cluster_labels = kmeans.fit_predict(X_pca)
@@ -328,7 +331,8 @@ def geo_sketch(
         else:
             c_coords = coords[c_indices]
             sampled_relative_idx = geo_subsample(
-                c_coords, quotas[c], global_bounds, global_n_bins
+                c_coords, quotas[c], global_bounds, global_n_bins,
+                seed=getattr(cfg, "seed", 42) + c
             )
             final_indices.append(c_indices[sampled_relative_idx])
             
@@ -336,22 +340,23 @@ def geo_sketch(
     return final_idx_array
 
 def make_meta_batches(
-    training_cache: list[dict[str, Any]], meta_batch_size: int
+    training_cache: list[dict[str, Any]], meta_batch_size: int, seed: int | None = None
 ) -> list[list[dict[str, Any]]]:
     """Group spatial chunks into highly diverse patient-stratified meta-batches."""
+    r = random.Random(seed if seed is not None else getattr(cfg, "seed", 42))
     patient_bins = defaultdict(list)
     for b in training_cache:
         patient_bins[b['patient_name']].append(b)
         
-    for p in patient_bins:
-        random.shuffle(patient_bins[p])
+    for p in sorted(patient_bins.keys()):
+        r.shuffle(patient_bins[p])
         
     meta_batches = []
-    active_patients = list(patient_bins.keys())
+    active_patients = sorted(list(patient_bins.keys()))
     
     while active_patients:
         current_meta = []
-        random.shuffle(active_patients)
+        r.shuffle(active_patients)
         selected = active_patients[:meta_batch_size]
         
         # Pop one diverse chunk from each selected patient
@@ -362,7 +367,7 @@ def make_meta_batches(
                 
         # If we couldn't fill a meta batch, pad with whatever is left
         while len(current_meta) < meta_batch_size and active_patients:
-            p = random.choice(active_patients)
+            p = r.choice(active_patients)
             current_meta.append(patient_bins[p].pop())
             if not patient_bins[p]:
                 active_patients.remove(p)
@@ -407,7 +412,8 @@ class SpatialBatcher:
         val_mask: np.ndarray, 
         batch_size: int | None = None, 
         k_hops: int | None = None, 
-        shuffle: bool = True
+        shuffle: bool = True,
+        seed: int | None = None,
     ):
         self.X = X
         self.adj = adj
@@ -439,7 +445,8 @@ class SpatialBatcher:
         self.chunks = [self.indices[i:i + active_batch_size] for i in range(0, self.n_cells, active_batch_size)]
         
         if shuffle:
-            np.random.shuffle(self.chunks)
+            rng = np.random.default_rng(seed if seed is not None else getattr(cfg, "seed", 42))
+            rng.shuffle(self.chunks)
             
     def __len__(self) -> int:
         return len(self.chunks)
@@ -483,7 +490,8 @@ def _load_h5ad(
     FEATURE_CAP = cfg.feature_cap 
     
     if n_cells_total > FEATURE_CAP:
-        idx = np.sort(np.random.choice(n_cells_total, FEATURE_CAP, replace=False))
+        rng = np.random.default_rng(getattr(cfg, "seed", 42))
+        idx = np.sort(rng.choice(n_cells_total, FEATURE_CAP, replace=False))
         adata_mem = adata_backed[idx].to_memory()
     else:
         adata_mem = adata_backed.to_memory()
@@ -605,7 +613,7 @@ def get_consensus_genes(
         for g, val in m_dict.items(): global_moran[g] += val
     
     # Get all unique genes that passed the whitelist and appeared in the data
-    valid_genes = list(set(global_hvg.keys()) | set(global_moran.keys()))
+    valid_genes = sorted(list(set(global_hvg.keys()) | set(global_moran.keys())))
     
     # If the whitelist already returned fewer genes than the cap, return them all
     if len(valid_genes) <= top_n:
@@ -675,7 +683,8 @@ def _remap_and_norm(
             idx = geo_sketch(adata_tmp, cfg.max_cells_per_sample, common_genes)
             del adata_tmp
         else:
-            idx = np.sort(np.random.choice(n_cells, cfg.max_cells_per_sample, replace=False))
+            rng = np.random.default_rng(getattr(cfg, "seed", 42))
+            idx = np.sort(rng.choice(n_cells, cfg.max_cells_per_sample, replace=False))
         
         X_raw_sub = X_raw_sub[idx]
         barcodes = barcodes[idx]
@@ -714,7 +723,8 @@ def build_pt_graph(f: Path, common_genes: list[str]) -> Path | None:
         train_mask = torch.zeros(n_cells, dtype=torch.bool)
         val_mask = torch.zeros(n_cells, dtype=torch.bool)
         
-        perm = np.random.permutation(n_cells)
+        rng = np.random.default_rng(getattr(cfg, "seed", 42))
+        perm = rng.permutation(n_cells)
         train_cutoff = int(n_cells * 0.85)
         train_mask[perm[:train_cutoff]] = True
         val_mask[perm[train_cutoff:]] = True

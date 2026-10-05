@@ -23,7 +23,7 @@ from .inference import (
 )
 from .model import LibellaGNN
 from .train import train_gnn
-from .utils import get_device, get_whitelist
+from .utils import get_device, get_whitelist, set_seed
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +62,15 @@ def setup_config_from_args(args: argparse.Namespace) -> None:
             if val is not None:
                 setattr(new_cfg, field.name, val)
     
+    if getattr(args, "g_det", None) is None:
+        arm_upper = str(getattr(new_cfg, "arm", "")).upper()
+        if "N1-0" in arm_upper or arm_upper == "N1":
+            new_cfg.g_det = 0.0
+        elif "N1-1" in arm_upper:
+            new_cfg.g_det = 0.1
+        elif "N1-3" in arm_upper:
+            new_cfg.g_det = 0.3
+
     for key, value in vars(new_cfg).items():
         setattr(cfg, key, value)
         
@@ -70,6 +79,7 @@ def setup_config_from_args(args: argparse.Namespace) -> None:
 
 def run_pipeline(manifest_path: Path) -> None:
     """Execute the full Libella pipeline."""
+    set_seed(getattr(cfg, "seed", 42))
     init_env()
     out_dirs = paths.make_dirs(cfg.suffix)
     
