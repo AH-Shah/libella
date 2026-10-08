@@ -187,6 +187,12 @@ class LibellaGNN(nn.Module):
         self.encoder_bias = nn.Parameter(torch.zeros(in_channels))
         # Bias for the [0, 5000] raw counts space
         self.decoder_bias = nn.Parameter(torch.zeros(in_channels))
+        # Calibrated dictionary (B9): written by the closed-form refit in train._refit_cal_dictionary, read by decode()
+        self.cal_dict = bool(getattr(cfg, "cal_dictionary", False))
+        if self.cal_dict:
+            self.decoder_weight_cal = nn.Parameter(dec_init.clone())
+            self.decoder_bias_cal = nn.Parameter(torch.zeros(in_channels))
+            self.cal_atom_log_scale = nn.Parameter(torch.zeros(n_metaprograms))
 
         # Detection Head (Arm N1: p(x > 0 | z))
         arm = getattr(cfg, "arm", "").upper()
@@ -226,6 +232,10 @@ class LibellaGNN(nn.Module):
         self.delta_tau_2.zero_()
 
     @torch.no_grad()
+    def _cal_atoms(self) -> torch.Tensor:
+        """Unit-norm non-negative calibrated atoms (no tau gate: every entry is fitted)."""
+        return F.normalize(F.relu(self.decoder_weight_cal) + 1e-8, p=2, dim=-1)
+
     def normalize_decoder(self) -> None:
         """Enforces unit-norm constraints on dictionaries after optimizer.step()."""
         self.decoder_weight.data = F.normalize(self.decoder_weight.data, p=2, dim=-1)
@@ -246,6 +256,12 @@ class LibellaGNN(nn.Module):
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
+        if self.cal_dict and prefix + "decoder_weight_cal" not in state_dict:
+            # Checkpoint trained without the calibrated dictionary: fall back to the main decoder
+            self.cal_dict = False
+            for name in ("decoder_weight_cal", "decoder_bias_cal", "cal_atom_log_scale"):
+                if name in self._parameters:
+                    del self._parameters[name]
         if prefix + "det_weight" in state_dict and self.det_weight is None:
             w_shape = state_dict[prefix + "det_weight"].shape
             self.det_weight = nn.Parameter(torch.empty(w_shape, dtype=torch.float32))
@@ -662,19 +678,24 @@ class LibellaGNN(nn.Module):
         If detection head is enabled and apply_det_gate is True, returns (pi * x_recon, pi).
         Otherwise returns (x_recon, None).
         """
-        tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
-        w_dec_pos = F.relu(self.decoder_weight)
-        _, w_dec_norm = self._apply_ste_gate(w_dec_pos, tau)
-
         z = z.to(device=self.decoder_weight.device, dtype=self.decoder_weight.dtype)
         if cell_mass is not None:
             cell_mass = cell_mass.to(device=self.decoder_weight.device, dtype=self.decoder_weight.dtype)
 
-        if cell_mass is not None:
-            x_raw = torch.mm(z, w_dec_norm) * cell_mass
+        if self.cal_dict:
+            w_dec_norm = self._cal_atoms()
+            z_amp = z * torch.exp(self.cal_atom_log_scale)
+            b_dec = self.decoder_bias_cal
         else:
-            x_raw = torch.mm(z, w_dec_norm)
-        x_recon = F.relu(x_raw - self.decoder_bias)
+            tau = self.tau_0 * torch.exp(torch.clamp(self.delta_tau_gene, min=-2.0, max=2.5))
+            _, w_dec_norm = self._apply_ste_gate(F.relu(self.decoder_weight), tau)
+            z_amp = z
+            b_dec = self.decoder_bias
+
+        x_raw = torch.mm(z_amp, w_dec_norm)
+        if cell_mass is not None:
+            x_raw = x_raw * cell_mass
+        x_recon = F.relu(x_raw - b_dec)
 
         if self.det_weight is not None:
             det_logits = torch.mm(z, self.det_weight) + self.det_bias

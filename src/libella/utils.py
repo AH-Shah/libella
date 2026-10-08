@@ -447,6 +447,89 @@ class UnifiedLogger:
 
 
 
+def _save_dense_view(path: Path, M: np.ndarray, barcodes: np.ndarray) -> None:
+    M = np.asarray(M, dtype=np.float32)
+    np.savez_compressed(path, data=M.ravel(), indices=np.tile(np.arange(M.shape[1]), M.shape[0]),
+                        indptr=np.arange(0, M.size + 1, M.shape[1]), shape=M.shape, barcodes=barcodes)
+
+
+def _save_sparse_view(path: Path, M: sp.csr_matrix, barcodes: np.ndarray) -> None:
+    c = sp.csr_matrix(M)
+    np.savez_compressed(path, data=c.data, indices=c.indices, indptr=c.indptr, shape=c.shape, barcodes=barcodes)
+
+
+def _export_program_views(out_dir: Path, sparse_z: sp.csr_matrix, dense: np.ndarray, barcodes: np.ndarray) -> None:
+    """Dense program layer (pre-top-K scores) + coarse programs: Ward clustering of program activity profiles."""
+    from scipy.cluster.hierarchy import fcluster, linkage
+    _save_dense_view(out_dir / "libella_program_layer_dense.npz", dense, barcodes)
+    rng = np.random.default_rng(getattr(cfg, "seed", 42))
+    idx = rng.choice(dense.shape[0], min(50000, dense.shape[0]), replace=False)
+    prof = dense[idx].T
+    prof = (prof - prof.mean(1, keepdims=True)) / np.maximum(prof.std(1, keepdims=True), 1e-6)
+    n_groups = int(getattr(cfg, "program_groups", 40))
+    groups = fcluster(linkage(prof, method="ward"), n_groups, criterion="maxclust") - 1
+    M = sp.csr_matrix((np.ones(len(groups)), (np.arange(len(groups)), groups)), shape=(len(groups), groups.max() + 1))
+    _save_sparse_view(out_dir / f"libella_grouped{n_groups}_sparse.npz", sparse_z @ M, barcodes)
+    np.save(out_dir / f"libella_program_groups_{n_groups}.npy", groups)
+    print(f"  ↳ Program views: dense layer {dense.shape}, {groups.max() + 1} grouped programs")
+
+
+@torch.no_grad()
+def _residual_code(model, X_sp: sp.csr_matrix, z: sp.csr_matrix, k: int, device, batch: int = 8192) -> sp.csr_matrix:
+    """Positive residual after the calibrated decoder, encoded by non-negative matching pursuit over the calibrated atoms."""
+    D = model._cal_atoms()
+    out = []
+    for s in range(0, X_sp.shape[0], batch):
+        xb = torch.from_numpy(X_sp[s:s + batch].toarray()).float().to(device)
+        zb = torch.from_numpy(z[s:s + batch].toarray()).float().to(device)
+        mass = torch.clamp(xb.norm(dim=-1, keepdim=True), min=1e-5)
+        xhat, _ = model.decode(zb, cell_mass=mass, apply_det_gate=False)
+        r = F.relu(xb - xhat)
+        r = r / r.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        code = torch.zeros(xb.shape[0], D.shape[0], device=device)
+        rows = torch.arange(xb.shape[0], device=device)
+        for _ in range(k):
+            v, j = (r @ D.t()).max(1)
+            v = v.clamp(min=0)
+            code[rows, j] += v
+            r = r - v[:, None] * D[j]
+        out.append(sp.csr_matrix(code.cpu().numpy()))
+    return sp.vstack(out).tocsr()
+
+
+def _level_features(dense: np.ndarray, X_sp: sp.csr_matrix) -> np.ndarray:
+    norm = np.sqrt(np.asarray(X_sp.multiply(X_sp).sum(1))).ravel()
+    n_det = np.diff(X_sp.tocsr().indptr)
+    return np.hstack([dense, np.log(np.maximum(norm, 1e-5))[:, None], np.log1p(n_det)[:, None]]).astype(np.float32)
+
+
+def _fit_level_head(dense: np.ndarray, X_sp: sp.csr_matrix, n_cells: int, steps: int) -> dict:
+    """Per-gene linear head for E[x | x > 0] on [dense program layer, log||x||, log n_detected]; masked MSE on detected entries."""
+    rng = np.random.default_rng(getattr(cfg, "seed", 42))
+    cells = np.where(np.diff(X_sp.indptr) > 0)[0]
+    fit = rng.choice(cells, size=min(n_cells, len(cells)), replace=False)
+    Ff = _level_features(dense[fit], X_sp[fit])
+    mu, sd = Ff.mean(0), Ff.std(0) + 1e-6
+    Ft = torch.from_numpy((Ff - mu) / sd)
+    Xf = torch.from_numpy(X_sp[fit].toarray()).float()
+    M = (Xf > 0).float()
+    W = torch.zeros(Ft.shape[1], Xf.shape[1], requires_grad=True)
+    b = (Xf.sum(0) / M.sum(0).clamp(min=1)).clone().requires_grad_(True)
+    opt = torch.optim.Adam([W, b], lr=0.01)
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = (((Ft @ W + b - Xf) ** 2) * M).sum() / M.sum() + 1e-4 * (W ** 2).sum()
+        loss.backward()
+        opt.step()
+    return {"W": W.detach().numpy(), "b": b.detach().numpy(), "mu": mu, "sd": sd, "masked_mse": float(loss.detach())}
+
+
+def apply_level_head(head: dict, dense: np.ndarray, X_sp: sp.csr_matrix) -> np.ndarray:
+    """Predicted log1p-CP10k level given detection, for cells (rows of dense / X_sp) and all genes."""
+    F_ = (_level_features(dense, X_sp) - head["mu"]) / head["sd"]
+    return np.maximum(F_ @ head["W"] + head["b"], 0.0)
+
+
 def export_latents_from_graphs(
     model: torch.nn.Module,
     graph_paths: List[Union[str, Path]],
@@ -475,6 +558,7 @@ def export_latents_from_graphs(
     model.eval()
 
     all_patient_csrs = []
+    all_dense, all_h0, all_niche, all_residual, all_X = [], [], [], [], []
     all_cell_metadata = []
     all_barcodes_master = []
 
@@ -533,6 +617,7 @@ def export_latents_from_graphs(
             )
 
             patient_z_chunks = []
+            patient_dense_chunks, patient_h0_chunks = [], []
             patient_cell_indices = []
 
             for chunk_idx, core_idx in enumerate(batcher.chunks):
@@ -562,19 +647,41 @@ def export_latents_from_graphs(
                     dst = dst.to(torch.int64)
 
                 # Direct encoder inference (bypasses decoder reconstruction FLOPs)
-                z_contextual, *_ = model.encode(chunk_x, src, dst, weights, spatial=chunk_spatial)
+                z_contextual, _, bio_scores, *_ = model.encode(chunk_x, src, dst, weights, spatial=chunk_spatial)
 
                 # Slice ONLY core nodes (drops halo receptive field)
                 local_core = chunk["local_core_idx"]
                 z_core = z_contextual[local_core].detach().cpu().numpy()
 
                 patient_z_chunks.append(sp.csr_matrix(z_core))
+                if getattr(cfg, "export_program_views", False):
+                    patient_dense_chunks.append(bio_scores[local_core].detach().cpu().numpy().astype(np.float32))
+                if getattr(cfg, "export_gnn_h0", False):
+                    x_core = chunk_x[local_core]
+                    x_c = x_core / torch.clamp(x_core.norm(p=2, dim=-1, keepdim=True), min=1e-5) - model.encoder_bias
+                    w_gnn = F.normalize(F.relu(model.encoder_weight) + 1e-8, p=2, dim=-1)
+                    patient_h0_chunks.append(torch.tanh(x_c @ w_gnn.t()).detach().cpu().numpy().astype(np.float32))
                 patient_cell_indices.extend(core_idx)
 
             # Reconstruct original graph order (0..N_cells-1)
             patient_csr_unordered = sp.vstack(patient_z_chunks)
             order_map = np.argsort(patient_cell_indices)
             patient_csr = patient_csr_unordered[order_map]
+            if patient_h0_chunks:
+                all_h0.append(np.vstack(patient_h0_chunks)[order_map])
+            if patient_dense_chunks:
+                dense_p = np.vstack(patient_dense_chunks)[order_map]
+                all_dense.append(dense_p)
+                k_niche = int(getattr(cfg, "niche_k", 15))
+                if k_niche > 0:
+                    from sklearn.neighbors import NearestNeighbors
+                    k_eff = min(k_niche + 1, dense_p.shape[0])
+                    _, nbr = NearestNeighbors(n_neighbors=k_eff).fit(pos_coords).kneighbors(pos_coords)  # self included
+                    all_niche.append(dense_p[nbr].mean(1).astype(np.float32))
+                if bool(getattr(cfg, "export_level_head", False)):
+                    all_X.append(X_sp.tocsr())
+            if getattr(model, "cal_dict", False) and bool(getattr(cfg, "export_residual_code", False)):
+                all_residual.append(_residual_code(model, X_sp.tocsr(), patient_csr.tocsr(), int(getattr(cfg, "residual_k", 5)), device))
 
             # Save Patient-Specific Artifacts
             p_latent_file = sample_out_dir / f"{patient_name}_latent.npz"
@@ -621,6 +728,26 @@ def export_latents_from_graphs(
     master_meta_path = out_dir / "libella_cell_metadata.csv.gz"
     master_meta_df.to_csv(master_meta_path, index=False, compression="gzip")
 
+    if all_dense:
+        dense_all = np.vstack(all_dense)
+        _export_program_views(out_dir, master_csr, dense_all, master_barcodes_arr)
+    if all_h0:
+        _save_dense_view(out_dir / "libella_gnn_h0_dense.npz", np.vstack(all_h0), master_barcodes_arr)
+        print("  ↳ GNN H0 view exported")
+    if all_niche:
+        k_niche = int(getattr(cfg, "niche_k", 15))
+        _save_dense_view(out_dir / f"libella_niche_k{k_niche}_dense.npz", np.vstack(all_niche), master_barcodes_arr)
+        print(f"  ↳ Niche view: dense layer pooled over self + {k_niche} spatial neighbours")
+    if all_residual:
+        R_ = sp.vstack(all_residual).tocsr()
+        _save_sparse_view(out_dir / f"libella_residual_k{int(getattr(cfg, 'residual_k', 5))}.npz", R_, master_barcodes_arr)
+        print(f"  ↳ Residual sparse code: {np.diff(R_.indptr).mean():.2f} active/cell")
+    if all_X and all_dense:
+        head = _fit_level_head(dense_all, sp.vstack(all_X).tocsr(), int(getattr(cfg, "level_head_cells", 60000)),
+                               int(getattr(cfg, "level_head_steps", 400)))
+        np.savez_compressed(out_dir / "libella_level_head.npz", **head)
+        print(f"  ↳ Level head E[x | detected] fitted (masked MSE {head['masked_mse']:.4f}); apply with utils.apply_level_head")
+
     print(f"\n[✓] Master export complete -> {master_latent_path}")
     print(f"    Shape: {master_csr.shape[0]:,} cells × {master_csr.shape[1]:,} latents (Barcodes embedded)")
 
@@ -647,7 +774,7 @@ class SafePadeActivation(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_safe = torch.tanh(x / F.softplus(self.c_in))
         
-        p_val = 0.0
+        p_val = self.p_coeffs[0] if bool(getattr(cfg, "pade_p0_learnable", False)) else 0.0
         for i in range(1, len(self.p_coeffs)):
             p_val = p_val + self.p_coeffs[i] * (x_safe ** i)
             
@@ -915,7 +1042,7 @@ def get_deep_telemetry(model: torch.nn.Module) -> dict[str, float]:
     if hasattr(model, "pade_gate"):
         stats["rsae_pade_p_norm"] = float(model.pade_gate.p_coeffs.norm(2).item())
         stats["rsae_pade_q_norm"] = float(model.pade_gate.q_coeffs.norm(2).item())
-        stats["rsae_pade_p0"] = 0.0
+        stats["rsae_pade_p0"] = float(model.pade_gate.p_coeffs[0].item()) if bool(getattr(cfg, "pade_p0_learnable", False)) else 0.0
         stats["rsae_pade_q0"] = float(model.pade_gate.q_coeffs[0].item())
     # 6. Spatial GNN & CSNN Gates
     stats["gnn_listen_prob_mean"] = float(model.last_listen_prob.mean().item()) if getattr(model, "last_listen_prob", None) is not None else 0.0

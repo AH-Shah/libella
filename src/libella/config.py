@@ -27,6 +27,25 @@ class RunConfig:
     seed: int = 42
     arm: str = "A0"
     g_det: float = 0.0
+    # --- B9 (sealed 2026-10) ---
+    # Main dictionary init: "prior" = atoms from prior._get_raw_adjs (n_dict_components) + random rest; "random" = |N(0,1)|
+    dict_init: str = "prior"
+    # Calibrated dictionary: added decoder (own atoms + bias + per-atom scale) refit each epoch by closed-form NNLS
+    # of x on detached codes (x ~ z D ||x||); decode() uses it. The main encoder/decoder path is untouched.
+    cal_dictionary: bool = True
+    cal_refit_chunks: int = 8
+    # Export views (export_latents_from_graphs)
+    export_program_views: bool = True   # dense pre-top-K layer + Ward-grouped coarse programs
+    program_groups: int = 40
+    niche_k: int = 15                   # dense layer pooled over self + k spatial neighbours (0 = off)
+    export_gnn_h0: bool = True          # GNN input state H0 = tanh(x_c W_gnn^T)
+    export_residual_code: bool = True   # residual sparse code over calibrated atoms (minority rescue)
+    residual_k: int = 5
+    export_level_head: bool = True      # E[x | detected] head on [dense, log||x||, log n_detected]
+    level_head_cells: int = 60000
+    level_head_steps: int = 400
+    # Learnable Pade p0 (v0.1.8.8.5 behaviour): near-binary codes, sparse ARI up / BalAcc down; default p0 = 0
+    pade_p0_learnable: bool = False
     det_loss_weight: float = 1.0
     det_init_scale: float = 3.0
     lr_det: float = 4e-3

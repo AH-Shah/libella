@@ -198,6 +198,8 @@ def init_decoder_bias_from_data(
             print(f"  ↳ Initialized encoder_bias to normalized mean (L2 norm: {model.encoder_bias.norm(2).item():.4f})")
         ambient_floor = raw_mean * 0.01
         model.decoder_bias.data.copy_(ambient_floor)
+        if getattr(model, "cal_dict", False):
+            model.decoder_bias_cal.data.copy_(ambient_floor)
         print(f"  ↳ Initialized decoder_bias to raw count mean (L2 norm: {model.decoder_bias.norm(2).item():.4f}, across {total_samples} core cells)")
         if hasattr(model, "det_bias") and model.det_bias is not None:
             det_rate = (total_detected / total_samples).clamp(min=1e-4, max=1.0 - 1e-4)
@@ -230,10 +232,60 @@ def init_decoder_bias_from_data(
 
     model.train()
 
+def _prior_init_components(graph_paths: list[Path], n_latents: int, n_genes: int) -> np.ndarray:
+    """B9 dictionary seed: prior._get_raw_adjs atoms (cfg.n_dict_components) + |N(0,1)| for the remaining atoms."""
+    from .prior import _get_raw_adjs
+    prior_atoms = np.abs(np.asarray(_get_raw_adjs(graph_paths), dtype=np.float32))[:n_latents]
+    g = torch.Generator().manual_seed(int(getattr(cfg, "seed", 42)))
+    rest = torch.abs(torch.randn(n_latents - prior_atoms.shape[0], n_genes, generator=g)).numpy()
+    print(f"  ↳ Prior dictionary init: {prior_atoms.shape[0]} prior atoms + {rest.shape[0]} random atoms")
+    return np.vstack([prior_atoms, rest]).astype(np.float32)
+
+
+@torch.no_grad()
+def _refit_cal_dictionary(model: LibellaGNN, training_cache: list[dict[str, Any]], device: torch.device, epoch: int) -> None:
+    """Closed-form non-negative least squares of x on detached codes (x ~ z D ||x||) -> calibrated atoms, scales, bias."""
+    was_training = model.training
+    model.eval()
+    rng = np.random.default_rng(getattr(cfg, "seed", 42) + epoch)
+    A_rows, X_rows = [], []
+    for ci in rng.permutation(len(training_cache))[: int(getattr(cfg, "cal_refit_chunks", 8))]:
+        batch = torch.load(training_cache[ci]["chunk_file"], map_location="cpu", weights_only=False)
+        x = batch["x"].to(device=device, dtype=torch.float32)
+        src, dst, w = batch["src"].to(device), batch["dst"].to(device), batch["weights"].to(device)
+        sp_raw = batch.get("spatial", batch.get("pos", None))
+        spatial = sp_raw.to(device) if sp_raw is not None else None
+        x, src, dst, w, spatial = pad_mps_shapes(x, src, dst, w, spatial=spatial)
+        if device.type != "mps":
+            src, dst = src.to(torch.int64), dst.to(torch.int64)
+        z, _, _, cell_mass, *_ = model.encode(x, src, dst, w, spatial=spatial)
+        core = batch["train_core_idx"].to(device=device, dtype=torch.int64)
+        A_rows.append((z[core] * cell_mass[core]).float().cpu())
+        X_rows.append(x[core].float().cpu())
+        del batch, x, src, dst, w, spatial, z, cell_mass
+    A, Xc = torch.cat(A_rows), torch.cat(X_rows)
+    AtA, AtX = A.T @ A, A.T @ Xc
+    L = torch.linalg.eigvalsh(AtA).max().clamp(min=1e-6)
+    D = torch.linalg.lstsq(AtA + 1e-6 * torch.eye(AtA.shape[0]), AtX).solution.clamp(min=0)
+    for _ in range(300):
+        D = (D - (AtA @ D - AtX) / L).clamp(min=0)
+    norms = D.norm(dim=-1)
+    alive = norms > 1e-8
+    W_new = torch.where(alive[:, None], D / norms.clamp(min=1e-12)[:, None], model.decoder_weight_cal.data.cpu())
+    model.decoder_weight_cal.data.copy_(W_new.to(model.decoder_weight_cal.device))
+    model.cal_atom_log_scale.data.copy_(torch.where(alive, torch.log(norms.clamp(min=1e-12)), torch.full_like(norms, -20.0)).to(model.cal_atom_log_scale.device))
+    model.decoder_bias_cal.data.zero_()
+    r2 = 1.0 - float(((A @ D - Xc) ** 2).sum() / ((Xc - Xc.mean(0)) ** 2).sum())
+    print(f"  ↳ [cal refit] epoch {epoch}: {A.shape[0]} cells, alive atoms {int(alive.sum())}, in-sample R2(x) {r2:.4f}")
+    if was_training:
+        model.train()
+
+
 def _init_model(
     common_genes: list[str],
     n_latents: int,
     checkpoint_path: Path | None = None,
+    init_components: np.ndarray | None = None,
 ) -> tuple[
     LibellaGNN,
     torch.optim.Optimizer,
@@ -248,6 +300,7 @@ def _init_model(
     model = LibellaGNN(
         in_channels=len(common_genes),
         n_metaprograms=n_latents,
+        init_components=init_components,
     ).to(device)
 
     # 1. Parameter grouping with dedicated baseline & decoder learning rates
@@ -815,6 +868,8 @@ def _train_loop(
         history["val_loss"].append(val_loss_acc / (val_steps + 1e-9))
 
         scheduler.step()
+        if getattr(model, "cal_dict", False):
+            _refit_cal_dictionary(model, training_cache, device, epoch)
         gc.collect()
 
         # Telemetry Resolution (Zero-Division Safe, single batched host sync)
@@ -1147,8 +1202,11 @@ def train_gnn(
             cfg.epochs = max(5, int(round(raw_epochs / 5.0)) * 5)
         print(f"  ↳ Dataset scale: {len(training_cache)} chunks ({steps_per_epoch} steps/epoch). Auto-scheduled {cfg.epochs} epochs (~{cfg.epochs * steps_per_epoch} steps).")
 
+    init_components = None
+    if str(getattr(cfg, "dict_init", "random")).lower() == "prior" and not (checkpoint_path and Path(checkpoint_path).exists()):
+        init_components = _prior_init_components(graph_paths, n_latents, len(common_genes))
     model, optimizer, scheduler, best_composite_score, tracker_state, history, start_epoch = _init_model(
-        common_genes, n_latents, checkpoint_path
+        common_genes, n_latents, checkpoint_path, init_components=init_components
     )
     gc.collect()
 
